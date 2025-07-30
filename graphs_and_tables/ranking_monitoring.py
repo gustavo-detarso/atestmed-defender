@@ -8,10 +8,14 @@ import numpy as np
 from datetime import datetime
 from tabulate import tabulate
 
-BASE_DIR = os.path.dirname(__file__)
-ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, '..'))
-DB_PATH = os.path.join(ROOT_DIR, 'db', 'atestmed.db')
-EXPORT_DIR = os.path.join(ROOT_DIR, 'exports')
+# Caminho absoluto para a raiz do projeto
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+# Caminho absoluto para o banco de dados
+DB_PATH = os.path.join(BASE_DIR, 'db', 'atestmed.db')
+
+# Caminho absoluto para exports
+EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 def parse_args():

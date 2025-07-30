@@ -378,18 +378,29 @@ def tela_mensagem(screen, msg, cor=BORDER_COLOR):
             return
 
 def descobrir_argumentos_obrigatorios(script_path):
+    # Lista apenas os argumentos do seu interesse, por exemplo "--perito"
+    ARGS_DESEJADOS = {"--perito"}  # Adicione outros argumentos obrigatórios se quiser
     try:
-        help_out = subprocess.run([sys.executable, script_path, "--help"], capture_output=True, text=True)
+        help_out = subprocess.run(
+            [sys.executable, script_path, "--help"],
+            capture_output=True, text=True
+        )
         log_debug(f"Executando help para {script_path}")
         help_lines = help_out.stdout.splitlines()
         obrigatorios = {}
-        pattern = re.compile(r"^\s*(--[a-zA-Z0-9_-]+)[^ ]*\s+([^\[]*)\(required\)")
         for line in help_lines:
-            match = pattern.search(line)
-            if match:
-                argname = match.group(1)
-                helpmsg = match.group(2).strip()
-                obrigatorios[argname] = helpmsg if helpmsg else argname
+            line = line.strip()
+            if not line or line.startswith("options:") or line.startswith("usage:"):
+                continue
+            # Pega argumentos "--algo ALGO"
+            if line.startswith("--"):
+                m = re.match(r"(--[a-zA-Z0-9_-]+)(\s+\S+)?\s*(.*)", line)
+                if m:
+                    argname = m.group(1)
+                    helpmsg = m.group(3) if m.group(3) else ""
+                    # Só entra se for argumento desejado!
+                    if argname in ARGS_DESEJADOS:
+                        obrigatorios[argname] = helpmsg.strip()
         log_debug(f"Argumentos obrigatórios detectados: {obrigatorios}")
         return obrigatorios
     except Exception as e:
@@ -423,7 +434,31 @@ def executar_gerar_comentario(screen, nome_script, di, df, args_dict):
     else:
         tela_mensagem(screen, "Erro ao gerar comentário!\n" + proc.stderr, cor=Screen.COLOUR_RED)
 
-# --- NOVO bloco: coleta universal de argumentos obrigatórios (autocomplete/fallback) ---
+def sugerir_nomes_peritos():
+    db_path = os.path.join("db", "atestmed.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        # Só peritos que aparecem em pelo menos uma análise
+        cur.execute("""
+            SELECT DISTINCT p.nomePerito
+            FROM peritos p
+            JOIN analises a ON a.siapePerito = p.siapePerito
+            WHERE p.nomePerito IS NOT NULL AND p.nomePerito != ''
+            ORDER BY p.nomePerito
+        """)
+        nomes = [row[0] for row in cur.fetchall()]
+        conn.close()
+        return nomes
+    except Exception as e:
+        log_debug(f"Erro ao buscar nomes de peritos: {e}")
+        return []
+
+SUGGESTION_MAP = {
+    "--perito": sugerir_nomes_peritos,
+    "--nome-perito": sugerir_nomes_peritos,  # Se seus scripts usarem esse nome
+}
+
 def coletar_argumentos_universal(screen, obrigatorios):
     args_dict = {}
     for arg, helpmsg in obrigatorios.items():
@@ -502,6 +537,50 @@ def tela_selecao_csv(screen, files):
         elif ev in (10, 13):  # Enter
             return opcoes[idx]
 
+def tela_selecao_formatos(screen):
+    opcoes = [
+        ("Gerar Markdown (.md)", "--export-md"),
+        ("Gerar Gráfico PNG (.png)", "--chart --export-png"),
+        ("Gerar Comentário GPT", "--export-comment"),
+    ]
+    selecionados = [False] * len(opcoes)
+    idx = 0
+    needs_redraw = True
+    while True:
+        if needs_redraw:
+            screen.clear()
+            for y, line in enumerate(BANNER):
+                screen.print_at(line, (screen.width - len(line)) // 2, y + 1, colour=BOX_COLOR, attr=Screen.A_BOLD)
+            linhas = []
+            for i, (label, _) in enumerate(opcoes):
+                mark = "[X]" if selecionados[i] else "[ ]"
+                sel = "→ " if i == idx else "  "
+                linhas.append(f"{sel}{mark} {label}")
+            linhas.append("")
+            linhas.append("ESPACO: selecionar/deselecionar  ENTER: confirmar  < Voltar")
+            bbs_box(screen, linhas, None, selected=idx)
+            needs_redraw = False
+        ev = screen.get_key()
+        if ev == ord('<'):
+            return None
+        if ev == Screen.KEY_DOWN:
+            idx = (idx + 1) % len(opcoes)
+            needs_redraw = True
+        elif ev == Screen.KEY_UP:
+            idx = (idx - 1) % len(opcoes)
+            needs_redraw = True
+        elif ev == ord(' '):
+            selecionados[idx] = not selecionados[idx]
+            needs_redraw = True
+        elif ev in (10, 13):  # ENTER
+            if not any(selecionados):
+                if tela_yesno(screen, "Nenhum formato selecionado. Cancelar geração?"):
+                    return None
+                else:
+                    needs_redraw = True
+                    continue
+            return [opcoes[i][1] for i in range(len(opcoes)) if selecionados[i]]
+
 # TUI principal
 
 def main_bbs(screen):
@@ -579,26 +658,24 @@ def main_bbs(screen):
             df = tela_data(screen, "Digite data final (YYYY-MM-DD):")
             if not df: continue
 
-            proc_md = executar_script_estatistica(nome_script, di, df, ["--export-md"], args_dict)
-            if proc_md.returncode == 0:
-                tela_mensagem(screen, "Tabela Markdown gerada!", cor=Screen.COLOUR_GREEN)
-            else:
-                tela_mensagem(screen, "Erro ao gerar tabela!\n" + proc_md.stderr, cor=Screen.COLOUR_RED)
+            # Nova seleção de formatos (multi seleção)
+            formatos = tela_selecao_formatos(screen)
+            if formatos is None:
+                tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
                 continue
 
-            opcionais = descobrir_argumentos_opcionais(script_path)
-            if '--chart' in opcionais and '--export-png' in opcionais:
-                if tela_yesno(screen, "Deseja exportar o gráfico (PNG)?", cor=Screen.COLOUR_CYAN):
-                    proc_png = executar_script_estatistica(
-                        nome_script, di, df, ["--chart", "--export-png"], args_dict
-                    )
-                    if proc_png.returncode == 0:
+            for fmt in formatos:
+                extra_args = fmt.split()
+                proc = executar_script_estatistica(nome_script, di, df, extra_args, args_dict)
+                if proc.returncode == 0:
+                    if "--export-md" in extra_args:
+                        tela_mensagem(screen, "Tabela Markdown gerada!", cor=Screen.COLOUR_GREEN)
+                    elif "--export-png" in extra_args:
                         tela_mensagem(screen, "Gráfico PNG gerado!", cor=Screen.COLOUR_GREEN)
-                    else:
-                        tela_mensagem(screen, "Erro ao gerar gráfico!\n" + proc_png.stderr, cor=Screen.COLOUR_RED)
-
-            if tela_yesno(screen, "Deseja gerar comentário ChatGPT?", cor=Screen.COLOUR_CYAN):
-                executar_gerar_comentario(screen, nome_script, di, df, args_dict)
+                    elif "--export-comment" in extra_args:
+                        tela_mensagem(screen, "Comentário ChatGPT salvo no exports.", cor=Screen.COLOUR_GREEN)
+                else:
+                    tela_mensagem(screen, f"Erro ao executar: {fmt}\n" + proc.stderr, cor=Screen.COLOUR_RED)
 
         # 2: Análises em R
         elif opc == 2:
@@ -634,7 +711,6 @@ def main_bbs(screen):
             tela_mensagem(screen, "Saindo do sistema... Até logo!", cor=Screen.COLOUR_RED)
             log_debug("Usuário saiu do sistema")
             return
-
 
 if __name__ == "__main__":
     log_debug("=== INICIANDO NOVA SESSÃO CLI TUI ===")

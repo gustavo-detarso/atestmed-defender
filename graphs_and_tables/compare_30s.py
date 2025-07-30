@@ -6,8 +6,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
 
-DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'db', 'atestmed.db')
-EXPORT_DIR = os.path.join(os.path.dirname(__file__), '..', 'exports')
+
+# Caminho absoluto para a raiz do projeto
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+# Caminho absoluto para o banco de dados
+DB_PATH = os.path.join(BASE_DIR, 'db', 'atestmed.db')
+
+# Caminho absoluto para exports
+EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 def parse_args():
@@ -19,7 +26,7 @@ def parse_args():
     p.add_argument('--export-md', action='store_true', help='Exporta tabela em Markdown')
     p.add_argument('--export-png', action='store_true', help='Exporta gráfico em PNG')
     p.add_argument('--export-comment', action='store_true', help='Exporta comentário vazio para GPT')
-    p.add_argument('--perito', required=False, help='Nome do perito (se não fornecido, usa primeiro do ranking)')
+    p.add_argument('--perito', required=True, help='Nome do perito (se não fornecido, usa primeiro do ranking)')
     return p.parse_args()
 
 def comparar(start, end, threshold, perito=None):
