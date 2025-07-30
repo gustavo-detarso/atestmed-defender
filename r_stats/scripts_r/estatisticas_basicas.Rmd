@@ -1,0 +1,55 @@
+---
+title: "Estatísticas Básicas"
+output:
+  html_document: default
+  pdf_document:
+    latex_engine: xelatex
+params:
+  arquivo: "r_stats/data/dados_analise.csv"
+  start_date: "Início"
+  end_date: "Fim"
+---
+
+```{r setup, include=FALSE}
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+
+# parâmetros
+start_date <- params$start_date
+end_date   <- params$end_date
+
+# carrega dados
+df <- read_csv(params$arquivo)
+```
+
+**Período analisado**: r start_date até r end_date
+
+```{r estatísticas_descritivas}
+
+df %>% 
+  select(prod, short_count, nc_ratio, score_final, icra, iatd) %>% 
+  summary()
+```
+
+```{r correlacao}
+
+m <- cor(df %>% select(prod, short_count, nc_ratio, score_final, icra, iatd),
+         use = "complete.obs")
+corrplot(m, method = "number")
+```
+
+```{r boxplot_sc_final_por_grupo}
+
+ggplot(df, aes(x = grupo, y = score_final)) +
+  geom_boxplot(fill = "skyblue") +
+  theme_minimal() +
+  labs(
+    title    = "Score Final - Top 10 vs Nacional",
+    subtitle = paste(start_date, "até", end_date),
+    x        = "Grupo",
+    y        = "Score Final"
+  )
+```

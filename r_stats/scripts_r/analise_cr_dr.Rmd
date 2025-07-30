@@ -1,0 +1,53 @@
+---
+title: "Análise por CR e DR"
+output: html_document
+params:
+  arquivo: "r_stats/data/dados_analise.csv"
+  start_date: "Início"
+  end_date: "Fim"
+---
+
+
+```{r setup, include=FALSE}
+
+library(readr)
+library(ggplot2)
+
+# Recebe parâmetros do YAML
+start_date <- params$start_date
+end_date   <- params$end_date
+
+# Carrega os dados
+df <- read_csv(params$arquivo)
+```
+
+**Período analisado**: r start_date até r end_date
+
+```{r boxplot_por_cr}
+
+ggplot(df, aes(x = reorder(cr, -score_final, FUN = mean, na.rm = TRUE),
+               y = score_final)) +
+  geom_boxplot(fill = "#FFDD87") +
+  theme_minimal() +
+  labs(
+    title = "Score Final por CR",
+    subtitle = paste(start_date, "até", end_date),
+    x = "CR",
+    y = "Score Final"
+  )
+```
+
+```{r anova}
+
+# ANOVA para CR
+anova_cr <- aov(score_final ~ cr, data = df)
+cat("### ANOVA por CR\n")
+print(summary(anova_cr))
+
+cat("\n---\n\n")
+
+# ANOVA para DR
+anova_dr <- aov(score_final ~ dr, data = df)
+cat("### ANOVA por DR\n")
+print(summary(anova_dr))
+```

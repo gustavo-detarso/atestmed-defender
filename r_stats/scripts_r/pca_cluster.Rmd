@@ -1,0 +1,37 @@
+---
+title: "PCA e Clusterização"
+output: html_document
+params:
+  arquivo: "r_stats/data/dados_analise.csv"
+  start_date: "Início"
+  end_date: "Fim"
+---
+
+```{r setup, include=FALSE}
+
+library(readr)
+library(FactoMineR)
+library(factoextra)
+
+# Recebe parâmetros do YAML
+start_date <- params$start_date
+end_date   <- params$end_date
+
+# Carrega e prepara os dados
+df <- read_csv(params$arquivo) %>%
+  select(prod, short_count, nc_ratio, score_final, icra, iatd) %>%
+  na.omit()
+```
+**Período analisado:** `r start_date` até `r end_date`
+
+```{r pca}
+
+res.pca <- PCA(df, graph = FALSE)
+fviz_pca_var(res.pca, col.var = "contrib")
+```
+
+```{r k-means_clustering}
+
+km <- kmeans(scale(df), centers=3)
+fviz_cluster(km, data=scale(df), ellipse.type="euclid")
+```

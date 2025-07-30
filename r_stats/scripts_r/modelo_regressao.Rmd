@@ -1,0 +1,37 @@
+---
+title: "Modelo de Regressão"
+output: html_document
+params:
+  arquivo: "r_stats/data/dados_analise.csv"
+  start_date: "Início"
+  end_date: "Fim"
+---
+
+
+```{r setup, include=FALSE}
+
+library(readr)
+library(broom)
+
+# Recebe parâmetros do YAML
+start_date <- params$start_date
+end_date   <- params$end_date
+
+# Carrega os dados
+df <- read_csv(params$arquivo)
+```
+
+**Período analisado**: r start_date até r end_date
+
+```{r modelo_linear}
+
+# Ajuste do modelo de regressão linear
+modelo <- lm(score_final ~ prod + short_count + nc_ratio + icra + iatd, data = df)
+
+# Sumário completo
+summary(modelo)
+
+# Resumo em formato tidy (opcional)
+tidy(modelo)
+glance(modelo)
+```

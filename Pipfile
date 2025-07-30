@@ -1,0 +1,28 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+tqdm = "*"
+plotext = "*"
+inquirer = "*"
+python-dotenv = "*"
+openai = "*"
+textual = "*"
+rich = "*"
+questionary = "*"
+pandas = "*"
+numpy = "*"
+tabulate = "*"
+openpyxl = "*"
+xlsxwriter = "*"
+prompt-toolkit = "*"
+asciimatics = "*"
+matplotlib = "*"
+
+[dev-packages]
+plotext = "*"
+
+[requires]
+python_version = "3.12"

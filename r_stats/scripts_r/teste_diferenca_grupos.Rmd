@@ -1,0 +1,70 @@
+---
+title: "Teste de Diferença entre Grupos"
+output:
+  html_document: default
+  pdf_document:
+    latex_engine: xelatex
+params:
+  arquivo: "r_stats/data/dados_analise.csv"
+  start_date: "Início"
+  end_date: "Fim"
+---
+
+```{r setup, include=FALSE}
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+
+# recebe os parâmetros do YAML
+start_date <- params$start_date
+end_date   <- params$end_date
+
+# carrega e filtra o CSV
+df <- read_csv(params$arquivo) %>%
+  filter(grupo %in% c("Top10", "Outros"))
+```
+
+**Período analisado:** `r start_date` até `r end_date`
+
+```{r estatisticas_descritivas_por_grupo}
+
+estat_desc <- df %>%
+  group_by(grupo) %>%
+  summarise(
+    media_score = mean(score_final, na.rm = TRUE),
+    sd_score    = sd(score_final,   na.rm = TRUE),
+    media_icra  = mean(icra,         na.rm = TRUE),
+    sd_icra     = sd(icra,          na.rm = TRUE),
+    media_iatd  = mean(iatd,         na.rm = TRUE),
+    sd_iatd     = sd(iatd,          na.rm = TRUE)
+  )
+print(estat_desc)
+```
+
+```{r testes_estatisticos}
+
+variaveis <- c("score_final", "icra", "iatd")
+
+for (var in variaveis) {
+  cat("### Variável:", var, "\n")
+  top10  <- df %>% filter(grupo == "Top10") %>% pull(var) %>% na.omit()
+  outros <- df %>% filter(grupo == "Outros") %>% pull(var)  %>% na.omit()
+  
+  # t-test
+  if (length(top10) > 1 && length(outros) > 1) {
+    print(t.test(top10, outros))
+  } else {
+    cat("t-test não executado (amostras insuficientes)\n")
+  }
+  
+  # Wilcoxon
+  if (length(top10) > 0 && length(outros) > 0) {
+    print(wilcox.test(top10, outros))
+  } else {
+    cat("Wilcoxon não executado (amostras insuficientes)\n")
+  }
+  
+  cat("\n---\n\n")
+}
+```

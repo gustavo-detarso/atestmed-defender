@@ -1,0 +1,30 @@
+# Dados sensíveis
+.env
+dados_analise.csv
+atestmed.db
+lista*
+
+# Pastas de resultados
+/r_stats/outputs/**
+
+# Pastas de db
+/db/**
+!/db/.gitkeep
+
+/exports/**
+!/exports/.gitkeep
+
+# Dejetos
+
+.Rhistory
+.Rdata
+
+/logs/**
+!/logs/.gitkeep
+
+/debug_logs/**
+!/debug_logs/.gitkeep
+
+# Ignora todos os CSVs brutos
+/data/raw/*.csv
+!/data/raw/.gitkeep
