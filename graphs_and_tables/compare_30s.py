@@ -5,7 +5,8 @@ import argparse
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
-
+import sys
+print("DEBUG sys.argv:", sys.argv)
 
 # Caminho absoluto para a raiz do projeto
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))

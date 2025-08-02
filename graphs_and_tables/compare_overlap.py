@@ -33,21 +33,42 @@ def detectar_sobreposicao(start, end):
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT siapePerito, nomePerito FROM peritos")
-    lista = cur.fetchall()
+    
+    # Consulta única para todas perícias do período, ordenadas por perito e data
+    cur.execute("""
+        SELECT p.siapePerito, p.nomePerito, a.dataHoraIniPericia, a.dataHoraFimPericia
+        FROM analises a
+        JOIN peritos p ON a.siapePerito = p.siapePerito
+        WHERE date(a.dataHoraIniPericia) BETWEEN ? AND ?
+        ORDER BY p.siapePerito, a.dataHoraIniPericia
+    """, (dt_start, dt_end))
+    
+    rows = cur.fetchall()
+    conn.close()
 
     flags = {}
-    for siape, nome in lista:
-        cur.execute("""
-            SELECT dataHoraIniPericia, dataHoraFimPericia
-            FROM analises
-            WHERE siapePerito=? AND dataHoraIniPericia BETWEEN ? AND ?
-            ORDER BY dataHoraIniPericia
-        """, (siape, dt_start, dt_end))
-        rows = cur.fetchall()
-        overlap = any(rows[i+1][0] < rows[i][1] for i in range(len(rows)-1))
-        flags[nome] = overlap
-    conn.close()
+    current_siape = None
+    current_nome = None
+    current_periods = []
+
+    def check_overlap(periods):
+        return any(periods[i+1][0] < periods[i][1] for i in range(len(periods) - 1))
+
+    for siape, nome, start_time, end_time in rows:
+        if siape != current_siape:
+            # Avalia sobreposição do perito anterior
+            if current_siape is not None:
+                flags[current_nome] = check_overlap(current_periods)
+            # Reinicia para novo perito
+            current_siape = siape
+            current_nome = nome
+            current_periods = [(start_time, end_time)]
+        else:
+            current_periods.append((start_time, end_time))
+    # Avalia o último perito
+    if current_siape is not None:
+        flags[current_nome] = check_overlap(current_periods)
+
     return flags
 
 def calcular_percentuais(flags, perito):

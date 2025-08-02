@@ -11,7 +11,7 @@ from utils.db_manager import create_database, load_csv_to_db, calcular_indicador
 
 BANNER = [
     "╔══════════════════════════════════════════════════════════════╗",
-    "║              ATESTMED MONITORAMENTO CLI - BBS              ║",
+    "║               MONITORAMENTO ATESTMED CLI - BBS               ║",
     "╚══════════════════════════════════════════════════════════════╝"
 ]
 HELP_MAIN = "↑↓ Navegar  ENTER Escolher  Q Sair"
@@ -137,7 +137,7 @@ def listar_scripts_r():
         return []
 
 def tela_menu(screen):
-    opcoes = ["Gerenciar Banco de Dados", "Gráficos e Tabelas", "Análises em R", "Sair"]
+    opcoes = ["Gerenciar Banco de Dados", "Gráficos e Tabelas", "Análises em R", "Relatórios", "Sair"]
     idx = 0
     needs_redraw = True
     while True:
@@ -332,36 +332,44 @@ def tela_autocomplete(screen, prompt, options):
             last_render = None
 
 def tela_yesno(screen, question, cor=Screen.COLOUR_CYAN):
-    lines = [question, "", "Use ← → para escolher, ENTER para confirmar."]
     options = ["Sim", "Não"]
     idx = 0
     needs_redraw = True
+
+    # Desenha banner e estrutura fixa uma vez
+    def draw_base(selected_idx):
+        screen.clear()
+        for y, line in enumerate(BANNER):
+            screen.print_at(line, (screen.width - len(line)) // 2, y + 1, colour=BOX_COLOR, attr=Screen.A_BOLD)
+        # Caixa com a pergunta e instruções fixas
+        lines = [question, "", "Use ESPAÇO para alternar, ENTER para confirmar."]
+        bbs_box(screen, lines, None)
+        # Desenha opções "Sim" e "Não" com destaque no selecionado
+        x = (screen.width - 18) // 2
+        yb = (screen.height // 2) + 2
+        for i, opt in enumerate(options):
+            sel_attr = Screen.A_BOLD if i == selected_idx else 0
+            bg = BG_SELECT if i == selected_idx else Screen.COLOUR_BLACK
+            screen.print_at(f"[ {opt} ]", x + i*10, yb, colour=cor, bg=bg, attr=sel_attr)
+        screen.refresh()
+
     while True:
         if needs_redraw:
-            screen.clear()
-            for y, line in enumerate(BANNER):
-                screen.print_at(line, (screen.width - len(line)) // 2, y + 1, colour=BOX_COLOR, attr=Screen.A_BOLD)
-            bbs_box(screen, lines, None)
-            x = (screen.width - 18) // 2
-            yb = (screen.height // 2) + 2
-            for i, opt in enumerate(options):
-                sel_attr = Screen.A_BOLD if i == idx else 0
-                bg = BG_SELECT if i == idx else Screen.COLOUR_BLACK
-                screen.print_at(f"[ {opt} ]", x + i*10, yb, colour=cor, bg=bg, attr=sel_attr)
+            draw_base(idx)
             needs_redraw = False
         ev = screen.get_key()
-        if ev == ord('<'):
+        if ev in (ord("q"), ord("Q"), ord("<")):
             log_debug("Usuário saiu em pergunta Sim/Não")
             sys.exit(0)
-        if ev == Screen.KEY_LEFT:
-            idx = (idx - 1) % 2
+        if ev == Screen.KEY_LEFT or ev == ord(' '):
+            idx = (idx - 1) % len(options)
             needs_redraw = True
         elif ev == Screen.KEY_RIGHT:
-            idx = (idx + 1) % 2
+            idx = (idx + 1) % len(options)
             needs_redraw = True
         elif ev in (10, 13):
             log_debug(f"Usuário respondeu {options[idx]} para pergunta: {question}")
-            return idx == 0
+            return idx == 0  # True se "Sim", False se "Não"
 
 def tela_mensagem(screen, msg, cor=BORDER_COLOR):
     lines = [msg]
@@ -379,7 +387,7 @@ def tela_mensagem(screen, msg, cor=BORDER_COLOR):
 
 def descobrir_argumentos_obrigatorios(script_path):
     # Lista apenas os argumentos do seu interesse, por exemplo "--perito"
-    ARGS_DESEJADOS = {"--perito"}  # Adicione outros argumentos obrigatórios se quiser
+    ARGS_DESEJADOS = {"--perito", "--start", "--end"}  # Adicione outros argumentos obrigatórios se quiser
     try:
         help_out = subprocess.run(
             [sys.executable, script_path, "--help"],
@@ -462,20 +470,28 @@ SUGGESTION_MAP = {
 def coletar_argumentos_universal(screen, obrigatorios):
     args_dict = {}
     for arg, helpmsg in obrigatorios.items():
-        sug_func = SUGGESTION_MAP.get(arg)
-        if sug_func:
-            opcoes = sug_func()
-            val = tela_autocomplete(screen, f"Selecione {arg[2:]}:", opcoes)
+        # Se for argumento de data (nome ou help), chama tela_data!
+        if arg in ("--start", "--end") or "data" in helpmsg.lower():
+            val = tela_data(screen, f"Preencha {arg}: {helpmsg}")
             if not val:
-                log_debug(f"Usuário não selecionou valor para {arg}")
+                log_debug(f"Usuário não preencheu argumento de data {arg}")
                 break
             args_dict[arg] = val
         else:
-            val = tela_input(screen, f"Preencha {arg}: {helpmsg}")
-            if not val:
-                log_debug(f"Usuário não preencheu argumento obrigatório {arg}")
-                break
-            args_dict[arg] = val
+            sug_func = SUGGESTION_MAP.get(arg)
+            if sug_func:
+                opcoes = sug_func()
+                val = tela_autocomplete(screen, f"Selecione {arg[2:]}:", opcoes)
+                if not val:
+                    log_debug(f"Usuário não selecionou valor para {arg}")
+                    break
+                args_dict[arg] = val
+            else:
+                val = tela_input(screen, f"Preencha {arg}: {helpmsg}")
+                if not val:
+                    log_debug(f"Usuário não preencheu argumento obrigatório {arg}")
+                    break
+                args_dict[arg] = val
     return args_dict if len(args_dict) == len(obrigatorios) else None
 
 def tela_selecao_csv(screen, files):
@@ -537,8 +553,8 @@ def tela_selecao_csv(screen, files):
         elif ev in (10, 13):  # Enter
             return opcoes[idx]
 
-def tela_selecao_formatos(screen):
-    opcoes = [
+def tela_selecao_formatos(screen, opcoes_personalizadas=None):
+    opcoes = opcoes_personalizadas or [
         ("Gerar Markdown (.md)", "--export-md"),
         ("Gerar Gráfico PNG (.png)", "--chart --export-png"),
         ("Gerar Comentário GPT", "--export-comment"),
@@ -581,38 +597,41 @@ def tela_selecao_formatos(screen):
                     continue
             return [opcoes[i][1] for i in range(len(opcoes)) if selecionados[i]]
 
-# TUI principal
+def listar_scripts_reports(pasta):
+    try:
+        scripts = []
+        for nome in sorted(os.listdir(pasta)):
+            if nome.endswith(".py") and not nome.startswith("_"):
+                scripts.append(nome[:-3])
+        return scripts
+    except Exception as e:
+        log_debug(f"Erro listando scripts em reports: {e}")
+        return []
 
+# TUI principal
 def main_bbs(screen):
     while True:
         opc = tela_menu(screen)
 
         # 0: Gerenciar Banco de Dados
         if opc == 0:
-            # Desenha banner
             screen.clear()
             for y, line in enumerate(BANNER):
-                screen.print_at(line,
-                                (screen.width - len(line)) // 2,
-                                y + 1,
-                                colour=BOX_COLOR,
-                                attr=Screen.A_BOLD)
+                screen.print_at(line, (screen.width - len(line)) // 2, y + 1, colour=BOX_COLOR, attr=Screen.A_BOLD)
             screen.refresh()
 
-            # Recriar / Atualizar
             idx_bd = tela_submenu_estatisticas(screen, ["Recriar", "Atualizar"])
             if idx_bd is None:
                 continue
             db_dir = "db"; db_path = os.path.join(db_dir, "atestmed.db")
 
-            if idx_bd == 0:  # Recriar
+            if idx_bd == 0:
                 if tela_yesno(screen, "Excluir e recriar o banco?", cor=Screen.COLOUR_CYAN):
                     if os.path.exists(db_path): os.remove(db_path)
                     create_database(); calcular_indicadores(db_path)
                     tela_mensagem(screen, "✅ Banco recriado com sucesso!", cor=Screen.COLOUR_GREEN)
                 continue
 
-            # Atualizar: seleção de arquivos
             files = [f for f in os.listdir("data/raw") if f.lower().endswith(".csv")]
             modo = tela_selecao_csv(screen, files)
             if modo == "Cancelar":
@@ -622,7 +641,6 @@ def main_bbs(screen):
             if modo == "Todos":
                 to_load = files
             else:
-                # Um a um: adicionar, pular ou cancelar
                 for f in files:
                     escolha = tela_submenu_estatisticas(
                         screen,
@@ -649,16 +667,29 @@ def main_bbs(screen):
 
             nome_script = scripts[idx_est]
             script_path = os.path.join(GRAPHS_DIR, nome_script + ".py")
+
+            help_out = subprocess.run([sys.executable, script_path, "--help"], capture_output=True, text=True)
+            help_text = help_out.stdout
+            print("DEBUG --help do gráfico:\n", help_text)
+            log_debug("DEBUG --help do gráfico:\n" + help_text)
+            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script}_help.txt"), "w", encoding="utf-8") as f:
+                f.write(help_text)
+
             obrigatorios = descobrir_argumentos_obrigatorios(script_path)
+            print("DEBUG obrigatorios do help:", obrigatorios)
+            log_debug(f"DEBUG obrigatorios do help: {obrigatorios}")
+            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script}_obrigatorios.txt"), "w", encoding="utf-8") as f:
+                f.write(str(obrigatorios))
+
             args_dict = coletar_argumentos_universal(screen, obrigatorios)
-            if args_dict is None: continue
+            print("DEBUG args_dict:", args_dict)
+            log_debug(f"DEBUG args_dict: {args_dict}")
+            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script}_args_dict.txt"), "w", encoding="utf-8") as f:
+                f.write(str(args_dict))
+            if args_dict is None:
+                tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
+                continue
 
-            di = tela_data(screen, "Digite data inicial (YYYY-MM-DD):")
-            if not di: continue
-            df = tela_data(screen, "Digite data final (YYYY-MM-DD):")
-            if not df: continue
-
-            # Nova seleção de formatos (multi seleção)
             formatos = tela_selecao_formatos(screen)
             if formatos is None:
                 tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
@@ -666,7 +697,15 @@ def main_bbs(screen):
 
             for fmt in formatos:
                 extra_args = fmt.split()
-                proc = executar_script_estatistica(nome_script, di, df, extra_args, args_dict)
+                cmd = [sys.executable, script_path]
+                for k, v in args_dict.items():
+                    cmd += [k, v]
+                cmd += extra_args
+                print("DEBUG comando final:", cmd)
+                log_debug(f"DEBUG comando final: {cmd}")
+                with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script}_cmd.txt"), "w", encoding="utf-8") as f:
+                    f.write(str(cmd))
+                proc = subprocess.run(cmd, capture_output=True, text=True)
                 if proc.returncode == 0:
                     if "--export-md" in extra_args:
                         tela_mensagem(screen, "Tabela Markdown gerada!", cor=Screen.COLOUR_GREEN)
@@ -688,6 +727,29 @@ def main_bbs(screen):
 
             nome_script_r = scripts_r[idx_r]
             script_path = os.path.join("r_stats", "scripts_r", nome_script_r)
+
+            help_out = subprocess.run([sys.executable, script_path, "--help"], capture_output=True, text=True)
+            help_text = help_out.stdout
+            print("DEBUG --help do script R:\n", help_text)
+            log_debug("DEBUG --help do script R:\n" + help_text)
+            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script_r}_help.txt"), "w", encoding="utf-8") as f:
+                f.write(help_text)
+
+            obrigatorios = descobrir_argumentos_obrigatorios(script_path)
+            print("DEBUG obrigatorios do help:", obrigatorios)
+            log_debug(f"DEBUG obrigatorios do help: {obrigatorios}")
+            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script_r}_obrigatorios.txt"), "w", encoding="utf-8") as f:
+                f.write(str(obrigatorios))
+
+            args_dict = coletar_argumentos_universal(screen, obrigatorios)
+            print("DEBUG args_dict:", args_dict)
+            log_debug(f"DEBUG args_dict: {args_dict}")
+            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script_r}_args_dict.txt"), "w", encoding="utf-8") as f:
+                f.write(str(args_dict))
+            if args_dict is None:
+                tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
+                continue
+
             di = tela_data(screen, "Digite data inicial (YYYY-MM-DD):")
             if not di: continue
             df = tela_data(screen, "Digite data final (YYYY-MM-DD):")
@@ -696,7 +758,10 @@ def main_bbs(screen):
             env = os.environ.copy()
             env["DATA_START"] = di
             env["DATA_END"] = df
-            log_debug(f"Executando script R: {script_path} com DATA_START={di} e DATA_END={df}")
+            print(f"DEBUG comando R: Rscript -e rmarkdown::render('{script_path}', ...)")
+            log_debug(f"DEBUG comando R: Rscript -e rmarkdown::render('{script_path}', ...)")
+            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script_r}_cmd.txt"), "w", encoding="utf-8") as f:
+                f.write(f"Rscript -e rmarkdown::render('{script_path}', ...) DATA_START={di} DATA_END={df}")
             proc = subprocess.run(
                 ["Rscript", "-e", f'rmarkdown::render("{script_path}", params = list(arquivo = "dados_analise.csv"))'],
                 capture_output=True, text=True, env=env
@@ -706,7 +771,59 @@ def main_bbs(screen):
             else:
                 tela_mensagem(screen, f"❌ Erro ao executar script R:\n{proc.stderr}", cor=Screen.COLOUR_RED)
 
-        # 3 ou None: Sair
+        # 3: Relatórios
+        elif opc == 3:
+            scripts_report = listar_scripts_reports("reports")
+            if not scripts_report:
+                tela_mensagem(screen, "Nenhum script encontrado em reports!", cor=Screen.COLOUR_RED)
+                continue
+            idx_rep = tela_submenu_estatisticas(screen, scripts_report)
+            if idx_rep is None: continue
+
+            nome_script = scripts_report[idx_rep]
+            script_path = os.path.join("reports", nome_script + ".py")
+
+            help_out = subprocess.run([sys.executable, script_path, "--help"], capture_output=True, text=True)
+            help_text = help_out.stdout
+            print("DEBUG --help do relatório:\n", help_text)
+            log_debug("DEBUG --help do relatório:\n" + help_text)
+            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script}_help.txt"), "w", encoding="utf-8") as f:
+                f.write(help_text)
+
+            obrigatorios = descobrir_argumentos_obrigatorios(script_path)
+            print("DEBUG obrigatorios do help:", obrigatorios)
+            log_debug(f"DEBUG obrigatorios do help: {obrigatorios}")
+            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script}_obrigatorios.txt"), "w", encoding="utf-8") as f:
+                f.write(str(obrigatorios))
+
+            args_dict = coletar_argumentos_universal(screen, obrigatorios)
+            print("DEBUG args_dict:", args_dict)
+            log_debug(f"DEBUG args_dict: {args_dict}")
+            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script}_args_dict.txt"), "w", encoding="utf-8") as f:
+                f.write(str(args_dict))
+            if args_dict is None:
+                tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
+                continue
+
+            # Pergunta se quer incluir comentários GPT e adiciona o argumento --add-comments se sim
+            inclui_comentarios = tela_yesno(screen, "Incluir comentários do ChatGPT nos gráficos?", cor=Screen.COLOUR_CYAN)
+
+            # Monta comando final com argumentos obrigatórios + --export-pdf + possível --add-comments
+            cmd = [sys.executable, script_path]
+            for k, v in args_dict.items():
+                cmd += [k, v]
+            cmd.append('--export-pdf')
+            if inclui_comentarios:
+                cmd.append('--add-comments')
+
+            print("DEBUG comando final:", cmd)
+            log_debug(f"DEBUG comando final: {cmd}")
+            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script}_cmd.txt"), "w", encoding="utf-8") as f:
+                f.write(str(cmd))
+
+            subprocess.run(cmd)
+
+        # 4 ou None: Sair
         else:
             tela_mensagem(screen, "Saindo do sistema... Até logo!", cor=Screen.COLOUR_RED)
             log_debug("Usuário saiu do sistema")

@@ -6,6 +6,10 @@ lista*
 
 # Pastas de resultados
 /r_stats/outputs/**
+!/r_stats/outputs/.gitkeep
+
+/reports/outputs/**
+!/reports/outputs/.gitkeep
 
 # Pastas de db
 /db/**
