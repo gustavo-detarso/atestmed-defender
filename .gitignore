@@ -3,6 +3,7 @@
 dados_analise.csv
 atestmed.db
 lista*
+.zip
 
 # Pastas de resultados
 /r_stats/outputs/**
