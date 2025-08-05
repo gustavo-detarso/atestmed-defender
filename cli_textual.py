@@ -608,6 +608,34 @@ def listar_scripts_reports(pasta):
         log_debug(f"Erro listando scripts em reports: {e}")
         return []
 
+def tela_escolha_modo_relatorio(screen):
+    opcoes = ["Top 10 piores peritos", "Individual (por perito)", "Voltar"]
+    idx = 0
+    needs_redraw = True
+    while True:
+        if needs_redraw:
+            screen.clear()
+            for y, line in enumerate(BANNER):
+                screen.print_at(line, (screen.width - len(line)) // 2, y + 1,
+                               colour=BOX_COLOR, attr=Screen.A_BOLD)
+            bbs_box(screen, [f"{i+1}. {nome}" for i, nome in enumerate(opcoes)], HELP_MAIN, selected=idx)
+            screen.print_at("Escolha o tipo de relatório".center(screen.width), 0, len(BANNER) + 1,
+                            colour=Screen.COLOUR_GREEN, attr=Screen.A_BOLD)
+            needs_redraw = False
+        ev = screen.get_key()
+        if ev in (ord('q'), ord('Q'), ord('<')):  # Sai/Volta
+            return None
+        if ev == Screen.KEY_DOWN:
+            idx = (idx + 1) % len(opcoes)
+            needs_redraw = True
+        elif ev == Screen.KEY_UP:
+            idx = (idx - 1) % len(opcoes)
+            needs_redraw = True
+        elif ev in (10, 13):
+            if idx == 2:  # Voltar
+                return None
+            return "top10" if idx == 0 else "individual"
+
 # TUI principal
 def main_bbs(screen):
     while True:
@@ -796,24 +824,60 @@ def main_bbs(screen):
             with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script}_obrigatorios.txt"), "w", encoding="utf-8") as f:
                 f.write(str(obrigatorios))
 
-            args_dict = coletar_argumentos_universal(screen, obrigatorios)
-            print("DEBUG args_dict:", args_dict)
-            log_debug(f"DEBUG args_dict: {args_dict}")
-            with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script}_args_dict.txt"), "w", encoding="utf-8") as f:
-                f.write(str(args_dict))
-            if args_dict is None:
-                tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
+            # ⬇️ MENU VISUAL DE MODO DE RELATÓRIO ⬇️
+            modo_rel = tela_escolha_modo_relatorio(screen)
+            if modo_rel is None:
                 continue
 
-            # Pergunta se quer incluir comentários GPT
+            args_dict = {}
+            for arg, helpmsg in obrigatorios.items():
+                if arg == "--top10":
+                    if modo_rel == "top10":
+                        args_dict[arg] = "--top10"
+                    # Não adiciona nada se for individual
+                elif arg == "--perito":
+                    if modo_rel == "individual":
+                        sug_func = SUGGESTION_MAP.get(arg)
+                        if sug_func:
+                            opcoes_peritos = sug_func()
+                            val = tela_autocomplete(screen, f"Selecione o perito:", opcoes_peritos)
+                        else:
+                            val = tela_input(screen, "Digite o nome do perito:")
+                        if not val:
+                            tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
+                            args_dict = None
+                            break
+                        args_dict[arg] = val
+                    # Não adiciona nada se for top10
+                elif arg in ("--start", "--end") or "data" in helpmsg.lower():
+                    val = tela_data(screen, f"Preencha {arg}: {helpmsg}")
+                    if not val:
+                        tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
+                        args_dict = None
+                        break
+                    args_dict[arg] = val
+                else:
+                    val = tela_input(screen, f"Preencha {arg}: {helpmsg}")
+                    if not val:
+                        tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
+                        args_dict = None
+                        break
+                    args_dict[arg] = val
+            if args_dict is None:
+                continue
+
             inclui_comentarios = tela_yesno(screen, "Incluir comentários do ChatGPT nos gráficos?", cor=Screen.COLOUR_CYAN)
             incluir_pdf = tela_yesno(screen, "Exportar relatório em PDF?", cor=Screen.COLOUR_CYAN)
             incluir_org = tela_yesno(screen, "Exportar também em Org-mode?", cor=Screen.COLOUR_CYAN)
 
-            # Monta comando final com os argumentos obrigatórios + flags
             cmd = [sys.executable, script_path]
             for k, v in args_dict.items():
-                cmd += [k, v]
+                if k == "--top10" and v == "--top10":
+                    cmd.append("--top10")
+                elif k == "--perito":
+                    cmd += [k, v]
+                elif v:
+                    cmd += [k, v]
             if incluir_pdf:
                 cmd.append('--export-pdf')
             if incluir_org:
