@@ -7,18 +7,29 @@ params:
   end_date: "Fim"
 ---
 
-
 ```{r setup, include=FALSE}
-
 library(readr)
 library(broom)
+library(glue)
 
 # Recebe parâmetros do YAML
 start_date <- params$start_date
 end_date   <- params$end_date
 
+# Caminho robusto para o CSV
+csv_path <- params$arquivo
+if (!file.exists(csv_path)) {
+  csv_alternativo <- file.path("..", "data", basename(csv_path))
+  if (file.exists(csv_alternativo)) {
+    message(glue("Arquivo CSV não encontrado em {csv_path}. Usando {csv_alternativo}."))
+    csv_path <- csv_alternativo
+  } else {
+    stop(glue("Arquivo CSV não encontrado em {csv_path} nem em {csv_alternativo}"))
+  }
+}
+
 # Carrega os dados
-df <- read_csv(params$arquivo)
+df <- read_csv(csv_path)
 ```
 
 **Período analisado**: r start_date até r end_date

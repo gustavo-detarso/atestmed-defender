@@ -165,37 +165,32 @@ def compactar_outputs():
 
 def menu():
     log(f"📄 Log em: {LOG_PATH}")
-    while True:
-        print("\n🧭 Selecione a(s) opção(ões) de execução (ex: 2 3 4):")
-        print("[1] Instalar pacotes R e TinyTeX")
-        print("[2] Gerar CSV a partir do banco")
-        print("[3] Renderizar relatórios RMarkdown")
-        print("[4] Executar tudo em sequência")
-        print("[0] Sair")
-        opcoes = input("Digite a(s) opção(ões) desejada(s): ").strip().split()
-        if not opcoes:
-            print("Nenhuma opção selecionada.")
-            continue
-        for opcao in opcoes:
-            if opcao == "1":
-                instalar_pacotes_r()
-            elif opcao == "2":
-                perguntar_periodo()
-                gerar_csv()
-            elif opcao == "3":
-                renderizar_relatorios()
-                compactar_outputs()
-            elif opcao == "4":
-                instalar_pacotes_r()
-                perguntar_periodo()
-                gerar_csv()
-                renderizar_relatorios()
-                compactar_outputs()
-            elif opcao == "0":
-                print("Saindo.")
-                return
-            else:
-                print(f"Opção inválida: {opcao}")
+    print("🧭 Selecione a opção de execução:")
+    print("[1] Instalar pacotes R e TinyTeX")
+    print("[2] Gerar CSV a partir do banco")
+    print("[3] Renderizar relatórios RMarkdown")
+    print("[4] Executar tudo em sequência")
+    print("[0] Sair")
+    opcao = input("Digite a opção desejada: ").strip()
+
+    if opcao == "1":
+        instalar_pacotes_r()
+    elif opcao == "2":
+        perguntar_periodo()
+        gerar_csv()
+    elif opcao == "3":
+        renderizar_relatorios()
+        compactar_outputs()
+    elif opcao == "4":
+        instalar_pacotes_r()
+        perguntar_periodo()
+        gerar_csv()
+        renderizar_relatorios()
+        compactar_outputs()
+    elif opcao == "0":
+        print("Saindo.")
+    else:
+        print("Opção inválida.")
 
 if __name__ == "__main__":
     menu()

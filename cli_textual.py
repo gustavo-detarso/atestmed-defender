@@ -824,40 +824,16 @@ def main_bbs(screen):
             with open(os.path.join(DEBUG_LOG_DIR, f"{nome_script}_obrigatorios.txt"), "w", encoding="utf-8") as f:
                 f.write(str(obrigatorios))
 
-            # ⬇️ MENU VISUAL DE MODO DE RELATÓRIO ⬇️
+            # Escolha modo visual para relatório
             modo_rel = tela_escolha_modo_relatorio(screen)
             if modo_rel is None:
                 continue
 
             args_dict = {}
+            # Sempre pede data (start/end)
             for arg, helpmsg in obrigatorios.items():
-                if arg == "--top10":
-                    if modo_rel == "top10":
-                        args_dict[arg] = "--top10"
-                    # Não adiciona nada se for individual
-                elif arg == "--perito":
-                    if modo_rel == "individual":
-                        sug_func = SUGGESTION_MAP.get(arg)
-                        if sug_func:
-                            opcoes_peritos = sug_func()
-                            val = tela_autocomplete(screen, f"Selecione o perito:", opcoes_peritos)
-                        else:
-                            val = tela_input(screen, "Digite o nome do perito:")
-                        if not val:
-                            tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
-                            args_dict = None
-                            break
-                        args_dict[arg] = val
-                    # Não adiciona nada se for top10
-                elif arg in ("--start", "--end") or "data" in helpmsg.lower():
+                if arg in ("--start", "--end") or "data" in helpmsg.lower():
                     val = tela_data(screen, f"Preencha {arg}: {helpmsg}")
-                    if not val:
-                        tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
-                        args_dict = None
-                        break
-                    args_dict[arg] = val
-                else:
-                    val = tela_input(screen, f"Preencha {arg}: {helpmsg}")
                     if not val:
                         tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
                         args_dict = None
@@ -866,13 +842,28 @@ def main_bbs(screen):
             if args_dict is None:
                 continue
 
+            # Se individual, pede perito; se top10, adiciona flag
+            if modo_rel == "individual":
+                sug_func = SUGGESTION_MAP.get("--perito")
+                if sug_func:
+                    opcoes_peritos = sug_func()
+                    val = tela_autocomplete(screen, f"Selecione o perito:", opcoes_peritos)
+                else:
+                    val = tela_input(screen, "Digite o nome do perito:")
+                if not val:
+                    tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
+                    continue
+                args_dict["--perito"] = val
+            elif modo_rel == "top10":
+                args_dict["--top10"] = True
+
             inclui_comentarios = tela_yesno(screen, "Incluir comentários do ChatGPT nos gráficos?", cor=Screen.COLOUR_CYAN)
             incluir_pdf = tela_yesno(screen, "Exportar relatório em PDF?", cor=Screen.COLOUR_CYAN)
             incluir_org = tela_yesno(screen, "Exportar também em Org-mode?", cor=Screen.COLOUR_CYAN)
 
             cmd = [sys.executable, script_path]
             for k, v in args_dict.items():
-                if k == "--top10" and v == "--top10":
+                if k == "--top10" and v:
                     cmd.append("--top10")
                 elif k == "--perito":
                     cmd += [k, v]

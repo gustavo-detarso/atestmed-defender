@@ -11,17 +11,29 @@ params:
 ---
 
 ```{r setup, include=FALSE}
-
 library(readr)
 library(dplyr)
 library(ggplot2)
+library(glue)
 
 # recebe os parâmetros do YAML
 start_date <- params$start_date
 end_date   <- params$end_date
 
+# Caminho robusto para o CSV
+csv_path <- params$arquivo
+if (!file.exists(csv_path)) {
+  csv_alternativo <- file.path("..", "data", basename(csv_path))
+  if (file.exists(csv_alternativo)) {
+    message(glue("Arquivo CSV não encontrado em {csv_path}. Usando {csv_alternativo}."))
+    csv_path <- csv_alternativo
+  } else {
+    stop(glue("Arquivo CSV não encontrado em {csv_path} nem em {csv_alternativo}"))
+  }
+}
+
 # carrega e filtra o CSV
-df <- read_csv(params$arquivo) %>%
+df <- read_csv(csv_path) %>%
   filter(grupo %in% c("Top10", "Outros"))
 ```
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Módulo de funções de comentário para scripts ATESTMED.
-Todos os comentários consideram: se o perito analisado NÃO atinge o limiar de risco,
-o GPT instrui que mesmo fora do limiar deve-se monitorar/revisar toda a atuação.
+Primeiro parágrafo: descreve só os dados/indicador.
+Segundo: sempre reforça que a ausência/presença em um KPI não descarta risco.
+Agora robusto para casos em que perito_valor ou similares são None.
 """
+
 from dotenv import load_dotenv
 load_dotenv()
 import os
@@ -11,21 +13,23 @@ import openai
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+BLOCO_CONCLUSAO = (
+    "É importante ressaltar que o enquadramento ou não de um perito em um determinado critério de risco "
+    "não é suficiente para afastar ou confirmar risco de atuação inadequada. A avaliação de risco deve "
+    "sempre considerar o contexto completo e a análise integrada de todos os indicadores relevantes do "
+    "período, garantindo monitoramento contínuo para todos os profissionais."
+)
+
 def comentar_compare_30s(
     tabela_md: str, chart_ascii: str, start: str, end: str, threshold: int,
     perito_nome: str = None, perito_valor: float = None
 ) -> str:
-    extra = ""
-    if perito_nome and perito_valor is not None and perito_valor < threshold:
-        extra = (
-            f"\nObservação: O perito {perito_nome} NÃO atingiu o limiar de {threshold} análises com ≤{threshold}s. "
-            "Apesar disso, recomenda-se monitorar e revisar regularmente a atuação de todos os peritos, "
-            "incluindo aqueles fora do grupo de maior risco, conforme política de integridade do ATESTMED."
-        )
-    prompt = f"""
-Você é um auditor técnico do Ministério da Previdência Social, especialista em riscos operacionais do ATESTMED.
-
-Analise a tabela e o gráfico abaixo sobre perícias com duração ≤ {threshold}s entre {start} e {end}.
+    valor_str = (
+        f"{int(perito_valor)}" if perito_valor is not None
+        else "não disponível"
+    )
+    primeira_parte = f"""
+Analise os dados referentes à quantidade de perícias com duração igual ou inferior a {threshold} segundos, realizadas entre {start} e {end}.
 
 Tabela:
 {tabela_md}
@@ -33,17 +37,19 @@ Tabela:
 Gráfico ASCII:
 {chart_ascii}
 
-IMPORTANTE:
-- O indicador 'análises ≤ {threshold}s' identifica potenciais automatizações, execuções mecânicas ou julgamentos sem análise devida.
-- Realizar várias análises em poucos segundos é sempre um sinal de risco, nunca de eficiência.
-- Frequência elevada de perícias extremamente curtas foge ao padrão técnico e pode indicar fraude ou uso indevido do sistema.
-- Quanto mais análises ≤ {threshold}s, maior o risco de conduta inadequada.
-{extra}
+No indicador de duração ≤ {threshold}s, o perito {perito_nome or '[não informado]'} realizou {valor_str} análises no período considerado.
+Esse KPI visa identificar potenciais automatizações, execuções mecânicas ou julgamentos sumários. Altos valores para esse indicador sinalizam risco, mas a ausência não elimina a necessidade de monitoramento.
+""".strip()
+    segunda_parte = BLOCO_CONCLUSAO
 
-Comente tecnicamente, de modo objetivo e institucional:
-- Destaque o(s) perito(s) em risco.
-- Reforce que todos devem ser monitorados — inclusive aqueles fora do grupo de maior risco — para garantir integridade e qualidade.
-Responda em texto corrido, **SEM usar listas ou tópicos** (nem numeradas, nem bullets). O comentário deve ser composto apenas por frases e parágrafos contínuos.
+    prompt = f"""
+Você é um auditor técnico do Ministério da Previdência Social, especialista em riscos do ATESTMED.
+
+{primeira_parte}
+
+{segunda_parte}
+
+Responda sempre em texto corrido, **sem listas, tópicos ou enumerações**.
 """.strip()
     resp = openai.chat.completions.create(
         model="gpt-4o-mini",
@@ -59,22 +65,23 @@ def comentar_nc100(
     tabela_md: str, start: str, end: str,
     perito_nome: str = None, perito_valor: float = None
 ) -> str:
-    extra = ""
-    prompt = f"""
-Você é um auditor do Ministério da Previdência Social, especializado em integridade e controle do ATESTMED.
-
-Analise a lista de peritos com 100% de não conformidade no período de {start} a {end}:
+    primeira_parte = f"""
+A tabela abaixo apresenta a relação de peritos que registraram 100% de não conformidade no período de {start} a {end}.
 
 {tabela_md}
 
-INSTRUÇÕES:
-- 100% de não conformidade representa desvio total do procedimento e risco máximo para o sistema.
-- Indicador serve para detectar fraudes, atuação irregular ou desconhecimento dos protocolos.
-- Todos os casos devem ser considerados para revisão integral e possível bloqueio, conforme política institucional.
-Responda em texto corrido, **SEM usar listas ou tópicos** (nem numeradas, nem bullets). O comentário deve ser composto apenas por frases e parágrafos contínuos.
-{extra}
+Esse resultado significa que todas as análises realizadas pelo(s) perito(s) foram consideradas não conformes. Trata-se de uma situação de risco máximo, pois pode indicar total desvio do protocolo técnico, fraude ou desconhecimento das normas institucionais.
+""".strip()
+    segunda_parte = BLOCO_CONCLUSAO
 
-Gere um comentário objetivo, orientando medidas imediatas de auditoria e reforçando que nenhum caso deve ser negligenciado, independentemente de outras métricas.
+    prompt = f"""
+Você é um auditor do Ministério da Previdência Social, especializado em integridade e controle do ATESTMED.
+
+{primeira_parte}
+
+{segunda_parte}
+
+Responda sempre em texto corrido, **sem listas, tópicos ou enumerações**.
 """.strip()
     resp = openai.chat.completions.create(
         model="gpt-4o-mini",
@@ -90,22 +97,13 @@ def comentar_produtividade(
     tabela_md: str, chart_ascii: str, start: str, end: str, threshold: int,
     perito_nome: str = None, perito_valor: float = None
 ) -> str:
-    extra = ""
-    if perito_nome and perito_valor is not None:
-        if perito_valor < threshold:
-            extra = (
-                f"\nObservação: O perito {perito_nome} NÃO atingiu o limiar de {threshold} análises/hora neste período. "
-                "Mesmo assim, recomenda-se revisar e monitorar todas as análises periodicamente, inclusive as de peritos abaixo do limiar, conforme política de integridade."
-            )
-        else:
-            extra = (
-                f"\nO perito {perito_nome} atingiu ou superou o limiar de {threshold} análises/hora, "
-                "o que acende um alerta de risco conforme explicado abaixo."
-            )
-    prompt = f"""
-Você é um auditor técnico do Ministério da Previdência Social, especialista em detecção de riscos operacionais no ATESTMED.
+    if perito_valor is None:
+        valor_str = "não disponível"
+    else:
+        valor_str = f"{perito_valor:.2f}"
 
-Analise a tabela e o gráfico abaixo, referentes ao comparativo de produtividade (≥ {threshold} análises/hora) entre {start} e {end}.
+    primeira_parte = f"""
+Abaixo está a análise objetiva da produtividade do perito {perito_nome or '[não informado]'} em {start} a {end}.
 
 Tabela:
 {tabela_md}
@@ -113,16 +111,18 @@ Tabela:
 Gráfico ASCII:
 {chart_ascii}
 
-IMPORTANTE:
-- O KPI de produtividade (≥ {threshold} análises/hora) serve para identificar práticas automáticas, revezamento de credenciais ou ausência de análise real.
-- Maior produtividade acima deste limiar = maior risco de fraude e não conformidade.
-- **Atingir ou superar 50 análises/hora NÃO é meta institucional.** É um alerta para conduta incompatível.
-Responda em texto corrido, **SEM usar listas ou tópicos** (nem numeradas, nem bullets). O comentário deve ser composto apenas por frases e parágrafos contínuos.
-{extra}
+O KPI de produtividade utiliza o limiar de {threshold} análises/hora para indicar risco de execução mecânica, automatização ou revezamento de credenciais. O valor observado para o perito foi de {valor_str} análises/hora, o que deve ser comparado com esse referencial. A superação do limiar sugere potencial risco, mas estar abaixo não exclui a necessidade de monitoramento.
+""".strip()
+    segunda_parte = BLOCO_CONCLUSAO
 
-Comente tecnicamente:
-- Destaque se o perito está acima ou abaixo do limiar e o que isso representa.
-- Reforce que todos, inclusive fora do limiar, devem ser analisados regularmente para garantir integridade do sistema.
+    prompt = f"""
+Você é um auditor técnico do Ministério da Previdência Social, especialista em detecção de riscos operacionais do ATESTMED.
+
+{primeira_parte}
+
+{segunda_parte}
+
+Responda sempre em texto corrido, **sem listas, tópicos ou enumerações**.
 """.strip()
     resp = openai.chat.completions.create(
         model="gpt-4o-mini",
@@ -138,29 +138,30 @@ def comentar_overlap(
     tabela_md: str, chart_ascii: str, start: str, end: str,
     perito_nome: str = None, perito_valor: float = None
 ) -> str:
-    extra = ""
-    if perito_nome and perito_valor is not None and not perito_valor:
-        extra = (
-            f"\nObservação: Não foram detectadas sobreposições relevantes para o perito {perito_nome} neste período. "
-            "Mesmo assim, toda atuação deve ser acompanhada de modo preventivo."
-        )
+    valor_str = (
+        f"{perito_valor:.2f}%" if perito_valor is not None else "não disponível"
+    )
+    primeira_parte = f"""
+A análise a seguir detalha a ocorrência de sobreposição de protocolos de perícia para o perito {perito_nome or '[não informado]'}, no período de {start} a {end}.
+
+Tabela:
+{tabela_md}
+
+Gráfico ASCII:
+{chart_ascii}
+
+O KPI de sobreposição de protocolos identifica execução paralela tecnicamente inviável, sinalizando possível fraude ou revezamento de credenciais. O percentual de sobreposição observado foi {valor_str}. Mesmo a ausência de sobreposição não elimina a necessidade de revisão da atuação do perito.
+""".strip()
+    segunda_parte = BLOCO_CONCLUSAO
+
     prompt = f"""
 Você é um auditor de integridade operacional do Ministério da Previdência Social.
 
-Analise a tabela e o gráfico de sobreposição de tarefas de perícia entre {start} e {end}:
+{primeira_parte}
 
-{tabela_md}
+{segunda_parte}
 
-{chart_ascii}
-
-INSTRUÇÕES:
-- Sobreposição de tarefas indica execução paralela tecnicamente inviável e potencial fraude.
-- KPI serve para identificar múltiplos logins, revezamento de senha ou manipulação.
-- Incidência alta = bloqueio preventivo e revisão.
-Responda em texto corrido, **SEM usar listas ou tópicos** (nem numeradas, nem bullets). O comentário deve ser composto apenas por frases e parágrafos contínuos.
-{extra}
-
-Comente de modo claro, destacando o risco institucional, e sempre recomende monitoramento mesmo quando não há sobreposição para o perito analisado.
+Responda sempre em texto corrido, **sem listas, tópicos ou enumerações**.
 """.strip()
     resp = openai.chat.completions.create(
         model="gpt-4o-mini",
@@ -176,30 +177,30 @@ def comentar_rank_score(
     result_md: str, chart_ascii: str, start: str, end: str,
     perito_nome: str = None, perito_valor: float = None
 ) -> str:
-    extra = ""
-    if perito_nome and perito_valor is not None and perito_valor < 4.0:  # ajuste seu threshold real!
-        extra = (
-            f"\nO perito {perito_nome} ficou fora do grupo com scores finais mais elevados neste período, "
-            "mas, conforme política institucional, todos devem ser acompanhados para prevenir desvios."
-        )
-    prompt = f"""
-Você é um auditor institucional do Ministério da Previdência Social, especialista em integridade do ATESTMED.
-
-Analise o ranking de peritos por Score Final (ICRA + [1 – IATD]) entre {start} e {end}.
+    valor_str = (
+        f"{perito_valor:.2f}" if perito_valor is not None else "não disponível"
+    )
+    primeira_parte = f"""
+O ranking abaixo mostra os scores finais dos peritos no período de {start} a {end}.
 
 Tabela:
 {result_md}
 
+Gráfico ASCII:
 {chart_ascii}
 
-INSTRUÇÕES:
-- Score Final alto = desempenho pior, acúmulo de fatores de risco (produtividade, sobreposição, NC, etc).
-- Peritos com scores elevados = prioridade de supervisão, treinamento ou auditoria.
-- Monitoramento é obrigatório para todos, mesmo fora do grupo crítico.
-Responda em texto corrido, **SEM usar listas ou tópicos** (nem numeradas, nem bullets). O comentário deve ser composto apenas por frases e parágrafos contínuos.
-{extra}
+Score final elevado representa maior acúmulo de fatores de risco (produtividade, sobreposição, NC alta, etc). O score observado foi {valor_str}. Os peritos com maior score são priorizados para auditoria, mas a ausência nesse grupo não exclui monitoramento.
+""".strip()
+    segunda_parte = BLOCO_CONCLUSAO
 
-Comente tecnicamente, sempre destacando que a gestão de risco é para todos, não só para os casos críticos.
+    prompt = f"""
+Você é um auditor institucional do Ministério da Previdência Social, especialista em integridade do ATESTMED.
+
+{primeira_parte}
+
+{segunda_parte}
+
+Responda sempre em texto corrido, **sem listas, tópicos ou enumerações**.
 """.strip()
     resp = openai.chat.completions.create(
         model="gpt-4o-mini",
@@ -215,30 +216,30 @@ def comentar_rank_cr(
     result_md: str, chart_ascii: str, start: str, end: str,
     cr_nome: str = None, cr_valor: float = None
 ) -> str:
-    extra = ""
-    if cr_nome and cr_valor is not None and cr_valor < 4.0:  # ajuste seu threshold
-        extra = (
-            f"\nA CR {cr_nome} ficou fora do grupo de maior score médio neste período, "
-            "mas recomenda-se revisão periódica para garantir integridade e qualidade institucional."
-        )
-    prompt = f"""
-Você é um gestor estratégico do Ministério da Previdência Social, especialista em integridade do ATESTMED.
-
-Analise o ranking de CRs por Score Médio no período de {start} até {end}.
+    valor_str = (
+        f"{cr_valor:.2f}" if cr_valor is not None else "não disponível"
+    )
+    primeira_parte = f"""
+Segue a análise do score médio das CRs entre {start} e {end}.
 
 Tabela:
 {result_md}
 
+Gráfico ASCII:
 {chart_ascii}
 
-INSTRUÇÕES:
-- Score Médio alto = maior risco institucional, maior prioridade de intervenção.
-- Ranking orienta auditorias, supervisão e treinamento.
-- Não é prêmio: todos devem ser monitorados periodicamente.
-Responda em texto corrido, **SEM usar listas ou tópicos** (nem numeradas, nem bullets). O comentário deve ser composto apenas por frases e parágrafos contínuos.
-{extra}
+Scores médios elevados para determinada CR sinalizam maior risco institucional e necessidade de intervenção, mas todas as CRs devem ser acompanhadas. O score médio observado foi {valor_str}.
+""".strip()
+    segunda_parte = BLOCO_CONCLUSAO
 
-Comente de modo claro e estratégico, sempre reforçando que a gestão de risco vale para toda a estrutura.
+    prompt = f"""
+Você é um gestor estratégico do Ministério da Previdência Social, especialista em integridade do ATESTMED.
+
+{primeira_parte}
+
+{segunda_parte}
+
+Responda sempre em texto corrido, **sem listas, tópicos ou enumerações**.
 """.strip()
     resp = openai.chat.completions.create(
         model="gpt-4o-mini",
@@ -254,27 +255,24 @@ def comentar_icra(
     conteudo_md: str, nome: str, start: str, end: str,
     any_criterio_acionado: bool = True
 ) -> str:
-    extra = ""
-    if not any_criterio_acionado:
-        extra = (
-            "\nNenhum critério de risco foi acionado para o perito neste período. "
-            "Mesmo assim, recomenda-se monitoramento institucional e revisão periódica para garantir padrões de integridade."
-        )
-    prompt = f"""
-Você é um auditor do ATESTMED responsável por avaliação técnica individualizada de peritos.
-
-Abaixo está o detalhamento completo do ICRA para o perito {nome}, no período de {start} a {end}:
+    status = "Algum critério de risco foi acionado neste período." if any_criterio_acionado else "Nenhum critério de risco foi acionado neste período."
+    primeira_parte = f"""
+Segue o detalhamento completo do ICRA para o perito {nome}, no período de {start} a {end}.
 
 {conteudo_md}
 
-INSTRUÇÕES:
-- O ICRA reúne critérios que, quando acionados, sinalizam risco elevado (produtividade alta, curtas, NC alta, sobreposição).
-- Cada ocorrência é indício objetivo de desvio e demanda avaliação técnica.
-- Monitoramento é necessário mesmo quando nenhum critério é acionado.
-Responda em texto corrido, **SEM usar listas ou tópicos** (nem numeradas, nem bullets). O comentário deve ser composto apenas por frases e parágrafos contínuos.
-{extra}
+{status} O ICRA reúne critérios que, quando acionados, sinalizam risco elevado (produtividade alta, curtas, NC alta, sobreposição). Mesmo se nenhum critério for acionado, é recomendada revisão periódica e acompanhamento institucional.
+""".strip()
+    segunda_parte = BLOCO_CONCLUSAO
 
-Comente sucintamente, voltado à gestão de risco individual, e sempre sugerindo revisão e acompanhamento de todos os casos.
+    prompt = f"""
+Você é um auditor do ATESTMED responsável por avaliação técnica individualizada de peritos.
+
+{primeira_parte}
+
+{segunda_parte}
+
+Responda sempre em texto corrido, **sem listas, tópicos ou enumerações**.
 """.strip()
     resp = openai.chat.completions.create(
         model="gpt-4o-mini",

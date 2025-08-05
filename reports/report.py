@@ -321,34 +321,13 @@ def adicionar_capa_pdf(pdf_final_path):
     except Exception as e:
         print(f"[ERRO] Falha ao adicionar capa ao PDF: {e}")
 
-def perguntar_modo_interativo():
-    print("\n=== GERAÇÃO DE RELATÓRIO ATESTMED ===")
-    print("Escolha o modo de geração do relatório:")
-    print("1. Top 10 piores peritos")
-    print("2. Individual (por perito)")
-    while True:
-        escolha = input("Digite 1 para Top 10 ou 2 para Individual: ").strip()
-        if escolha == "1":
-            return {"top10": True}
-        elif escolha == "2":
-            nome = input("Digite o nome COMPLETO do perito: ").strip()
-            if nome:
-                return {"perito": nome}
-            else:
-                print("Nome não pode ser vazio. Tente novamente.")
-        else:
-            print("Opção inválida! Digite 1 ou 2.")
-
 def main():
     args = parse_args()
 
-    # HÍBRIDO: Pergunta se não foi passado nem top10 nem perito
+    # Checagem de modo (um e só um!)
     if not args.top10 and not args.perito:
-        modo = perguntar_modo_interativo()
-        if "top10" in modo:
-            args.top10 = True
-        if "perito" in modo:
-            args.perito = modo["perito"]
+        print("ERRO: É obrigatório informar --perito (individual) ou --top10")
+        sys.exit(1)
 
     PERIODO_DIR = os.path.join(OUTPUTS_DIR, f"{args.start}_a_{args.end}")
 
@@ -358,7 +337,7 @@ def main():
     elif args.perito:
         RELATORIO_DIR = os.path.join(PERIODO_DIR, "individual")
     else:
-        print("É obrigatório informar --perito (individual) ou --top10")
+        print("ERRO: É obrigatório informar --perito (individual) ou --top10")
         sys.exit(1)
 
     global IMGS_DIR, COMMENTS_DIR
@@ -383,10 +362,10 @@ def main():
     elif args.perito:
         lista_peritos = [args.perito]
     else:
-        print("É obrigatório informar --perito (individual) ou --top10")
+        print("ERRO: É obrigatório informar --perito (individual) ou --top10")
         sys.exit(1)
 
-    # Geração para cada perito individual, agora com checagem de existência de dados
+    # Geração para cada perito individual, com checagem de existência de dados
     org_paths = []
     for perito in lista_peritos:
         if not perito_tem_dados(perito, args.start, args.end):
@@ -434,4 +413,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

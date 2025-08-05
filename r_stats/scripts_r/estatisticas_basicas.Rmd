@@ -16,13 +16,23 @@ library(readr)
 library(dplyr)
 library(ggplot2)
 library(corrplot)
+library(glue)
 
 # parâmetros
 start_date <- params$start_date
 end_date   <- params$end_date
 
 # carrega dados
-df <- read_csv(params$arquivo)
+csv_path <- params$arquivo
+if (!file.exists(csv_path)) {
+  csv_alternativo <- file.path("..", "data", basename(csv_path))
+  if (file.exists(csv_alternativo)) {
+    message(glue("Arquivo CSV não encontrado em {csv_path}. Usando {csv_alternativo}."))
+    csv_path <- csv_alternativo
+  } else {
+    stop(glue("Arquivo CSV não encontrado em {csv_path} nem em {csv_alternativo}"))
+  }
+}
 ```
 
 **Período analisado**: r start_date até r end_date
