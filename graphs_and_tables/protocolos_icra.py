@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
 import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import sys
 import sqlite3
 import argparse
 import pandas as pd
@@ -8,14 +10,10 @@ import numpy as np
 import questionary
 from tabulate import tabulate
 from datetime import datetime
+from utils.comentarios import comentar_icra  # Integração GPT
 
-# Caminho absoluto para a raiz do projeto
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-
-# Caminho absoluto para o banco de dados
 DB_PATH = os.path.join(BASE_DIR, 'db', 'atestmed.db')
-
-# Caminho absoluto para exports
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
@@ -29,6 +27,7 @@ def parse_args():
     parser.add_argument('--export-md', action="store_true", help="Exportar direto para Markdown")
     parser.add_argument('--export-xlsx', action="store_true", help="Exportar direto para Excel")
     parser.add_argument('--export-comment', action="store_true", help="Exporta comentário ChatGPT no Markdown")
+    parser.add_argument('--add-comments', action="store_true", help="Gera comentário automaticamente (modo PDF)")
     return parser.parse_args()
 
 def export_md(nome, start, end, prod_rate, hours, total, protocolos_short, protocolos_nc,
@@ -69,26 +68,14 @@ def export_excel(nome, start, end, protocolos_short, protocolos_nc, protocolos_o
     return path
 
 def export_comment_md(nome, start, end):
-    # Busca nome seguro de arquivo
     safe = nome.replace(' ', '_')
     md_path = os.path.join(EXPORT_DIR, f"protocolos_icra_{safe}_{start}_{end}.md")
     if not os.path.isfile(md_path):
         print("Arquivo Markdown não encontrado para gerar comentário.")
         sys.exit(1)
-    try:
-        from openai import OpenAI
-    except ImportError:
-        print("Pacote openai não instalado.")
-        sys.exit(1)
     with open(md_path, "r", encoding="utf-8") as f:
         conteudo = f.read()
-    prompt = f"Gere um comentário profissional e sucinto para gestores sobre o detalhamento do ICRA do perito '{nome}' no período {start} a {end}:\n\n{conteudo}"
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", "SUA_API_KEY"))
-    response = client.chat.completions.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    comentario = response.choices[0].message.content.strip()
+    comentario = comentar_icra(conteudo, nome, start, end)
     out_path = md_path.replace(".md", "_comment.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("# Comentário automático do ChatGPT\n\n")
@@ -100,7 +87,7 @@ def main():
     start, end = args.start, args.end
 
     # --- fluxo para geração de comentário (sem consultar BD, só gera comentário!) ---
-    if args.export_comment:
+    if args.export_comment or args.add_comments:
         if not args.nome:
             print("Precisa informar --nome para exportar comentário!")
             sys.exit(1)

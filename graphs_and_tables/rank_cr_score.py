@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
 import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import sys
 import argparse
 import sqlite3
 import pandas as pd
@@ -9,20 +11,10 @@ from tabulate import tabulate
 import plotext as plt
 import io
 from datetime import datetime
+from utils.comentarios import comentar_rank_cr  # Integração GPT
 
-# ---- openai opcional ----
-try:
-    import openai
-except ImportError:
-    openai = None
-
-# Caminho absoluto para a raiz do projeto
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-
-# Caminho absoluto para o banco de dados
 DB_PATH = os.path.join(BASE_DIR, 'db', 'atestmed.db')
-
-# Caminho absoluto para exports
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
@@ -36,6 +28,7 @@ def parse_args():
     p.add_argument("--export-md",  action="store_true", help="Exportar tabela para MD sem prompt")
     p.add_argument("--export-png", action="store_true", help="Exportar gráfico para PNG sem prompt")
     p.add_argument("--export-comment", action="store_true", help="Exporta comentário do ChatGPT sobre a tabela MD")
+    p.add_argument("--add-comments", action="store_true", help="Gera comentário automaticamente (modo PDF)")
     return p.parse_args()
 
 def compute_scores(df: pd.DataFrame) -> pd.DataFrame:
@@ -104,7 +97,7 @@ def _export_md(md: str, start: str, end: str):
 
 def _export_png(labels, vals, start, end):
     import matplotlib.pyplot as mplt
-    fig, ax = mplt.subplots(figsize=(6,4))
+    fig, ax = mplt.subplots(figsize=(10, 6), dpi=400)
     x = np.arange(len(labels))
     ax.bar(x, vals, width=0.5, color="#5A9")
     ax.set_xticks(x)
@@ -152,20 +145,9 @@ def print_chart(cr_rank: pd.DataFrame, args):
             _export_png(labels, vals, args.start, args.end)
 
 def export_comment_md(start, end, md_path):
-    if openai is None:
-        print("openai não instalado!")
-        return
     with open(md_path, "r", encoding="utf-8") as f:
         tabela = f.read()
-    prompt = (
-        f"Gere um comentário analítico e direto para gestão sobre a tabela de score médio por CR no período de {start} até {end}:\n\n{tabela}"
-    )
-    openai.api_key = os.environ.get("OPENAI_API_KEY", "SUA_API_KEY")
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    comentario = response["choices"][0]["message"]["content"].strip()
+    comentario = comentar_rank_cr(tabela, "", start, end)
     out_path = md_path.replace(".md", "_comment.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("# Comentário automático do ChatGPT\n\n")
@@ -183,7 +165,7 @@ if __name__ == "__main__":
         if args.chart:
             print_chart(cr, args)
     # Só gera comentário se o arquivo MD já existir!
-    if args.export_comment:
+    if args.export_comment or args.add_comments:
         if not os.path.isfile(md_path):
             print("Arquivo MD não encontrado! Gere a tabela (MD) antes de gerar o comentário.")
             sys.exit(1)

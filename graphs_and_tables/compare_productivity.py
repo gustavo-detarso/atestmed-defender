@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import sqlite3
 import argparse
 from datetime import datetime
 import pandas as pd
 import matplotlib.pyplot as plt
+import plotext as p
+from utils.comentarios import comentar_produtividade  # Integração GPT
 
-# Caminho absoluto para a raiz do projeto
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-
-# Caminho absoluto para o banco de dados
 DB_PATH = os.path.join(BASE_DIR, 'db', 'atestmed.db')
-
-# Caminho absoluto para exports
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Compara produtividade ≥threshold/h: perito vs demais")
-    p.add_argument('--start',     required=True, help='Data inicial YYYY-MM-DD')
-    p.add_argument('--end',       required=True, help='Data final   YYYY-MM-DD')
-    p.add_argument('--perito',    required=True, help='Nome do perito a destacar')
-    p.add_argument('--threshold', '-t', type=int, default=50, help='Limite de análises/hora')
-    p.add_argument('--chart',      action='store_true', help='Exibe gráfico na tela (plotext)')
-    p.add_argument('--export-md',      action='store_true', help='Exporta tabela em Markdown')
-    p.add_argument('--export-png',     action='store_true', help='Exporta gráfico em PNG')
-    p.add_argument('--export-comment', action='store_true', help='Exporta comentário base')
-    return p.parse_args()
+    p_ = argparse.ArgumentParser(description="Compara produtividade ≥threshold/h: perito vs demais")
+    p_.add_argument('--start',     required=True, help='Data inicial YYYY-MM-DD')
+    p_.add_argument('--end',       required=True, help='Data final   YYYY-MM-DD')
+    p_.add_argument('--perito',    required=True, help='Nome do perito a destacar')
+    p_.add_argument('--threshold', '-t', type=int, default=50, help='Limite de análises/hora')
+    p_.add_argument('--chart',      action='store_true', help='Exibe gráfico na tela (plotext)')
+    p_.add_argument('--export-md',      action='store_true', help='Exporta tabela em Markdown')
+    p_.add_argument('--export-png',     action='store_true', help='Exporta gráfico em PNG')
+    p_.add_argument('--export-comment', action='store_true', help='Exporta comentário GPT')
+    p_.add_argument('--add-comments',   action='store_true', help='Gera comentário automaticamente (modo PDF)')
+    return p_.parse_args()
 
 def calcular_produtividade(start, end):
     conn = sqlite3.connect(DB_PATH)
@@ -43,7 +43,6 @@ def calcular_produtividade(start, end):
     rows = cur.fetchall()
     conn.close()
 
-    # produtividade = total análises / horas efetivas
     return {nome: (total / (segs / 3600) if segs and segs > 0 else 0)
             for nome, total, segs in rows}
 
@@ -77,6 +76,7 @@ def exportar_md(perito, valor, flag, pct_outros, threshold, start, end):
     with open(path, "w", encoding="utf-8") as f:
         f.write(md)
     print(f"✅ Markdown salvo em: {path}")
+    return md
 
 def exportar_png(perito, flag, pct_outros, threshold):
     safe = perito.replace(' ', '_')
@@ -88,11 +88,9 @@ def exportar_png(perito, flag, pct_outros, threshold):
     ax.set_ylim(0, 100)
     ax.grid(axis='y', linestyle='--', alpha=0.6)
 
-    # Anotações de valor acima das barras
     for bar, pct in zip(bars, [flag, pct_outros]):
-        h = bar.get_height()
         ax.text(bar.get_x() + bar.get_width()/2,
-                h + 2,
+                h := bar.get_height(),
                 f"{pct:.1f}%",
                 ha='center', va='bottom', fontsize=10)
 
@@ -102,19 +100,29 @@ def exportar_png(perito, flag, pct_outros, threshold):
     plt.close(fig)
     print(f"✅ PNG salvo em: {filename}")
 
-def exportar_comment(perito, threshold, start, end):
-    texto = (
-        f"O perito **{perito}** teve produtividade ≥ {threshold} análises/h em X% dos casos "
-        f"no período {start}–{end}, comparado aos demais."
-    )
+def exportar_comment(perito, valor, flag, pct_outros, threshold, start, end):
+    tabela_md = f"""| Categoria   | % ≥ {threshold}/h |
+|-------------|-------------------:|
+| **{perito}** | {flag:.1f}%        |
+| Demais      | {pct_outros:.1f}%  |
+
+**Produtividade do perito:** {valor:.2f} análises/hora
+"""
+    p.clear_data()
+    p.bar([perito, 'Demais'], [flag, pct_outros])
+    p.title(f"Produtividade ≥ {threshold}/h")
+    p.plotsize(80, 15)
+    chart_ascii = p.build()
+
+    comentario = comentar_produtividade(tabela_md, chart_ascii, start, end, threshold)
+
     fname = f"produtividade_{perito.replace(' ', '_')}_comment.md"
     path = os.path.join(EXPORT_DIR, fname)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(texto)
-    print(f"✅ Comentário salvo em: {path}")
+        f.write(comentario)
+    print(f"✅ Comentário ChatGPT salvo em: {path}")
 
 def exibir_plotext(perito, flag, pct_outros, threshold):
-    import plotext as p
     labels = [f"{perito} ({flag:.0f}%)", f"Demais ({pct_outros:.0f}%)"]
     values = [flag, pct_outros]
     p.clear_data()
@@ -134,8 +142,8 @@ if __name__ == '__main__':
         exportar_md(args.perito, valor, flag, pct_outros, args.threshold, args.start, args.end)
     if args.export_png:
         exportar_png(args.perito, flag, pct_outros, args.threshold)
-    if args.export_comment:
-        exportar_comment(args.perito, args.threshold, args.start, args.end)
+    if args.export_comment or args.add_comments:
+        exportar_comment(args.perito, valor, flag, pct_outros, args.threshold, args.start, args.end)
     if args.chart:
         exibir_plotext(args.perito, flag, pct_outros, args.threshold)
 

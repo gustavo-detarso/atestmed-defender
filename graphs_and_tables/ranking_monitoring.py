@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 import os
 import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import sys
 import argparse
 import sqlite3
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from tabulate import tabulate
+from utils.comentarios import comentar_rank_score  # integração GPT
 
 # Caminho absoluto para a raiz do projeto
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-
-# Caminho absoluto para o banco de dados
 DB_PATH = os.path.join(BASE_DIR, 'db', 'atestmed.db')
-
-# Caminho absoluto para exports
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
@@ -26,7 +25,8 @@ def parse_args():
     p.add_argument('--end', required=True, help='Data final   (YYYY-MM-DD)')
     p.add_argument('--export-md', action='store_true', help='Exporta para Markdown')
     p.add_argument('--export-csv', action='store_true', help='Exporta para CSV')
-    p.add_argument('--export-comment', action='store_true', help='Exporta comentário base')
+    p.add_argument('--export-comment', action='store_true', help='Exporta comentário explicativo')
+    p.add_argument('--add-comments', action='store_true', help='Gera comentário automaticamente (modo PDF)')
     return p.parse_args()
 
 def export_md(df: pd.DataFrame, start: str, end: str):
@@ -37,6 +37,7 @@ def export_md(df: pd.DataFrame, start: str, end: str):
         f.write(f"**Período:** {start} até {end}\n\n")
         f.write(df.to_markdown(index=False))
     print(f"✅ Exportado Markdown para {path}")
+    return df.to_markdown(index=False)
 
 def export_csv(df: pd.DataFrame, start: str, end: str):
     fname = f"ranking_score_detalhado_{start}_{end}.csv"
@@ -44,13 +45,15 @@ def export_csv(df: pd.DataFrame, start: str, end: str):
     df.to_csv(path, index=False)
     print(f"✅ Exportado CSV para {path}")
 
-def export_comment(start: str, end: str):
-    texto = f"Ranking detalhado de peritos com 50 ou mais tarefas no período de {start} a {end}, ordenado pelo Score Final calculado com base em critérios de produtividade, sobreposição, duração curta e não conformidade."
+def export_comment(df: pd.DataFrame, start: str, end: str):
+    tabela_md = df.to_markdown(index=False)
+    # O gráfico não é essencial, pois o ranking é tabelar
+    comentario = comentar_rank_score(tabela_md, "", start, end)
     fname = f"ranking_score_detalhado_{start}_{end}_comment.md"
     path = os.path.join(EXPORT_DIR, fname)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(texto)
-    print(f"✅ Comentário salvo em: {path}")
+        f.write(comentario)
+    print(f"✅ Comentário ChatGPT salvo em: {path}")
 
 def main():
     args = parse_args()
@@ -117,8 +120,8 @@ def main():
         export_md(result, args.start, args.end)
     if args.export_csv:
         export_csv(result, args.start, args.end)
-    if args.export_comment:
-        export_comment(args.start, args.end)
+    if args.export_comment or args.add_comments:
+        export_comment(result, args.start, args.end)
 
 if __name__ == '__main__':
     main()

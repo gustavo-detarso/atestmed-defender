@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import sqlite3
 import argparse
 import pandas as pd
 from datetime import datetime
 import matplotlib.pyplot as plt
+import plotext as p
+from utils.comentarios import comentar_overlap  # Integração GPT
 
 # Caminho absoluto para a raiz do projeto
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-
-# Caminho absoluto para o banco de dados
 DB_PATH = os.path.join(BASE_DIR, 'db', 'atestmed.db')
-
-# Caminho absoluto para exports
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Compara sobreposição de tarefas")
-    p.add_argument('--start', required=True, help='Data inicial YYYY-MM-DD')
-    p.add_argument('--end',   required=True, help='Data final   YYYY-MM-DD')
-    p.add_argument('--perito',required=True, help='Nome do perito a destacar')
-    p.add_argument('--chart', action='store_true', help='Exibe gráfico na tela (plotext)')
-    p.add_argument('--export-md',      action='store_true', help='Exporta tabela em Markdown')
-    p.add_argument('--export-png',     action='store_true', help='Exporta gráfico em PNG')
-    p.add_argument('--export-comment', action='store_true', help='Exporta comentário base')
-    return p.parse_args()
+    p_ = argparse.ArgumentParser(description="Compara sobreposição de tarefas")
+    p_.add_argument('--start', required=True, help='Data inicial YYYY-MM-DD')
+    p_.add_argument('--end',   required=True, help='Data final   YYYY-MM-DD')
+    p_.add_argument('--perito',required=True, help='Nome do perito a destacar')
+    p_.add_argument('--chart', action='store_true', help='Exibe gráfico na tela (plotext)')
+    p_.add_argument('--export-md',      action='store_true', help='Exporta tabela em Markdown')
+    p_.add_argument('--export-png',     action='store_true', help='Exporta gráfico em PNG')
+    p_.add_argument('--export-comment', action='store_true', help='Exporta comentário GPT')
+    p_.add_argument('--add-comments',   action='store_true', help='Gera comentário automaticamente (modo PDF)')
+    return p_.parse_args()
 
 def detectar_sobreposicao(start, end):
     conn = sqlite3.connect(DB_PATH)
@@ -73,7 +74,6 @@ def calcular_percentuais(flags, perito):
     return pct_perito, pct_geral
 
 def exibir_plotext(perito, pct_p, pct_o):
-    import plotext as p
     labels = [f"{perito} ({pct_p:.0f}%)", f"Outros ({pct_o:.0f}%)"]
     values = [pct_p, pct_o]
     p.clear_data()
@@ -84,21 +84,18 @@ def exibir_plotext(perito, pct_p, pct_o):
 
 def exportar_png(perito, pct_p, pct_o):
     safe = perito.replace(' ', '_')
-    fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=400)
     bars = ax.bar([perito, 'Demais'], [pct_p, pct_o], edgecolor='black')
     ax.set_title("Taxa de Sobreposição de Tarefas (%)", pad=15)
     ax.set_ylabel("Percentual (%)")
     ax.set_ylim(0, 100)
     ax.grid(axis='y', linestyle='--', alpha=0.6)
-
-    # Anotar valores acima de cada barra
     for bar, pct in zip(bars, [pct_p, pct_o]):
         height = bar.get_height()
         ax.text(bar.get_x() + bar.get_width() / 2,
                 height + 2,
                 f"{pct:.1f}%",
                 ha='center', va='bottom', fontsize=10)
-
     plt.tight_layout()
     filename = os.path.join(EXPORT_DIR, f"sobreposicao_{safe}.png")
     fig.savefig(filename)
@@ -120,17 +117,25 @@ def exportar_md(perito, pct_p, pct_o, start, end):
     with open(path, "w", encoding="utf-8") as f:
         f.write(md)
     print(f"✅ Markdown salvo em: {path}")
+    return md
 
-def exportar_comment(perito, start, end):
-    texto = (
-        f"O perito **{perito}** apresentou taxa de sobreposição de tarefas de "
-        f"{pct_p:.1f}% no período de {start} a {end}, comparado à média de "
-        f"{pct_o:.1f}% dos demais."
-    )
+def exportar_comment(perito, pct_p, pct_o, start, end):
+    tabela_md = f"""| Categoria  | % com Sobreposição |
+|------------|---------------------|
+| **{perito}** | {pct_p:.1f}%       |
+| Demais     | {pct_o:.1f}%       |
+"""
+    p.clear_data()
+    p.bar([perito, 'Demais'], [pct_p, pct_o])
+    p.title("Sobreposição de Tarefas")
+    p.plotsize(80, 15)
+    chart_ascii = p.build()
+
+    comentario = comentar_overlap(tabela_md, chart_ascii, start, end)
     path = os.path.join(EXPORT_DIR, f"sobreposicao_{perito.replace(' ', '_')}_comment.md")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(texto)
-    print(f"✅ Comentário salvo em: {path}")
+        f.write(comentario)
+    print(f"✅ Comentário ChatGPT salvo em: {path}")
 
 if __name__ == '__main__':
     args = parse_args()
@@ -145,6 +150,6 @@ if __name__ == '__main__':
         exportar_png(args.perito, pct_p, pct_o)
     if args.export_md:
         exportar_md(args.perito, pct_p, pct_o, args.start, args.end)
-    if args.export_comment:
-        exportar_comment(args.perito, args.start, args.end)
+    if args.export_comment or args.add_comments:
+        exportar_comment(args.perito, pct_p, pct_o, args.start, args.end)
 

@@ -1,38 +1,37 @@
 #!/usr/bin/env python3
 import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import sqlite3
 import argparse
 import pandas as pd
 import matplotlib.pyplot as plt
+import plotext as p
 from datetime import datetime
+from utils.comentarios import comentar_compare_30s
 
-# Caminho absoluto para a raiz do projeto
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-
-# Caminho absoluto para o banco de dados
 DB_PATH = os.path.join(BASE_DIR, 'db', 'atestmed.db')
-
-# Caminho absoluto para exports
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Compara perícias ≤ threshold s: perito vs demais")
-    p.add_argument('--start',     required=True, help='Data inicial YYYY-MM-DD')
-    p.add_argument('--end',       required=True, help='Data final   YYYY-MM-DD')
-    p.add_argument('--threshold', '-t', type=int, default=30, help='Limite em segundos')
-    p.add_argument('--chart',      action='store_true', help='Exibe gráfico na tela (plotext)')
-    p.add_argument('--export-md',      action='store_true', help='Exporta tabela em Markdown')
-    p.add_argument('--export-png',     action='store_true', help='Exporta gráfico em PNG')
-    p.add_argument('--export-comment', action='store_true', help='Exporta comentário para GPT')
-    p.add_argument('--perito',    required=True, help='Nome do perito')
-    return p.parse_args()
+    p_ = argparse.ArgumentParser(description="Compara perícias ≤ threshold s: perito vs demais")
+    p_.add_argument('--start',     required=True, help='Data inicial YYYY-MM-DD')
+    p_.add_argument('--end',       required=True, help='Data final   YYYY-MM-DD')
+    p_.add_argument('--threshold', '-t', type=int, default=30, help='Limite em segundos')
+    p_.add_argument('--chart',      action='store_true', help='Exibe gráfico na tela (plotext)')
+    p_.add_argument('--export-md',      action='store_true', help='Exporta tabela em Markdown')
+    p_.add_argument('--export-png',     action='store_true', help='Exporta gráfico em PNG')
+    p_.add_argument('--export-comment', action='store_true', help='Exporta comentário para GPT')
+    p_.add_argument('--add-comments',   action='store_true', help='Gera comentário automaticamente (modo PDF)')
+    p_.add_argument('--perito',    required=True, help='Nome do perito')
+    return p_.parse_args()
 
 def comparar(start, end, threshold, perito=None):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    # Se não recebeu perito, escolhe quem tem mais perícias ≤ threshold
     if not perito:
         cur.execute("""
             SELECT p.nomePerito, COUNT(*) AS qtd
@@ -51,7 +50,6 @@ def comparar(start, end, threshold, perito=None):
             exit(1)
         perito = row[0]
 
-    # Conta perícias ≤ threshold para o perito
     cur.execute("""
         SELECT COUNT(*)
           FROM analises a
@@ -62,7 +60,6 @@ def comparar(start, end, threshold, perito=None):
     """, (perito, start, end, threshold))
     cnt_p = cur.fetchone()[0] or 0
 
-    # Conta perícias ≤ threshold para os demais
     cur.execute("""
         SELECT COUNT(*)
           FROM analises a
@@ -92,6 +89,7 @@ def exportar_md(perito, cnt_p, cnt_o, threshold, start, end):
     with open(path, "w", encoding="utf-8") as f:
         f.write(md)
     print(f"✅ Markdown salvo em: {path}")
+    return md
 
 def exportar_png(perito, cnt_p, cnt_o, threshold):
     safe = perito.replace(' ', '_')
@@ -104,7 +102,6 @@ def exportar_png(perito, cnt_p, cnt_o, threshold):
     ax.set_ylim(0, max_val * 1.1)
     ax.grid(axis='y', linestyle='--', alpha=0.6)
 
-    # Anotação dos valores
     for bar, val in zip(bars, [cnt_p, cnt_o]):
         ax.text(bar.get_x() + bar.get_width()/2,
                 val + max_val*0.02,
@@ -118,22 +115,28 @@ def exportar_png(perito, cnt_p, cnt_o, threshold):
     print(f"✅ PNG salvo em: {filename}")
 
 def exportar_comment(perito, cnt_p, cnt_o, threshold, start, end):
-    comentario = (
-        f"O perito **{perito}** realizou {cnt_p} perícias com duração ≤ {threshold}s "
-        f"no período {start}–{end}, enquanto os demais realizaram {cnt_o}."
-    )
+    tabela_md = f"""| Categoria   | Qtd. Perícias |
+|-------------|---------------:|
+| **{perito}** | {cnt_p}        |
+| Demais      | {cnt_o}        |
+"""
+    p.clear_data()
+    p.bar([perito, 'Demais'], [cnt_p, cnt_o])
+    p.title(f"Perícias ≤ {threshold}s")
+    p.plotsize(80, 15)
+    chart_ascii = p.build()
+
+    comentario = comentar_compare_30s(tabela_md, chart_ascii, start, end, threshold)
+
     fname = f"compare_30s_{perito.replace(' ', '_')}_comment.md"
     path = os.path.join(EXPORT_DIR, fname)
     with open(path, "w", encoding="utf-8") as f:
         f.write(comentario)
-    print(f"✅ Comentário salvo em: {path}")
+    print(f"✅ Comentário ChatGPT salvo em: {path}")
 
 def exibir_chart(perito, cnt_p, cnt_o, threshold):
-    import plotext as p
-    labels = [perito, 'Demais']
-    values = [cnt_p, cnt_o]
     p.clear_data()
-    p.bar(labels, values)
+    p.bar([perito, 'Demais'], [cnt_p, cnt_o])
     p.title(f"Perícias ≤ {threshold}s")
     p.plotsize(80, 15)
     p.show()
@@ -148,7 +151,7 @@ if __name__ == '__main__':
         exportar_md(perito, cnt_p, cnt_o, args.threshold, args.start, args.end)
     if args.export_png:
         exportar_png(perito, cnt_p, cnt_o, args.threshold)
-    if args.export_comment:
+    if args.export_comment or args.add_comments:
         exportar_comment(perito, cnt_p, cnt_o, args.threshold, args.start, args.end)
     if args.chart:
         exibir_chart(perito, cnt_p, cnt_o, args.threshold)

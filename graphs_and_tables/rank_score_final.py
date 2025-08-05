@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
 import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import sys
 import argparse
 import sqlite3
 import pandas as pd
@@ -8,14 +10,10 @@ import numpy as np
 from datetime import datetime
 from tabulate import tabulate
 import matplotlib.pyplot as plt
+from utils.comentarios import comentar_rank_cr  # integração GPT
 
-# Caminho absoluto para a raiz do projeto
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-
-# Caminho absoluto para o banco de dados
 DB_PATH = os.path.join(BASE_DIR, 'db', 'atestmed.db')
-
-# Caminho absoluto para exports
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
@@ -28,6 +26,7 @@ def parse_args():
     p.add_argument('--export-md', action='store_true', help='Exporta tabela em Markdown')
     p.add_argument('--export-png', action='store_true', help='Exporta gráfico em PNG')
     p.add_argument('--export-comment', action='store_true', help='Exporta comentário explicativo')
+    p.add_argument('--add-comments', action='store_true', help='Gera comentário automaticamente (modo PDF)')
     return p.parse_args()
 
 def compute_perito_scores(df):
@@ -104,11 +103,12 @@ def export_md(df, start, end):
         f.write(f"**Período:** {start} até {end}\n\n")
         f.write(df.to_markdown(index=False))
     print(f"✅ Markdown salvo em: {path}")
+    return df.to_markdown(index=False)
 
 def export_png(df, start, end):
     fname = f"ranking_cr_score_{start}_{end}.png"
     path  = os.path.join(EXPORT_DIR, fname)
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(10, 6), dpi=400)
     plt.barh(df['cr'], df['Score Médio'], color="#1f77b4")
     plt.xlabel("Score Médio")
     plt.title(f"Score Médio por CR ({start} a {end})")
@@ -117,13 +117,15 @@ def export_png(df, start, end):
     plt.savefig(path)
     print(f"✅ Gráfico PNG salvo em: {path}")
 
-def export_comment(start, end):
-    texto = f"Ranking das CRs baseado no Score Final médio dos peritos entre {start} e {end}, refletindo critérios de produtividade, sobreposição, tempo de análise e não conformidade."
+def export_comment(df, start, end):
+    tabela_md = df.to_markdown(index=False)
+    # Como é ranking, não faz sentido gráfico ASCII simples
+    comentario = comentar_rank_cr(tabela_md, "", start, end)
     fname = f"ranking_cr_score_{start}_{end}_comment.md"
     path = os.path.join(EXPORT_DIR, fname)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(texto)
-    print(f"✅ Comentário salvo em: {path}")
+        f.write(comentario)
+    print(f"✅ Comentário ChatGPT salvo em: {path}")
 
 if __name__ == '__main__':
     args = parse_args()
@@ -134,6 +136,6 @@ if __name__ == '__main__':
         export_md(df, args.start, args.end)
     if args.export_png:
         export_png(df, args.start, args.end)
-    if args.export_comment:
-        export_comment(args.start, args.end)
+    if args.export_comment or args.add_comments:
+        export_comment(df, args.start, args.end)
 

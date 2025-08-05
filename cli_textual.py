@@ -805,14 +805,19 @@ def main_bbs(screen):
                 tela_mensagem(screen, "Operação cancelada pelo usuário.", cor=Screen.COLOUR_RED)
                 continue
 
-            # Pergunta se quer incluir comentários GPT e adiciona o argumento --add-comments se sim
+            # Pergunta se quer incluir comentários GPT
             inclui_comentarios = tela_yesno(screen, "Incluir comentários do ChatGPT nos gráficos?", cor=Screen.COLOUR_CYAN)
+            incluir_pdf = tela_yesno(screen, "Exportar relatório em PDF?", cor=Screen.COLOUR_CYAN)
+            incluir_org = tela_yesno(screen, "Exportar também em Org-mode?", cor=Screen.COLOUR_CYAN)
 
-            # Monta comando final com argumentos obrigatórios + --export-pdf + possível --add-comments
+            # Monta comando final com os argumentos obrigatórios + flags
             cmd = [sys.executable, script_path]
             for k, v in args_dict.items():
                 cmd += [k, v]
-            cmd.append('--export-pdf')
+            if incluir_pdf:
+                cmd.append('--export-pdf')
+            if incluir_org:
+                cmd.append('--export-org')
             if inclui_comentarios:
                 cmd.append('--add-comments')
 
