@@ -1,0 +1,143 @@
+#+attr_org: :width 1200
+#+name: fluxo_svg
+#+begin_src plantuml :file ./fluxo.svg :results silent :exports none
+@startuml
+skinparam defaultFontName Arial
+skinparam defaultFontSize 16
+skinparam monochrome true
+skinparam activity {
+  BorderColor Black
+  FontSize 13
+  BackgroundColor White
+  StartColor Black
+  EndColor Black
+  DiamondBackgroundColor White
+  DiamondBorderColor Black
+  RoundCorner 10
+}
+skinparam ArrowThickness 1
+title Fluxo de Monitoramento ATESTMED – Gestão Pública
+
+start
+
+partition "Portal PMF" {
+  :Aguardar atualização do DB no Portal PMF;
+  :Extração das tarefas no Portal PMF;
+}
+
+partition "CGACDC (Coordenação-Geral)" {
+  :Processa dados de uso e conformidade;
+  :Aplica critérios de risco e gera **Relatório de Risco** (Atestmed Defender);
+  :Elege peritos com potencial mau uso (Top N / Score / Evidências);
+  -> ListaPeritos;
+  :Autuar/abrir processos no SEI (um por perito) com Relatório de Risco anexado;
+  :Enviar números de processo às CRPMF competentes;
+}
+
+partition "CRPMF (Coordenação Regional)" {
+  :Receber números de processo dos peritos sob sua atuação;
+  :Realizar análise preliminar dos indícios;
+  -> CGACDC_VerificaPreliminar;
+}
+
+partition "CGACDC (Coordenação-Geral)" {
+  label CGACDC_VerificaPreliminar
+  :Verificar indícios com base na análise preliminar da CRPMF;
+  if ("Indícios confirmados pela CGACDC?") then (Não)
+    :Determinar arquivamento do processo no SEI;
+    stop
+  else (Sim)
+    :Retirar **preventivamente** a competência ATESTMED do perito (até conclusão da análise);
+    :Elaborar despacho para a DRPMF comunicar o perito a apresentar justificativas;
+    -> DRPMF_Justif;
+  endif
+}
+
+partition "DRPMF" {
+  label DRPMF_Justif
+  :Comunicar formalmente o perito para apresentar justificativas (SEI);
+  -> Perito_Justif;
+}
+
+partition "Perito Médico" {
+  label Perito_Justif
+  :Apresentar justificativas no SEI;
+  -> CGACDC_AvaliaJustif;
+}
+
+partition "CGACDC (Coordenação-Geral)" {
+  label CGACDC_AvaliaJustif
+  :Analisar defesa e evidências de uso da ferramenta;
+  if ("Resposta compatível com a ferramenta?") then (Sim)
+    :Restabelecimento da competência e arquivamento;
+    stop
+  else (Não)
+    :Solicitar à DRPMF que **oriente formalmente** (boas práticas/uso correto) no SEI;
+    -> Perito_Orientacao;
+  endif	
+}
+
+partition "DRPMF" {
+  label Perito_Orientacao
+  :Orientar formalmente o perito (SEI);
+  -> Perito_1o_Comunicado;
+}
+
+partition "Perito Médico" {
+  label Perito_1o_Comunicado
+  if ("Aceita orientações?") then (Sim)
+    :Restabelecimento da competência e arquivamento;
+    stop
+  else (Não)
+    :DRPMF registra recusa no SEI;
+    -> CGACDC_SegundaNotificacao;
+  endif
+}
+
+partition "CGACDC (Coordenação-Geral)" {
+  label CGACDC_SegundaNotificacao
+  :Determinar respeito aos preceitos da ferramenta (2ª notificação);
+  -> Perito_2o_Comunicado;
+}
+
+partition "DRPMF" {
+  label Perito_2o_Comunicado
+  :Determina formalmente o perito a seguir as regras do ATESTMED (SEI);
+  -> Determina_PMF;
+}
+
+partition "Perito Médico" {
+  label Determina_PMF
+  if ("Aceita determinação?") then (Sim)
+    :Restabelecimento da competência e arquivamento;
+    stop
+  else (Não)
+    :DRPMF registra recusa no SEI;
+    -> CGACDC_Corregedoria;
+  endif
+}
+
+partition "CGACDC (Coordenação-Geral)" {
+  label CGACDC_Corregedoria
+  :Encaminhar **à Corregedoria** (SEI) para providências cabíveis;
+  stop
+}
+
+' (opcional) estilo da legenda
+skinparam LegendBackgroundColor White
+skinparam LegendBorderColor Black
+skinparam LegendFontSize 13
+
+legend right
+<b>Legenda</b>
+----
+●  Início/Fim (start/stop)
+◇ Decisão (if/else)
+☐  Atividade (ação)
+✎  Nota (note)
+➜  Fluxo (seta)
+Moldura/“piscina” = partition "CGACDC (...)"
+endlegend
+
+@enduml
+#+end_src

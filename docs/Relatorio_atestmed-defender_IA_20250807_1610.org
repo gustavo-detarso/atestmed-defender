@@ -1,0 +1,35 @@
+#+INCLUDE: "/home/gustavodetarso/Documentos/.share/header_mps_org/header_mps.org"
+
+*RELATÓRIO INSTITUCIONAL – SISTEMA atestmed-defender*
+
+* Introdução
+
+O presente relatório visa documentar o desenvolvimento e a implementação de um sistema de automação para a extração e análise de dados do Portal PMF. Este projeto foi idealizado e desenvolvido exclusivamente por Gustavo Magalhães Mendes de Tarso, Coordenador-Geral de Assuntos Corporativos e Disseminação de Conhecimento. O sistema foi criado para enfrentar desafios específicos relacionados à complexidade dos arquivos CSV gerados pelo portal, que dificultavam a filtragem de profissionais com base em indicadores-chave de desempenho (KPIs).
+
+* Contexto do Problema
+
+O principal desafio enfrentado era a extração de dados do Portal PMF, que eram disponibilizados em arquivos CSV complexos. Esses arquivos dificultavam a filtragem eficiente de profissionais conforme os KPIs estabelecidos, como ICRA, IATD e Score Final. A complexidade dos dados tornava o processo de análise manual demorado e propenso a erros, impactando negativamente a capacidade de gestão e tomada de decisão.
+
+* Soluções Desenvolvidas
+
+Para resolver o problema, foi desenvolvido um sistema automatizado que realiza a filtragem dos dados, calcula os indicadores e gera relatórios de forma eficiente. O sistema utiliza scripts para processar os dados, calcular os KPIs e apresentar os resultados de maneira clara e objetiva. A automação desses processos não apenas economiza tempo, mas também melhora a precisão das análises.
+
+* Indicadores Estratégicos
+
+Os KPIs utilizados no sistema são o ICRA (Índice de Conformidade e Risco de Análise), o IATD (Índice de Análise de Tarefas Diárias) e o Score Final. O ICRA avalia a conformidade e o risco associado às análises realizadas, enquanto o IATD mede a eficiência diária dos profissionais. O Score Final é uma combinação dos dois indicadores anteriores, fornecendo uma visão abrangente do desempenho dos profissionais. Esses indicadores são fundamentais para a gestão estratégica, pois permitem identificar áreas de melhoria e alocar recursos de maneira mais eficaz.
+
+* Importância para a Gestão Estratégica
+
+O sistema desenvolvido é crucial para a gestão estratégica, pois permite o monitoramento em tempo real dos indicadores de desempenho. Com a capacidade de transformar grandes volumes de dados em informações acionáveis, o sistema apoia a tomada de decisão informada e estratégica. Isso resulta em uma gestão mais eficiente e na melhoria contínua dos serviços prestados.
+
+* Importância do Uso de Inteligência Artificial
+
+A utilização de inteligência artificial no sistema traz inúmeros benefícios, como a automação das análises de tarefas e a geração de relatórios institucionais. A IA permite processar grandes volumes de dados de forma rápida e precisa, introduzindo inovação na administração pública. Isso não apenas melhora a eficiência operacional, mas também garante que as decisões sejam baseadas em dados concretos e atualizados.
+
+* Impactos Institucionais
+
+O impacto institucional do sistema é significativo, proporcionando um serviço mais justo, célere e de qualidade para a população. Além disso, a automação dos processos resulta em economia para o governo, ao reduzir o tempo e os recursos necessários para a análise de dados. O sistema também contribui para a transparência e a responsabilidade na gestão pública.
+
+* Conclusão
+
+Em conclusão, o sistema desenvolvido por Gustavo Magalhães Mendes de Tarso representa um avanço significativo na automação e análise de dados do Portal PMF. Ao enfrentar desafios complexos de extração e análise de dados, o sistema melhora a eficiência e a eficácia da gestão pública, beneficiando tanto a administração quanto a população. A implementação bem-sucedida deste sistema destaca a importância da inovação e da tecnologia na modernização dos processos governamentais.
