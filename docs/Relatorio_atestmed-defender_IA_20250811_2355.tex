@@ -1,0 +1,133 @@
+% Created 2025-08-11 seg 23:55
+% Intended LaTeX compiler: xelatex
+\documentclass[11pt]{article}
+\usepackage{graphicx}
+\usepackage{longtable}
+\usepackage{wrapfig}
+\usepackage{rotating}
+\usepackage[normalem]{ulem}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{capt-of}
+\usepackage{hyperref}
+\usepackage[brazil, ]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[left=3cm, right=2cm, top=3cm, bottom=2cm]{geometry}
+\sloppy
+\hyphenpenalty=50
+\tolerance=2000
+\usepackage{graphicx}
+\usepackage{sectsty}
+\usepackage{ulem}
+\renewcommand{\ULdepth}{1.8pt}
+\author{Gustavo M. Mendes de Tarso}
+\date{\today}
+\title{}
+\hypersetup{
+ pdfauthor={Gustavo M. Mendes de Tarso},
+ pdftitle={},
+ pdfkeywords={},
+ pdfsubject={},
+ pdfcreator={Emacs 28.2 (Org mode 9.5.5)}, 
+ pdflang={Pt_Br}}
+\begin{document}
+
+\begin{center}
+\includegraphics[width=0.6\textwidth]{/home/gustavodetarso/Documentos/.share/png/logolula.png}
+\end{center}
+
+\vspace{-1.8cm}
+\begin{center}
+\textbf{Ministério da Previdência Social}\\
+Secretaria do Regime Geral da Previdência Social\\
+Departamento de Perícia Médica Federal
+\end{center}
+
+\vspace{-0.3cm}
+\hrule
+
+\vspace{-0.3cm}
+\begin{center}
+\textit{Coordenação-Geral de Assuntos Corporativos e Disseminação de Conhecimento}
+\end{center}
+
+\vspace{-0.8cm}
+\begin{center}
+\textbf{Gustavo Magalhães Mendes de Tarso}
+\end{center}
+
+\vspace{1.5cm}
+
+\textbf{RELATÓRIO INSTITUCIONAL – SISTEMA atestmed-defender}
+
+\section{Introdução}
+\label{sec:org8b382e5}
+O presente relatório visa documentar o desenvolvimento e a implementação de um sistema automatizado para a gestão de análises de tarefas no contexto de sistemas públicos. Este sistema foi concebido e desenvolvido exclusivamente por Gustavo Magalhães Mendes de Tarso, Coordenador-Geral de Assuntos Corporativos e Disseminação de Conhecimento. O sistema, cujo nome é derivado diretamente da pasta raiz do projeto, busca otimizar a extração e análise de dados complexos provenientes do Portal PMF, facilitando a filtragem de profissionais conforme indicadores-chave de desempenho (KPIs).
+
+\section{Contexto do Problema}
+\label{sec:org557aac6}
+O desafio central enfrentado era a extração de dados do Portal PMF, que se apresentavam em arquivos CSV complexos. Essa complexidade dificultava a filtragem eficaz de profissionais com base em KPIs, essenciais para a gestão estratégica e operacional. A necessidade de um sistema que pudesse automatizar a filtragem, cálculo de indicadores e geração de relatórios era evidente, dada a quantidade e complexidade dos dados envolvidos.
+
+\section{Soluções Desenvolvidas}
+\label{sec:org972032b}
+Para enfrentar o desafio, foi desenvolvido um sistema que automatiza a filtragem de dados, o cálculo de indicadores e a geração de relatórios. O sistema utiliza scripts em Python e R para processar os dados, calcular indicadores como ICRA, IATD e Score Final, e gerar relatórios detalhados. A automação desses processos não apenas reduz o tempo necessário para a análise de dados, mas também aumenta a precisão e consistência dos resultados.
+
+\section{Indicadores Estratégicos}
+\label{sec:orgf20ed25}
+Os KPIs utilizados no sistema incluem o Índice de Conformidade de Risco de Análise (ICRA), o Índice de Análise de Tarefas Diárias (IATD) e o Score Final. O ICRA mede a conformidade das análises realizadas, enquanto o IATD avalia a eficiência das análises diárias. O Score Final é uma métrica composta que integra múltiplos indicadores para fornecer uma visão abrangente do desempenho. Esses indicadores são cruciais para a gestão estratégica, pois permitem o monitoramento em tempo real e o suporte à decisão baseado em dados objetivos e acionáveis.
+
+\section{Importância para a Gestão Estratégica}
+\label{sec:org2ce7168}
+O sistema desenvolvido é de extrema importância para a gestão estratégica, pois permite o monitoramento em tempo real das análises de tarefas, transformando dados brutos em indicadores objetivos e acionáveis. Isso facilita a tomada de decisões informadas e a implementação de estratégias baseadas em evidências, promovendo uma gestão mais eficiente e eficaz.
+
+\section{Importância do Uso de Inteligência Artificial}
+\label{sec:org2e2ad59}
+A utilização de inteligência artificial no sistema é um diferencial significativo, permitindo a automação das análises e a geração de relatórios institucionais de forma inovadora. A IA contribui para a inovação na administração pública, automatizando processos complexos e permitindo uma análise mais profunda e precisa dos dados.
+
+\section{Impactos Institucionais}
+\label{sec:org2b9e906}
+O impacto institucional do sistema é significativo, proporcionando melhorias tanto para a população quanto para o governo. Para a população, o sistema garante uma análise mais rápida e precisa das tarefas, melhorando a qualidade dos serviços prestados. Para o governo, a automação dos processos resulta em economia de recursos e aumento da eficiência operacional.
+
+\section{Conclusão}
+\label{sec:org27edf80}
+Em conclusão, o sistema desenvolvido por Gustavo Magalhães Mendes de Tarso representa um avanço significativo na gestão de análises de tarefas em sistemas públicos. Ao automatizar processos complexos e integrar inteligência artificial, o sistema não apenas melhora a eficiência e precisão das análises, mas também contribui para uma gestão estratégica mais informada e eficaz.
+
+\section{Arquivos e Saídas Utilizados pelo Relatório}
+\label{sec:org0edcb9a}
+O arquivo \texttt{graphs\_and\_tables/compare\_fifteen\_seconds.py} gera gráficos comparativos de análises de tarefas com duração inferior a quinze segundos. Os principais parâmetros utilizados por \texttt{reports/make\_report.py} incluem \texttt{-{}-start}, \texttt{-{}-end}, \texttt{-{}-threshold}, e \texttt{-{}-mode}. Os artefatos gerados são salvos em formato PNG.
+
+O arquivo \texttt{graphs\_and\_tables/compare\_indicadores\_composto.py} calcula indicadores compostos e gera gráficos comparativos. Os parâmetros principais são \texttt{-{}-start}, \texttt{-{}-end}, \texttt{-{}-top10}, e \texttt{-{}-mode}. Os resultados são salvos em PNG e ORG.
+
+O arquivo \texttt{graphs\_and\_tables/compare\_motivos\_perito\_vs\_brasil.py} analisa os motivos de não conformidade, gerando gráficos e tabelas. Utiliza parâmetros como \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-perito}, salvando os resultados em PNG e MD.
+
+O arquivo \texttt{graphs\_and\_tables/compare\_nc\_rate.py} compara taxas de não conformidade, gerando gráficos e relatórios. Os parâmetros incluem \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-perito}, com saídas em PNG e ORG.
+
+O arquivo \texttt{graphs\_and\_tables/compare\_overlap.py} analisa sobreposições de tarefas, gerando gráficos e relatórios. Os parâmetros principais são \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-mode}, com saídas em PNG e ORG.
+
+O arquivo \texttt{graphs\_and\_tables/compare\_productivity.py} calcula a produtividade dos profissionais, gerando gráficos e relatórios. Utiliza parâmetros como \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-threshold}, com saídas em PNG e ORG.
+
+O arquivo \texttt{r\_checks/01\_nc\_rate\_check.R} verifica a taxa de não conformidade, gerando gráficos em PNG. Os parâmetros principais são \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-perito}.
+
+O arquivo \texttt{r\_checks/02\_le15s\_check.R} verifica a duração das análises, gerando gráficos em PNG. Os parâmetros incluem \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-threshold}.
+
+O arquivo \texttt{r\_checks/03\_productivity\_check.R} verifica a produtividade, gerando gráficos em PNG. Os parâmetros principais são \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-threshold}.
+
+O arquivo \texttt{r\_checks/04\_overlap\_check.R} verifica sobreposições de tarefas, gerando gráficos em PNG. Os parâmetros incluem \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-perito}.
+
+O arquivo \texttt{r\_checks/05\_motivos\_chisq.R} realiza testes qui-quadrado sobre motivos de não conformidade, gerando gráficos em PNG e relatórios em MD. Os parâmetros principais são \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-perito}.
+
+O arquivo \texttt{r\_checks/06\_composite\_robustness.R} verifica a robustez dos indicadores compostos, gerando gráficos em PNG. Os parâmetros incluem \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-perito}.
+
+O arquivo \texttt{r\_checks/g01\_top10\_nc\_rate\_check.R} verifica a taxa de não conformidade dos 10 piores, gerando gráficos em PNG. Os parâmetros principais são \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-min-analises}.
+
+O arquivo \texttt{r\_checks/g02\_top10\_le15s\_check.R} verifica a duração das análises dos 10 piores, gerando gráficos em PNG. Os parâmetros incluem \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-min-analises}.
+
+O arquivo \texttt{r\_checks/g03\_top10\_productivity\_check.R} verifica a produtividade dos 10 piores, gerando gráficos em PNG. Os parâmetros principais são \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-min-analises}.
+
+O arquivo \texttt{r\_checks/g04\_top10\_overlap\_check.R} verifica sobreposições de tarefas dos 10 piores, gerando gráficos em PNG. Os parâmetros incluem \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-min-analises}.
+
+O arquivo \texttt{r\_checks/g05\_top10\_motivos\_chisq.R} realiza testes qui-quadrado sobre motivos de não conformidade dos 10 piores, gerando gráficos em PNG e relatórios em MD. Os parâmetros principais são \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-min-analises}.
+
+O arquivo \texttt{r\_checks/g06\_top10\_composite\_robustness.R} verifica a robustez dos indicadores compostos dos 10 piores, gerando gráficos em PNG. Os parâmetros incluem \texttt{-{}-start}, \texttt{-{}-end}, e \texttt{-{}-min-analises}.
+\end{document}

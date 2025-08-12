@@ -103,8 +103,8 @@ def ensure_duracao_seg_column(db_path: str):
     UPDATE analises
        SET duracao_seg =
            CASE
-             WHEN dataHoraIniPericia IS NOT NULL AND TRIM(dataHoraIniPericia) <> ''
-              AND dataHoraFimPericia IS NOT NULL AND TRIM(dataHoraFimPericia) <> ''
+             WHEN dataHoraIniPericia IS NOT NULL AND dataHoraIniPericia <> ''
+              AND dataHoraFimPericia IS NOT NULL AND dataHoraFimPericia <> ''
                 THEN CAST(ROUND((julianday(dataHoraFimPericia) - julianday(dataHoraIniPericia)) * 86400.0) AS INTEGER)
              WHEN duracaoPericia GLOB '??:??:??'
                 THEN (CAST(substr(duracaoPericia,1,2) AS INTEGER) * 3600)
@@ -150,7 +150,6 @@ def create_database():
     - inclui uf, cr, dr, uo, lotacao em protocolos (snapshot)
     - FK de protocolos.siapePerito -> peritos.siapePerito (NÃO por nome)
     - analises.duracao_seg INTEGER (segundos)
-    - protocolos_reabertos: protocolos que tiveram início, fim e um novo início posterior
     """
     db_dir = './db'
     os.makedirs(db_dir, exist_ok=True)
@@ -163,7 +162,6 @@ def create_database():
     cur.executescript("""
     PRAGMA foreign_keys = ON;
 
-    DROP TABLE IF EXISTS protocolos_reabertos;
     DROP TABLE IF EXISTS indicadores;
     DROP TABLE IF EXISTS analises;
     DROP TABLE IF EXISTS protocolos;
@@ -180,6 +178,7 @@ def create_database():
     CREATE INDEX IF NOT EXISTS idx_peritos_nome ON peritos(nomePerito);
 
     -- Protocolos (snapshot + texto livre do motivo)
+    -- AGORA com siapePerito e FK por siape
     CREATE TABLE protocolos (
         protocolo         INTEGER PRIMARY KEY,
         siapePerito       INTEGER NOT NULL,
@@ -229,21 +228,6 @@ def create_database():
         scoreFinal REAL,
         FOREIGN KEY (perito) REFERENCES peritos (siapePerito)
     );
-
-    -- Protocolos reabertos (derivado de analises por horários)
-    -- Critério: existe, para um mesmo protocolo, um par (fim, próximo início) tal que next_ini > fim
-    CREATE TABLE protocolos_reabertos (
-        protocolo        INTEGER PRIMARY KEY,
-        siapePerito      INTEGER NOT NULL,
-        primeira_ini     TEXT NOT NULL,   -- início da sessão anterior ao primeiro gap detectado
-        primeira_fim     TEXT,            -- fim da sessão anterior
-        proximo_inicio   TEXT NOT NULL,   -- início imediatamente posterior (reabertura)
-        n_sessoes        INTEGER NOT NULL,
-        n_reaberturas    INTEGER NOT NULL,
-        FOREIGN KEY (protocolo)   REFERENCES protocolos (protocolo),
-        FOREIGN KEY (siapePerito) REFERENCES peritos (siapePerito)
-    );
-    CREATE INDEX IF NOT EXISTS idx_reabertos_perito ON protocolos_reabertos(siapePerito);
     """)
     conn.commit()
     conn.close()
@@ -283,7 +267,7 @@ def load_csv_to_db(csv_path, db_path):
                 VALUES (?, ?, ?, ?, ?)
             """, (siape, nome, cpf_p, r.get('cr') or None, r.get('dr') or None))
 
-        # protocolos
+        # protocolos (snapshot do evento) — AGORA inclui siapePerito
         protocolo = _to_int_safe(r.get('protocolo'))
         if protocolo and siape:
             cur.execute("""
@@ -293,7 +277,7 @@ def load_csv_to_db(csv_path, db_path):
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 protocolo,
-                siape,
+                siape,                                # <-- vincula pelo SIAPE
                 r.get('uf') or None,
                 r.get('cr') or None,
                 r.get('dr') or None,
@@ -476,106 +460,6 @@ def calcular_indicadores(db_path):
     print("🔢 Indicadores (ICRA, IATD, Score) calculados/atualizados com sucesso.")
 
 # ------------------------
-# Detecta e persiste protocolos reabertos
-# ------------------------
-
-def compute_protocolos_reabertos(db_path: str):
-    """
-    Popula a tabela protocolos_reabertos a partir de analises:
-    marca protocolos em que existe (para o mesmo protocolo) um próximo início > fim anterior.
-    Guarda também o primeiro par (ini_anterior, fim_anterior, proximo_inicio), o nº de sessões e de reaberturas.
-    """
-    if not os.path.exists(db_path):
-        print("⚠️ Banco não encontrado para computar reaberturas.")
-        return
-
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    cur = conn.cursor()
-
-    # Limpa a tabela antes de recalcular
-    cur.execute("DELETE FROM protocolos_reabertos;")
-    conn.commit()
-
-    # CTEs com window functions (SQLite 3.25+)
-    sql = """
-    WITH a AS (
-      SELECT
-        protocolo,
-        siapePerito,
-        TRIM(dataHoraIniPericia) AS ini,
-        TRIM(dataHoraFimPericia) AS fim
-      FROM analises
-      WHERE TRIM(dataHoraIniPericia) IS NOT NULL AND TRIM(dataHoraIniPericia) <> ''
-    ),
-    seq AS (
-      SELECT
-        protocolo,
-        siapePerito,
-        ini,
-        fim,
-        LEAD(ini) OVER (PARTITION BY protocolo ORDER BY ini) AS next_ini,
-        COUNT(*)  OVER (PARTITION BY protocolo)           AS n_sessoes
-      FROM a
-    ),
-    first_gap AS (
-      SELECT
-        protocolo,
-        siapePerito,
-        ini AS primeira_ini,
-        fim AS primeira_fim,
-        next_ini AS proximo_inicio,
-        ROW_NUMBER() OVER (PARTITION BY protocolo ORDER BY ini) AS rn
-      FROM seq
-      WHERE fim IS NOT NULL
-        AND next_ini IS NOT NULL
-        AND next_ini > fim
-    ),
-    agg AS (
-      SELECT
-        protocolo,
-        MAX(siapePerito) AS siapePerito,
-        MAX(n_sessoes)   AS n_sessoes,
-        SUM(CASE WHEN next_ini IS NOT NULL AND fim IS NOT NULL AND next_ini > fim THEN 1 ELSE 0 END) AS n_reaberturas
-      FROM seq
-      GROUP BY protocolo
-      HAVING n_reaberturas > 0
-    )
-    INSERT OR REPLACE INTO protocolos_reabertos
-      (protocolo, siapePerito, primeira_ini, primeira_fim, proximo_inicio, n_sessoes, n_reaberturas)
-    SELECT
-      fg.protocolo,
-      fg.siapePerito,
-      fg.primeira_ini,
-      fg.primeira_fim,
-      fg.proximo_inicio,
-      ag.n_sessoes,
-      ag.n_reaberturas
-    FROM first_gap fg
-    JOIN agg ag USING (protocolo)
-    WHERE fg.rn = 1;
-    """
-
-    cur.executescript(sql)
-    conn.commit()
-
-    n = cur.execute("SELECT COUNT(*) FROM protocolos_reabertos;").fetchone()[0]
-    print(f"🧭 Protocolos reabertos detectados: {n}")
-
-    # Opcional: alguns exemplos para conferência
-    sample = cur.execute("""
-        SELECT pr.protocolo, p.nomePerito, pr.primeira_ini, pr.primeira_fim, pr.proximo_inicio, pr.n_sessoes, pr.n_reaberturas
-        FROM protocolos_reabertos pr
-        JOIN peritos p ON p.siapePerito = pr.siapePerito
-        ORDER BY pr.protocolo
-        LIMIT 5;
-    """).fetchall()
-    if sample:
-        print("   Exemplos:", sample)
-
-    conn.close()
-
-# ------------------------
 # Fluxo Principal (CLI)
 # ------------------------
 
@@ -603,10 +487,9 @@ def process_database():
                     if af and af.get('c'):
                         load_csv_to_db(os.path.join('./data/raw', f), db_path)
 
-            # garante coluna, calcula indicadores e computa reaberturas
+            # garante coluna e calcula indicadores
             ensure_duracao_seg_column(db_path)
             calcular_indicadores(db_path)
-            compute_protocolos_reabertos(db_path)
         else:
             print("👋 Operação cancelada.")
             return
@@ -637,7 +520,6 @@ def process_database():
 
                 ensure_duracao_seg_column(db_path)
                 calcular_indicadores(db_path)
-                compute_protocolos_reabertos(db_path)
             else:
                 print("👋 Operação cancelada.")
                 return
@@ -658,7 +540,6 @@ def process_database():
 
             ensure_duracao_seg_column(db_path)
             calcular_indicadores(db_path)
-            compute_protocolos_reabertos(db_path)
 
 if __name__ == '__main__':
     process_database()
