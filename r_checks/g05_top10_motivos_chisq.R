@@ -15,7 +15,7 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(stringr)
   library(forcats)
-  library(tidyr) # NÃO usado em replace_na, mas para pivot_wider em fallback (não obrigatório)
+  library(tidyr)  # usado no pivot_wider
 })
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -52,24 +52,40 @@ lump_rare <- function(tbl, min_count = 10L) {
     summarise(n = sum(n), .groups = "drop")
 }
 
+table_exists <- function(con, name) {
+  nrow(dbGetQuery(con,
+                  "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1",
+                  params = list(name))) > 0
+}
+detect_analises_table <- function(con) {
+  for (t in c("analises","analises_atestmed")) if (table_exists(con, t)) return(t)
+  stop("Não encontrei 'analises' nem 'analises_atestmed'.")
+}
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Conexão e dados básicos
 # ────────────────────────────────────────────────────────────────────────────────
 con <- dbConnect(RSQLite::SQLite(), opt$db)
 on.exit(try(dbDisconnect(con), silent = TRUE))
 
-# Top 10 piores por scoreFinal, com mínimo de análises (mesmo critério do Python)
-sql_top10 <- "
-SELECT p.nomePerito AS nomePerito
+a_tbl <- detect_analises_table(con)
+if (!table_exists(con, "indicadores")) {
+  stop("Tabela 'indicadores' não encontrada — calcule indicadores antes de usar este script.")
+}
+
+# Top 10 piores por scoreFinal, com mínimo de análises (mesmo critério dos scripts Python)
+sql_top10 <- sprintf("
+SELECT p.nomePerito AS nomePerito, i.scoreFinal, COUNT(a.protocolo) AS total_analises
 FROM indicadores i
 JOIN peritos p ON i.perito = p.siapePerito
-JOIN analises a ON a.siapePerito = i.perito
-WHERE date(a.dataHoraIniPericia) BETWEEN ? AND ?
+JOIN %s a ON a.siapePerito = i.perito
+WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
 GROUP BY p.nomePerito, i.scoreFinal
-HAVING COUNT(a.protocolo) >= ?
-ORDER BY i.scoreFinal DESC
+HAVING total_analises >= ?
+ORDER BY i.scoreFinal DESC, total_analises DESC
 LIMIT 10;
-"
+", a_tbl)
+
 top10_df <- dbGetQuery(con, sql_top10, params = list(opt$start, opt$end, opt$`min-analises`))
 if (nrow(top10_df) == 0) {
   message("Nenhum perito atende ao critério Top 10. Nada a fazer.")
@@ -77,17 +93,25 @@ if (nrow(top10_df) == 0) {
 }
 top10_set <- unique(top10_df$nomePerito)
 
-# Todas NC no período (com texto de motivo)
-sql_nc <- "
+# Todas NC no período (com texto de motivo) — **NC robusto**
+#  NC = (conformado=0) OR (TRIM(motivoNaoConformado) <> '' AND CAST(motivoNaoConformado AS INTEGER) <> 0)
+sql_nc <- sprintf("
 SELECT
   p.nomePerito AS perito,
-  COALESCE(pr.motivo, 'Motivo_' || a.motivoNaoConformado) AS motivo_text
-FROM analises a
+  COALESCE(NULLIF(TRIM(pr.motivo), ''), 'Motivo_' || CAST(IFNULL(a.motivoNaoConformado,'0') AS TEXT)) AS motivo_text
+FROM %s a
 JOIN peritos p   ON a.siapePerito = p.siapePerito
 LEFT JOIN protocolos pr ON a.protocolo = pr.protocolo
-WHERE date(a.dataHoraIniPericia) BETWEEN ? AND ?
-  AND a.motivoNaoConformado != 0
-;"
+WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
+  AND (
+        CAST(IFNULL(a.conformado,1) AS INTEGER)=0
+        OR (
+             TRIM(IFNULL(a.motivoNaoConformado,'')) <> ''
+             AND CAST(IFNULL(a.motivoNaoConformado,'0') AS INTEGER) <> 0
+           )
+      );
+", a_tbl)
+
 all_nc <- dbGetQuery(con, sql_nc, params = list(opt$start, opt$end)) %>%
   mutate(motivo = if_else(is.na(motivo_text) | motivo_text == "", "MOTIVO_DESCONHECIDO", motivo_text)) %>%
   select(perito, motivo)
@@ -104,7 +128,6 @@ tab_top10 <- all_nc %>%
   mutate(grupo = if_else(perito %in% top10_set, "Top10", "Resto")) %>%
   count(grupo, motivo, name = "n") %>%
   tidyr::pivot_wider(names_from = grupo, values_from = n) %>%
-  # zera NAs com dplyr::coalesce via mutate/across (sem tidyr::replace_na)
   mutate(across(all_of(c("Top10","Resto")), ~ dplyr::coalesce(.x, 0L))) %>%
   arrange(desc(Top10 + Resto))
 

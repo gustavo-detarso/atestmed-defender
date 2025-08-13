@@ -6,7 +6,9 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import sqlite3
 import argparse
-from typing import Optional, Callable, Tuple, List, Set
+import re
+import json
+from typing import Optional, Callable, Tuple, List, Set, Dict, Any
 
 import pandas as pd
 import matplotlib
@@ -14,11 +16,15 @@ matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 
 try:
-    import plotext as p  # opcional para --chart
+    import plotext as p  # opcional para --chart / ASCII no comentário
 except Exception:
     p = None
 
-from utils.comentarios import comentar_produtividade  # Integração GPT
+def _px_build():
+    if p is None:
+        return ""
+    b = getattr(p, "build", None)
+    return b() if callable(b) else ""
 
 # Caminhos
 BASE_DIR   = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -30,7 +36,7 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 # Args
 # ────────────────────────────────────────────────────────────────────────────────
 def parse_args():
-    ap = argparse.ArgumentParser(description="Produtividade ≥ threshold/h (Perito ou Top 10) vs Brasil (excl.)")
+    ap = argparse.ArgumentParser(description="Produtividade acima de um limiar/h (Perito ou Top 10) versus Brasil (excl.)")
     ap.add_argument('--start',     required=True, help='Data inicial YYYY-MM-DD')
     ap.add_argument('--end',       required=True, help='Data final   YYYY-MM-DD')
 
@@ -40,24 +46,34 @@ def parse_args():
     g.add_argument('--top10',  action='store_true', help='Comparar os 10 piores por scoreFinal no período')
 
     ap.add_argument('--min-analises', type=int, default=50,
-                    help='Elegibilidade p/ Top 10 (mínimo de análises no período)')
+                    help='Elegibilidade para Top 10 (mínimo de análises no período)')
     ap.add_argument('--threshold', '-t', type=int, default=50,
-                    help='Limite de produtividade (análises por hora)')
+                    help='Limiar de produtividade (análises por hora)')
 
-    # Métrica: perito-share (padrão), task-share (ponderada por tarefas), time-share (ponderada por tempo)
+    # Métrica (ajuda sem sinais de porcentagem)
     ap.add_argument('--mode', choices=['perito-share', 'task-share', 'time-share'],
                     default='perito-share',
-                    help=("Métrica: 'perito-share' = % de peritos ≥ limiar; "
-                          "'task-share' = % de tarefas produzidas por peritos ≥ limiar; "
-                          "'time-share' = % do tempo trabalhado por peritos ≥ limiar."))
+                    help=("Métrica: 'perito-share' = proporção de peritos acima do limiar; "
+                          "'task-share' = proporção de tarefas produzidas por peritos acima do limiar; "
+                          "'time-share' = proporção do tempo trabalhado por peritos acima do limiar."))
 
     # Exportações
     ap.add_argument('--export-md',      action='store_true', help='Exporta tabela em Markdown')
     ap.add_argument('--export-png',     action='store_true', help='Exporta gráfico em PNG')
-    ap.add_argument('--export-org',     action='store_true', help='Exporta resumo em Org-mode (.org) com a imagem')
+    ap.add_argument('--export-org',     action='store_true', help='Exporta resumo em Org-mode (.org) com a imagem e, se solicitado, o comentário')
     ap.add_argument('--chart',          action='store_true', help='Gráfico ASCII no terminal')
-    ap.add_argument('--export-comment', action='store_true', help='Exporta comentário GPT')
-    ap.add_argument('--add-comments',   action='store_true', help='Gera comentário automaticamente (modo PDF)')
+
+    # Comentários (agora inseridos no .org principal)
+    ap.add_argument('--export-comment',     action='store_true', help='Gera comentário (alias para inserir comentário no .org)')
+    ap.add_argument('--add-comments',       action='store_true', help='Sinônimo de --export-comment (compatibilidade)')
+    ap.add_argument('--export-comment-org', action='store_true', help='Insere comentário interpretativo diretamente no .org')
+    ap.add_argument('--call-api',           action='store_true', help='Usa OPENAI_API_KEY (.env) para gerar comentário via API')
+    ap.add_argument('--debug-comments',     action='store_true', help='Exibe qual caminho foi usado (API vs fallback)')
+
+    # Parâmetros de geração (API)
+    ap.add_argument('--model',       default='gpt-4o-mini', help='Modelo OpenAI (padrão: gpt-4o-mini)')
+    ap.add_argument('--max-words',   type=int, default=180, help='Máximo de palavras no comentário')
+    ap.add_argument('--temperature', type=float, default=0.2, help='Temperatura da geração')
 
     return ap.parse_args()
 
@@ -249,16 +265,16 @@ def _safe(name: str) -> str:
 
 def _labels_for_mode(mode: str) -> Tuple[str, str, str]:
     if mode == "perito-share":
-        return ("% de peritos ≥ limiar", "Peritos ≥ limiar (n)", "Peritos (total)")
+        return ("Percentual de peritos acima do limiar", "Peritos acima do limiar (n)", "Peritos (total)")
     if mode == "task-share":
-        return ("% de tarefas de peritos ≥ limiar", "Tarefas (peritos ≥ limiar)", "Tarefas (total)")
-    return ("% do tempo de peritos ≥ limiar", "Tempo (s) peritos ≥ limiar", "Tempo (s) total")
+        return ("Percentual de tarefas de peritos acima do limiar", "Tarefas (peritos acima do limiar)", "Tarefas (total)")
+    return ("Percentual do tempo de peritos acima do limiar", "Tempo (s) peritos acima do limiar", "Tempo (s) total")
 
 def _title_for_mode(mode: str, threshold: float, scope: str) -> str:
     prefix = {
-        "perito-share": "% de peritos ≥",
-        "task-share":   "% de tarefas de peritos ≥",
-        "time-share":   "% do tempo de peritos ≥",
+        "perito-share": "Percentual de peritos ≥",
+        "task-share":   "Percentual de tarefas de peritos ≥",
+        "time-share":   "Percentual do tempo de peritos ≥",
     }[mode]
     return f"Produtividade — {prefix} {threshold}/h ({scope})"
 
@@ -325,7 +341,8 @@ def _export_org(title: str, start: str, end: str,
                 left_label: str, right_label: str, left_num: float, left_den: float, left_pct: float,
                 right_num: float, right_den: float, right_pct: float,
                 a_name: str, b_name: str, png_path: str, out_name: str,
-                top_names: Optional[List[str]] = None, mode: str = "") -> str:
+                top_names: Optional[List[str]] = None, mode: str = "",
+                comment_text: Optional[str] = None) -> str:
     out = os.path.join(EXPORT_DIR, out_name)
     lines = []
     lines.append(f"* {title}")
@@ -349,6 +366,12 @@ def _export_org(title: str, start: str, end: str,
         lines.append(f"#+CAPTION: {title}")
         lines.append(f"[[file:{os.path.basename(png_path)}]]\n")
 
+    # Comentário inserido diretamente no .org
+    if comment_text:
+        lines.append("** Comentário")
+        lines.append(comment_text.strip())
+        lines.append("")
+
     with open(out, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print("✅ Org salvo em", out)
@@ -366,20 +389,242 @@ def _render_ascii(title: str, y_label: str, left_label: str, right_label: str, l
     p.plotsize(80, 18)
     p.show()
 
-def _export_comment(md_table: str, ascii_chart: str, start: str, end: str, threshold: float, stem: str) -> str:
-    comentario = comentar_produtividade(md_table, ascii_chart, start, end, threshold)
-    path = os.path.join(EXPORT_DIR, f"{stem}_comment.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(comentario)
-    print("🗒️ Comentário ChatGPT salvo em", path)
-    return path
+# ────────────────────────────────────────────────────────────────────────────────
+# Comentários (integra utils/comentarios + API direta + fallback) → texto para .org
+# ────────────────────────────────────────────────────────────────────────────────
+
+# utils.comentarios
+_COMENT_FUNCS: List[Callable[..., Any]] = []
+try:
+    from utils.comentarios import comentar_produtividade as _cf1  # se existir, será utilizado
+    _COMENT_FUNCS.append(_cf1)
+except Exception:
+    pass
+try:
+    from utils.comentarios import comentar_overlap as _cf2
+    _COMENT_FUNCS.append(_cf2)
+except Exception:
+    pass
+
+# .env + OpenAI
+def _load_openai_key_from_dotenv(env_path: str) -> Optional[str]:
+    if not os.path.exists(env_path):
+        return os.getenv("OPENAI_API_KEY")
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv(env_path, override=False)
+        if os.getenv("OPENAI_API_KEY"):
+            return os.getenv("OPENAI_API_KEY")
+    except Exception:
+        pass
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == "OPENAI_API_KEY":
+                    v = v.strip().strip('"').strip("'")
+                    if v:
+                        os.environ.setdefault("OPENAI_API_KEY", v)
+                        return v
+    except Exception:
+        pass
+    return os.getenv("OPENAI_API_KEY")
+
+def _call_openai_chat(messages: List[Dict[str, str]], model: str, temperature: float) -> Optional[str]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    # SDK novo
+    try:
+        from openai import OpenAI  # type: ignore
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
+        txt = (resp.choices[0].message.content or "").strip()
+        if txt:
+            return txt
+    except Exception:
+        pass
+    # SDK legado
+    try:
+        import openai  # type: ignore
+        openai.api_key = api_key
+        resp = openai.ChatCompletion.create(model=model, messages=messages, temperature=temperature)
+        txt = resp["choices"][0]["message"]["content"]
+        if txt:
+            return txt.strip()
+    except Exception:
+        pass
+    return None
+
+# Sanitização
+def _sanitize_org_text(text: str, max_words: int) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"^```.*?$", "", text, flags=re.M)
+    text = re.sub(r"^~~~.*?$", "", text, flags=re.M)
+    kept = []
+    for ln in text.splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        if t.startswith("[") and t.endswith("]"):  # cabeçalhos
+            continue
+        if t.startswith("|"):   # tabelas
+            continue
+        if t.startswith("#+"):  # diretivas org
+            continue
+        kept.append(ln)
+    text = " ".join(" ".join(kept).split())
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[:max_words]).rstrip() + "…"
+    return text
+
+# Parsing e prompts
+def _parse_prod_md_table(md_table: str) -> Dict[str, Any]:
+    lines = [ln for ln in md_table.splitlines() if ln.strip().startswith("|")]
+    if not lines:
+        return {}
+    hdr = re.sub(r"\s*\|\s*", " | ", lines[0].strip())
+    hcols = [c.strip() for c in hdr.strip("|").split("|")]
+    if len(hcols) < 4:
+        return {}
+    a_label = hcols[1]
+    b_label = hcols[2]
+    data_rows: List[List[str]] = []
+    for ln in lines[1:]:
+        if set(ln.replace("|", "").strip()) <= set("-: "):
+            continue
+        cols = [c.strip() for c in re.sub(r"\s*\|\s*", " | ", ln.strip()).strip("|").split("|")]
+        if len(cols) == 4:
+            data_rows.append(cols)
+
+    def _row(cols: List[str]):
+        label = cols[0]
+        try:    num = float(cols[1].replace("s",""))
+        except: num = 0.0
+        try:    den = float(cols[2].replace("s",""))
+        except: den = 0.0
+        try:    pct = float(str(cols[3]).replace("%", "").strip())
+        except: pct = 0.0
+        return {"label": label, "num": num, "den": den, "pct": pct}
+
+    left  = _row(data_rows[0]) if len(data_rows) >= 1 else {"label":"A","num":0,"den":0,"pct":0.0}
+    right = _row(data_rows[1]) if len(data_rows) >= 2 else {"label":"B","num":0,"den":0,"pct":0.0}
+    # Inferência simples do modo
+    hint = (a_label + " " + b_label).lower()
+    if "perito" in hint:
+        mode = "perito-share"
+    elif "tarefa" in hint:
+        mode = "task-share"
+    elif "tempo" in hint or "(s)" in hint or "segundo" in hint:
+        mode = "time-share"
+    else:
+        mode = "task-share"
+    return {"a_label": a_label, "b_label": b_label, "left": left, "right": right, "mode": mode}
+
+def _build_messages_produtividade(start: str, end: str, threshold: float, mode: str,
+                                  parsed: Dict[str, Any], ascii_chart: str, max_words: int) -> List[Dict[str, str]]:
+    human_metric = {
+        "perito-share": "proporção de peritos acima do limiar",
+        "task-share":   "proporção de tarefas de peritos acima do limiar",
+        "time-share":   "proporção do tempo de peritos acima do limiar"
+    }.get(mode, "métrica")
+
+    resumo = {
+        "periodo": f"{start} a {end}",
+        "limiar_h": float(threshold),
+        "metrica": mode,
+        "descricao_metrica": human_metric,
+        "lhs": parsed["left"],
+        "rhs": parsed["right"],
+        "grafico_ascii": ascii_chart or ""
+    }
+
+    system = "Você é um analista de dados do ATESTMED. Escreva comentários claros, objetivos e tecnicamente corretos."
+    user = (
+        "Escreva um comentário interpretativo em português (Brasil) para acompanhar um gráfico de duas barras "
+        f"sobre produtividade maior ou igual a {threshold}/h. Use TEXTO CORRIDO (um único parágrafo, sem títulos/listas/tabelas), "
+        f"com no máximo {max_words} palavras. Inclua: (1) leitura direta da comparação; "
+        "(2) diferença em pontos percentuais; (3) referência aos denominadores (n); "
+        "evite jargões e conclusões causais. Dados resumidos (JSON):\n\n" + json.dumps(resumo, ensure_ascii=False)
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+def _heuristic_prod_comment(start: str, end: str, threshold: float, mode: str, parsed: Dict[str, Any]) -> str:
+    left = parsed["left"]; right = parsed["right"]
+    diff = float(left["pct"]) - float(right["pct"])
+    if mode == "time-share":
+        esq = f"{left['pct']:.1f}% (n={left['num']:.0f}/{left['den']:.0f} s)"
+        dir = f"{right['pct']:.1f}% (n={right['num']:.0f}/{right['den']:.0f} s)"
+    else:
+        esq = f"{left['pct']:.1f}% (n={int(left['num'])}/{int(left['den'])})"
+        dir = f"{right['pct']:.1f}% (n={int(right['num'])}/{int(right['den'])})"
+    return (
+        f"No período {start} a {end}, considerando o limiar de {threshold}/h, "
+        f"{left['label']} registrou {esq}, enquanto {right['label']} apresentou {dir}. "
+        f"A diferença é de {abs(diff):.1f} p.p., "
+        f"{'acima' if diff > 0 else 'abaixo' if diff < 0 else 'em linha'} do comparativo. "
+        "Os percentuais refletem a participação relativa dos profissionais que atingem o limiar e podem variar conforme mix de casos e janelas de pico."
+    )
+
+def _generate_comment_text(md_table: str, ascii_chart: str, start: str, end: str,
+                           threshold: float, mode: str, call_api: bool, debug: bool,
+                           model: str, max_words: int, temperature: float) -> str:
+    """
+    1) tenta utils.comentarios (comentar_produtividade/comentar_overlap)
+    2) se falhar, chama API direta
+    3) fallback heurístico
+    """
+    parsed = _parse_prod_md_table(md_table)
+
+    # (1) utils.comentarios
+    for fn in _COMENT_FUNCS:
+        try:
+            out = None
+            try:
+                out = fn(md_table, ascii_chart, start, end, threshold, call_api=call_api, model=model)  # type: ignore
+            except TypeError:
+                try:
+                    out = fn(md_table, ascii_chart, start, end, call_api=call_api, model=model)  # type: ignore
+                except TypeError:
+                    out = fn(md_table, ascii_chart, start, end)  # type: ignore
+            text = (out.get("comment") if isinstance(out, dict) else str(out or "")).strip()
+            if text:
+                if debug:
+                    print(f"ℹ️ comentários: usando {fn.__name__} (call_api={call_api and bool(os.getenv('OPENAI_API_KEY'))})")
+                return _sanitize_org_text(text, max_words)
+        except Exception:
+            continue
+
+    # (2) API direta
+    if call_api and parsed:
+        try:
+            _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
+            msgs = _build_messages_produtividade(start, end, threshold, mode, parsed, ascii_chart, max_words)
+            api_txt = _call_openai_chat(msgs, model=model, temperature=temperature)
+            if api_txt:
+                return _sanitize_org_text(api_txt, max_words)
+        except Exception:
+            pass
+
+    # (3) fallback heurístico
+    if not parsed:
+        basic = f"No período {start} a {end}, compara-se a proporção relacionada ao limiar {threshold}/h entre dois grupos. "
+        return _sanitize_org_text(basic + "Tabela-base: " + re.sub(r"\s+", " ", md_table.strip()), max_words)
+    return _sanitize_org_text(_heuristic_prod_comment(start, end, threshold, mode, parsed), max_words)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Execução por modo
 # ────────────────────────────────────────────────────────────────────────────────
 def run_perito(start: str, end: str, perito: str, threshold: float, mode: str,
                export_md: bool, export_png: bool, export_org: bool,
-               chart: bool, export_comment: bool, add_comments: bool) -> None:
+               chart: bool, want_comment: bool,
+               call_api: bool, debug_comments: bool,
+               model: str, max_words: int, temperature: float) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, _ = _detect_tables(conn)
         df = _load_period_df(conn, tbl, start, end)
@@ -395,7 +640,7 @@ def run_perito(start: str, end: str, perito: str, threshold: float, mode: str,
     left_set  = {perito}
     right_set = set(agg["nomePerito"]) - left_set
 
-    left_num, left_den, left_pct   = _aggregate_group(agg, left_set,  mode)
+    left_num, left_den, left_pct    = _aggregate_group(agg, left_set,  mode)
     right_num, right_den, right_pct = _aggregate_group(agg, right_set, mode)
 
     y_label, a_name, b_name = _labels_for_mode(mode)
@@ -405,7 +650,7 @@ def run_perito(start: str, end: str, perito: str, threshold: float, mode: str,
     png   = os.path.join(EXPORT_DIR, f"{stem}.png")
     org   = f"{stem}.org"
 
-    # tabela MD inline (também para comentário)
+    # tabela MD (para .md e para o comentário)
     if mode == "time-share":
         md_tbl = (
             f"| Categoria | {a_name} | {b_name} | % |\n"
@@ -421,40 +666,48 @@ def run_perito(start: str, end: str, perito: str, threshold: float, mode: str,
             f"| Demais    | {int(right_num)} | {int(right_den)} | {right_pct:.1f}% |\n"
         )
 
-    if export_md or export_comment or add_comments:
+    if export_md or want_comment:
         _export_md(title, start, end, perito, "Demais",
                    left_num, left_den, left_pct,
                    right_num, right_den, right_pct,
                    a_name, b_name, stem, mode)
 
-    if export_png:
-        _render_png(title, y_label, perito, "Demais",
-                    left_pct, right_pct, left_num, left_den, right_num, right_den,
-                    mode, png)
-
-    if export_org:
+    if export_png or export_org or want_comment:
         if not os.path.exists(png):
             _render_png(title, y_label, perito, "Demais",
                         left_pct, right_pct, left_num, left_den, right_num, right_den,
                         mode, png)
-        _export_org(title, start, end, perito, "Demais",
-                    left_num, left_den, left_pct, right_num, right_den, right_pct,
-                    a_name, b_name, png, org, mode=mode)
 
     if chart:
         _render_ascii(title, y_label, perito, "Demais", left_pct, right_pct)
 
-    if export_comment or add_comments:
-        chart_ascii = ""
+    # Org principal (gera se pediu org OU se pediu comentário)
+    if export_org or want_comment:
+        ascii_chart = ""
         if p is not None:
-            p.clear_data()
-            p.bar([perito, "Demais"], [left_pct, right_pct])
-            p.title(title)
-            p.plotsize(80, 15)
-            chart_ascii = p.build()
-        _export_comment(md_tbl, chart_ascii, start, end, threshold, stem)
+            try:
+                p.clear_data()
+                p.bar([perito, "Demais"], [left_pct, right_pct])
+                p.title(title)
+                p.plotsize(80, 15)
+                ascii_chart = _px_build()
+            except Exception:
+                ascii_chart = ""
+        # gera texto do comentário (ou None)
+        comment_text = None
+        if want_comment:
+            _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
+            comment_text = _generate_comment_text(
+                md_tbl, ascii_chart, start, end, threshold, mode,
+                call_api=call_api and bool(os.getenv("OPENAI_API_KEY")),
+                debug=debug_comments, model=model, max_words=max_words, temperature=temperature
+            )
 
-    # print log
+        _export_org(title, start, end, perito, "Demais",
+                    left_num, left_den, left_pct, right_num, right_den, right_pct,
+                    a_name, b_name, png, org, mode=mode, comment_text=comment_text)
+
+    # log
     print(f"\n📊 {perito}: {left_pct:.1f}%  |  Demais: {right_pct:.1f}%  [{mode}, threshold={threshold}/h]")
     if mode == "time-share":
         print(f"   n={left_num:.0f}/{left_den:.0f} (esq.)  |  n={right_num:.0f}/{right_den:.0f} (dir.)\n")
@@ -463,7 +716,9 @@ def run_perito(start: str, end: str, perito: str, threshold: float, mode: str,
 
 def run_top10(start: str, end: str, min_analises: int, threshold: float, mode: str,
               export_md: bool, export_png: bool, export_org: bool,
-              chart: bool, export_comment: bool, add_comments: bool) -> None:
+              chart: bool, want_comment: bool,
+              call_api: bool, debug_comments: bool,
+              model: str, max_words: int, temperature: float) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, has_ind = _detect_tables(conn)
         if not has_ind:
@@ -480,7 +735,7 @@ def run_top10(start: str, end: str, min_analises: int, threshold: float, mode: s
     left_set  = set(names)
     right_set = set(agg["nomePerito"]) - left_set
 
-    left_num, left_den, left_pct   = _aggregate_group(agg, left_set,  mode)
+    left_num, left_den, left_pct    = _aggregate_group(agg, left_set,  mode)
     right_num, right_den, right_pct = _aggregate_group(agg, right_set, mode)
 
     y_label, a_name, b_name = _labels_for_mode(mode)
@@ -504,39 +759,45 @@ def run_top10(start: str, end: str, min_analises: int, threshold: float, mode: s
             f"| Brasil (excl.) | {int(right_num)} | {int(right_den)} | {right_pct:.1f}% |\n"
         )
 
-    if export_md or export_comment or add_comments:
+    if export_md or want_comment:
         _export_md(title, start, end, "Top 10 piores", "Brasil (excl.)",
                    left_num, left_den, left_pct, right_num, right_den, right_pct,
                    a_name, b_name, stem, mode)
 
-    if export_png:
-        _render_png(title, y_label, "Top 10 piores", "Brasil (excl.)",
-                    left_pct, right_pct, left_num, left_den, right_num, right_den,
-                    mode, png)
-
-    if export_org:
+    if export_png or export_org or want_comment:
         if not os.path.exists(png):
             _render_png(title, y_label, "Top 10 piores", "Brasil (excl.)",
                         left_pct, right_pct, left_num, left_den, right_num, right_den,
                         mode, png)
-        _export_org(title, start, end, "Top 10 piores", "Brasil (excl.)",
-                    left_num, left_den, left_pct, right_num, right_den, right_pct,
-                    a_name, b_name, png, org, top_names=names, mode=mode)
 
     if chart:
         _render_ascii(title, y_label, "Top 10 piores", "Brasil (excl.)", left_pct, right_pct)
 
-    if export_comment or add_comments:
-        chart_ascii = ""
+    if export_org or want_comment:
+        ascii_chart = ""
         if p is not None:
-            p.clear_data()
-            p.bar(["Top 10 piores", "Brasil (excl.)"], [left_pct, right_pct])
-            p.title(title)
-            p.plotsize(80, 15)
-            chart_ascii = p.build()
-        _export_comment(md_tbl, chart_ascii, start, end, threshold, stem)
+            try:
+                p.clear_data()
+                p.bar(["Top 10 piores", "Brasil (excl.)"], [left_pct, right_pct])
+                p.title(title)
+                p.plotsize(80, 15)
+                ascii_chart = _px_build()
+            except Exception:
+                ascii_chart = ""
+        comment_text = None
+        if want_comment:
+            _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
+            comment_text = _generate_comment_text(
+                md_tbl, ascii_chart, start, end, threshold, mode,
+                call_api=call_api and bool(os.getenv("OPENAI_API_KEY")),
+                debug=debug_comments, model=model, max_words=max_words, temperature=temperature
+            )
 
-    # print log
+        _export_org(title, start, end, "Top 10 piores", "Brasil (excl.)",
+                    left_num, left_den, left_pct, right_num, right_den, right_pct,
+                    a_name, b_name, png, org, top_names=names, mode=mode,
+                    comment_text=comment_text)
+
     print(f"\n📊 Top 10: {left_pct:.1f}%  |  Brasil (excl.): {right_pct:.1f}%  [{mode}, threshold={threshold}/h]")
     if mode == "time-share":
         print(f"   n={left_num:.0f}/{left_den:.0f} (grupo)  |  n={right_num:.0f}/{right_den:.0f} (Brasil excl.)\n")
@@ -548,15 +809,21 @@ def run_top10(start: str, end: str, min_analises: int, threshold: float, mode: s
 # ────────────────────────────────────────────────────────────────────────────────
 def main():
     args = parse_args()
+    # normaliza aliases
+    want_comment = args.export_comment or args.add_comments or args.export_comment_org
     if args.top10:
         run_top10(args.start, args.end, args.min_analises, args.threshold, args.mode,
                   args.export_md, args.export_png, args.export_org,
-                  args.chart, args.export_comment, args.add_comments)
+                  args.chart, want_comment,
+                  call_api=args.call_api, debug_comments=args.debug_comments,
+                  model=args.model, max_words=args.max_words, temperature=args.temperature)
     else:
         perito = args.perito or args.nome
         run_perito(args.start, args.end, perito, args.threshold, args.mode,
                    args.export_md, args.export_png, args.export_org,
-                   args.chart, args.export_comment, args.add_comments)
+                   args.chart, want_comment,
+                   call_api=args.call_api, debug_comments=args.debug_comments,
+                   model=args.model, max_words=args.max_words, temperature=args.temperature)
 
 if __name__ == '__main__':
     main()

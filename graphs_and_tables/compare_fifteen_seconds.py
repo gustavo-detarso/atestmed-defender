@@ -18,27 +18,41 @@ Pipeline alinhado ao compare_indicadores_composto:
      individualmente, tenham ≥ cut_n tarefas ≤ threshold no período.
    - Mesma regra para Brasil (excl.), excluindo o perito/grupo.
 
-Exportações (iguais ao outro script):
-    --export-png  (gráfico PNG)
-    --export-org  (arquivo .org com :PROPERTIES:, tabela e imagem)
-    --chart       (gráfico ASCII no terminal)
+Exportações:
+    --export-png           (gráfico PNG)
+    --export-org           (arquivo .org com :PROPERTIES:, tabela e imagem)
+    --export-comment       (arquivo *_comment.org com comentário automático)
+    --export-comment-org   (incorpora o comentário no .org principal)
+    --call-api             (liga a chamada da API p/ gerar o comentário via utils/comentarios/OpenAI)
+    --chart                (gráfico ASCII no terminal)
 """
 
 from __future__ import annotations
 import os
 import sys
+import re
 import sqlite3
 import argparse
-from typing import Tuple, List, Optional, Callable
+from typing import Tuple, List, Optional, Callable, Dict, Any
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 try:
-    import plotext as p  # opcional (--chart)
+    import plotext as p  # opcional (--chart) e p/ ASCII no comentário
 except Exception:
     p = None
+
+def _px_build() -> str:
+    """Compat: retorna o buffer ASCII do plotext se disponível."""
+    if p is None:
+        return ""
+    b = getattr(p, "build", None)
+    try:
+        return b() if callable(b) else ""
+    except Exception:
+        return ""
 
 import importlib
 import importlib.util
@@ -47,6 +61,19 @@ try:
     import pandas as pd
 except Exception as e:
     raise RuntimeError("Pandas é necessário para este script.") from e
+
+from pathlib import Path
+
+# Preferência: usar utils/comentarios.comentar_le15s se existir
+_COMENT_FUNCS: List[Callable[..., Any]] = []
+try:
+    # Assinatura moderna preferida:
+    # comentar_le15s(md_table, ascii_chart, start, end, threshold, cut_n, *, call_api=True, model=..., ...)
+    from utils.comentarios import comentar_le15s as _cf_le15s  # type: ignore
+    _COMENT_FUNCS.append(_cf_le15s)
+except Exception:
+    pass
+# (Sem problemas se não existir; o fallback local cobre.)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Paths
@@ -319,11 +346,176 @@ def export_org(path_png: Optional[str],
     return out_path
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Comentário (.org) — integra utils/comentarios (se existir) + fallback local
+# ────────────────────────────────────────────────────────────────────────────────
+def _md_table_leq(lhs_label: str, rhs_label: str,
+                  lhs_leq: int, lhs_tot: int, lhs_pct: float,
+                  rhs_leq: int, rhs_tot: int, rhs_pct: float,
+                  threshold: int) -> str:
+    return (
+        f"| Grupo | ≤{threshold}s | Total | % |\n"
+        f"|-------|-----------:|------:|---:|\n"
+        f"| {lhs_label}  | {lhs_leq} | {lhs_tot} | {lhs_pct:.1f}% |\n"
+        f"| {rhs_label} | {rhs_leq} | {rhs_tot} | {rhs_pct:.1f}% |\n"
+    )
+
+def _build_ascii_for_comment(lhs_label: str, rhs_label: str, lhs_pct: float, rhs_pct: float,
+                             threshold: int, cut_n: int, title: str) -> str:
+    if p is None:
+        return ""
+    try:
+        p.clear_data()
+        p.bar([lhs_label, rhs_label], [lhs_pct, rhs_pct])
+        p.title(title)
+        p.xlabel("")
+        p.ylabel(f"% ≤ {threshold}s (corte ≥ {cut_n})")
+        p.plotsize(80, 15)
+        return _px_build()
+    except Exception:
+        return ""
+
+def _strip_markers(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"^```.*?$", "", text, flags=re.M)
+    text = re.sub(r"^~~~.*?$", "", text, flags=re.M)
+    kept = []
+    for ln in text.splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        if t.startswith("[") and t.endswith("]"):
+            continue
+        if t.startswith("|"):
+            continue
+        if t.startswith("#+"):
+            continue
+        kept.append(ln)
+    return "\n".join(kept).strip()
+
+def _to_one_paragraph(text: str) -> str:
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\s*\n\s*", " ", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+def _cap_words(text: str, max_words: int = 180) -> str:
+    ws = text.split()
+    return " ".join(ws[:max_words]).rstrip() + ("…" if len(ws) > max_words else "")
+
+def _fallback_prompt_le15s(start: str, end: str,
+                           lhs_label: str, lhs_leq: int, lhs_tot: int, lhs_pct: float,
+                           rhs_label: str, rhs_leq: int, rhs_tot: int, rhs_pct: float,
+                           threshold: int, cut_n: int) -> str:
+    dpp = lhs_pct - rhs_pct
+    alert_l = (lhs_tot < 50)
+    alert_r = (rhs_tot < 50)
+    alert_txt = []
+    if alert_l: alert_txt.append(f"{lhs_label.lower()} com amostra reduzida")
+    if alert_r: alert_txt.append(f"{rhs_label.lower()} com amostra reduzida")
+    alerta = f" Atenção: {', '.join(alert_txt)}." if alert_txt else ""
+    return (
+        f"No período {start} a {end}, considerando o limiar de ≤{threshold}s e o corte por perito "
+        f"(apenas profissionais com ≥{cut_n} tarefas ≤{threshold}s entram no numerador), "
+        f"{lhs_label} registrou {lhs_pct:.1f}% ({lhs_leq}/{lhs_tot}), enquanto {rhs_label} apresentou "
+        f"{rhs_pct:.1f}% ({rhs_leq}/{rhs_tot}), diferença de {abs(dpp):.1f} p.p. "
+        f"Os percentuais refletem a participação relativa de tarefas muito curtas entre os elegíveis e podem "
+        f"variar com o mix de casos e horários de pico; recomenda-se revisar a distribuição de durações e a "
+        f"consistência de registros.{alerta}"
+    )
+
+def _generate_comment_text(md_table: str, ascii_chart: str, start: str, end: str,
+                           threshold: int, cut_n: int, call_api: bool) -> str:
+    """
+    Tenta usar utils.comentarios.comentar_le15s em diferentes assinaturas; se não der, gera texto local.
+    """
+    for fn in _COMENT_FUNCS:
+        # Assinatura preferida
+        try:
+            out = fn(md_table, ascii_chart, start, end, threshold, cut_n, call_api=call_api)  # type: ignore
+            if isinstance(out, dict):
+                text = (out.get("comment") or out.get("prompt") or "").strip()
+            else:
+                text = str(out or "").strip()
+            if text:
+                return _cap_words(_to_one_paragraph(_strip_markers(text)))
+        except TypeError:
+            # Assinatura antiga (por .org inteiro ou sem threshold/cut_n)
+            try:
+                out = fn(md_table, ascii_chart, start, end, call_api=call_api)  # type: ignore
+                text = (out.get("comment") if isinstance(out, dict) else str(out)).strip()
+                if text:
+                    return _cap_words(_to_one_paragraph(_strip_markers(text)))
+            except Exception:
+                try:
+                    out = fn(md_table, call_api=call_api)  # type: ignore
+                    text = (out.get("comment") if isinstance(out, dict) else str(out)).strip()
+                    if text:
+                        return _cap_words(_to_one_paragraph(_strip_markers(text)))
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+    # Fallback local (texto final, não apenas prompt)
+    try:
+        lines = [ln for ln in md_table.splitlines() if ln.strip().startswith("|")]
+        def parse_row(s: str):
+            c = [x.strip() for x in s.strip("|").split("|")]
+            return c[0], int(float(c[1])), int(float(c[2])), float(c[3].replace("%","").strip())
+        left_label, left_leq, left_tot, left_pct = parse_row(lines[2])
+        right_label, right_leq, right_tot, right_pct = parse_row(lines[3])
+        return _cap_words(_to_one_paragraph(_fallback_prompt_le15s(
+            start, end, left_label, left_leq, left_tot, left_pct,
+            right_label, right_leq, right_tot, right_pct,
+            threshold, cut_n
+        )))
+    except Exception:
+        # fallback mínimo
+        return _cap_words(_to_one_paragraph(
+            f"No período {start} a {end}, compara-se o % de perícias ≤{threshold}s com corte por perito (≥{cut_n})."
+        ))
+
+def _export_comment_org(title: str, start: str, end: str,
+                        md_table: str, ascii_chart: str,
+                        threshold: int, cut_n: int,
+                        stem: str, call_api: bool) -> str:
+    comment_text = _generate_comment_text(md_table, ascii_chart, start, end, threshold, cut_n, call_api)
+    out = os.path.join(EXPORT_DIR, f"{stem}_comment.org")
+    lines = []
+    lines.append(f"* Comentário – {title}")
+    lines.append(":PROPERTIES:")
+    lines.append(f":PERIODO: {start} a {end}")
+    lines.append(f":THRESHOLD: {threshold}s")
+    lines.append(f":CUT_N: {cut_n}")
+    lines.append(":END:\n")
+
+    lines.append("** Tabela base")
+    lines.append("#+BEGIN_EXAMPLE")
+    lines.append(md_table.strip())
+    lines.append("#+END_EXAMPLE\n")
+
+    if ascii_chart and ascii_chart.strip():
+        lines.append("** Gráfico ASCII (opcional)")
+        lines.append("#+BEGIN_EXAMPLE")
+        lines.append(ascii_chart.strip())
+        lines.append("#+END_EXAMPLE\n")
+
+    lines.append("** Texto")
+    lines.append(comment_text.strip() or "(sem comentário)")
+
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print("🗒️ Comentário .org salvo em", out)
+    return out
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Execução
 # ────────────────────────────────────────────────────────────────────────────────
 def run_perito(start: str, end: str, perito: str,
                threshold: int, cut_n: int,
-               export_png_flag: bool, export_org_flag: bool, chart: bool) -> None:
+               export_png_flag: bool, export_org_flag: bool,
+               export_comment_flag: bool, export_comment_org_flag: bool,
+               call_api: bool, chart: bool) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, _ = _detect_tables(conn)
         df_raw = _load_period_df(conn, tbl, start, end)
@@ -346,28 +538,53 @@ def run_perito(start: str, end: str, perito: str,
 
     png_path = os.path.join(EXPORT_DIR, f"compare_{threshold}s_{safe}.png")
     org_name = f"compare_{threshold}s_{safe}.org"
+    org_path = os.path.join(EXPORT_DIR, org_name)
 
     if export_png_flag:
         png_path = render_png(title, left_label, right_label,
                               left_pct, right_pct, left_leq, right_leq, left_tot, right_tot,
                               threshold, cut_n, png_path)
 
-    if export_org_flag:
+    # Se vamos comentar e/ou exportar .org, gere .org (precisamos da imagem linkada)
+    if export_org_flag or export_comment_flag or export_comment_org_flag:
         if not (png_path and os.path.exists(png_path)):
             png_path = render_png(title, left_label, right_label,
                                   left_pct, right_pct, left_leq, right_leq, left_tot, right_tot,
                                   threshold, cut_n, png_path)
-        export_org(png_path, start, end, left_label,
-                   left_tot, left_leq, left_pct,
-                   right_tot, right_leq, right_pct,
-                   threshold, cut_n, org_name)
+        org_path = export_org(png_path, start, end, left_label,
+                              left_tot, left_leq, left_pct,
+                              right_tot, right_leq, right_pct,
+                              threshold, cut_n, org_name)
+
+    # Preparar insumos de comentário (uma vez só)
+    if export_comment_flag or export_comment_org_flag:
+        md_tbl = _md_table_leq(left_label, right_label,
+                               left_leq, left_tot, left_pct,
+                               right_leq, right_tot, right_pct,
+                               threshold)
+        ascii_chart = _build_ascii_for_comment(left_label, right_label, left_pct, right_pct,
+                                               threshold, cut_n, title)
+        stem = f"compare_{threshold}s_{safe}"
+        comment_text = _generate_comment_text(md_tbl, ascii_chart, start, end, threshold, cut_n, call_api)
+
+        if export_comment_flag:
+            _export_comment_org(title, start, end, md_tbl, ascii_chart, threshold, cut_n, stem,
+                                call_api=call_api)
+
+        if export_comment_org_flag:
+            with open(org_path, "a", encoding="utf-8") as f:
+                f.write("\n** Comentário\n")
+                f.write(comment_text.strip() + "\n")
+            print(f"✅ Comentário incorporado ao ORG: {org_path}")
 
     if chart:
         render_ascii(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
 
 def run_top10(start: str, end: str, min_analises: int,
               threshold: int, cut_n: int,
-              export_png_flag: bool, export_org_flag: bool, chart: bool) -> None:
+              export_png_flag: bool, export_org_flag: bool,
+              export_comment_flag: bool, export_comment_org_flag: bool,
+              call_api: bool, chart: bool) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, has_ind = _detect_tables(conn)
         if not has_ind:
@@ -396,21 +613,42 @@ def run_top10(start: str, end: str, min_analises: int,
 
     png_path = os.path.join(EXPORT_DIR, f"compare_{threshold}s_top10.png")
     org_name = f"compare_{threshold}s_top10.org"
+    org_path = os.path.join(EXPORT_DIR, org_name)
 
     if export_png_flag:
         png_path = render_png(title, left_label, right_label,
                               left_pct, right_pct, left_leq, right_leq, left_tot, right_tot,
                               threshold, cut_n, png_path)
 
-    if export_org_flag:
+    if export_org_flag or export_comment_flag or export_comment_org_flag:
         if not (png_path and os.path.exists(png_path)):
             png_path = render_png(title, left_label, right_label,
                                   left_pct, right_pct, left_leq, right_leq, left_tot, right_tot,
                                   threshold, cut_n, png_path)
-        export_org(png_path, start, end, left_label,
-                   left_tot, left_leq, left_pct,
-                   right_tot, right_leq, right_pct,
-                   threshold, cut_n, org_name)
+        org_path = export_org(png_path, start, end, left_label,
+                              left_tot, left_leq, left_pct,
+                              right_tot, right_leq, right_pct,
+                              threshold, cut_n, org_name)
+
+    if export_comment_flag or export_comment_org_flag:
+        md_tbl = _md_table_leq(left_label, right_label,
+                               left_leq, left_tot, left_pct,
+                               right_leq, right_tot, right_pct,
+                               threshold)
+        ascii_chart = _build_ascii_for_comment(left_label, right_label, left_pct, right_pct,
+                                               threshold, cut_n, title)
+        stem = f"compare_{threshold}s_top10"
+        comment_text = _generate_comment_text(md_tbl, ascii_chart, start, end, threshold, cut_n, call_api)
+
+        if export_comment_flag:
+            _export_comment_org(title, start, end, md_tbl, ascii_chart, threshold, cut_n, stem,
+                                call_api=call_api)
+
+        if export_comment_org_flag:
+            with open(org_path, "a", encoding="utf-8") as f:
+                f.write("\n** Comentário\n")
+                f.write(comment_text.strip() + "\n")
+            print(f"✅ Comentário incorporado ao ORG: {org_path}")
 
     if chart:
         render_ascii(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
@@ -433,23 +671,34 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--threshold', '-t', type=int, default=15, help='Limite em segundos para considerar “≤ threshold” (padrão: 15)')
     ap.add_argument('--cut-n',      type=int, default=10, help='Corte: mínimo de tarefas ≤ threshold por perito para entrar no numerador (padrão: 10)')
 
-    # >>> Exportações (iguais ao outro script) <<<
-    ap.add_argument('--export-png', action='store_true')
-    ap.add_argument('--export-org', action='store_true')
-    ap.add_argument('--chart',      action='store_true', help='Gráfico ASCII no terminal')
+    # Exportações/saídas
+    ap.add_argument('--export-png',           action='store_true')
+    ap.add_argument('--export-org',           action='store_true')
+    ap.add_argument('--export-comment',       action='store_true', help='Gera *_comment.org com texto corrido (IA ou fallback local)')
+    ap.add_argument('--export-comment-org',   action='store_true', help='Incorpora o comentário automaticamente no arquivo .org principal')
+    ap.add_argument('--call-api',             action='store_true', help='Chama a API (utils.comentarios) para obter o texto final do comentário (requer OPENAI_API_KEY)')
+    ap.add_argument('--chart',                action='store_true', help='Gráfico ASCII no terminal')
 
     return ap.parse_args()
 
 def main() -> None:
     args = parse_args()
+
+    # liga API automaticamente se existir OPENAI_API_KEY no ambiente
+    call_api = bool(args.call_api or os.getenv("OPENAI_API_KEY"))
+
     if args.top10:
         run_top10(args.start, args.end, args.min_analises,
                   args.threshold, args.cut_n,
-                  args.export_png, args.export_org, args.chart)
+                  args.export_png, args.export_org,
+                  args.export_comment, args.export_comment_org,
+                  call_api, args.chart)
     else:
         run_perito(args.start, args.end, args.perito,
                    args.threshold, args.cut_n,
-                   args.export_png, args.export_org, args.chart)
+                   args.export_png, args.export_org,
+                   args.export_comment, args.export_comment_org,
+                   call_api, args.chart)
 
 if __name__ == "__main__":
     main()

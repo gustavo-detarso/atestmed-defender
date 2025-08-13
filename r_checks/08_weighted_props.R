@@ -71,6 +71,14 @@ z_test_2props <- function(x1,n1,x2,n2) {
   list(z=z, p=p)
 }
 
+percent_s <- function(x, acc=.1) {
+  ifelse(is.finite(x), percent(x, accuracy = acc), "NA")
+}
+pvalue_s <- function(p) {
+  if (!is.finite(p)) return("NA")
+  if (p < 0.001) "<0.001" else sprintf("%.3f", p)
+}
+
 get_top10_names <- function(con, start_date, end_date, min_n=50) {
   q <- sprintf("
     SELECT p.nomePerito AS perito, i.scoreFinal, COUNT(a.protocolo) AS total_analises
@@ -89,12 +97,19 @@ get_top10_names <- function(con, start_date, end_date, min_n=50) {
 
 build_agg_query <- function(measure, threshold, start_date, end_date) {
   if (tolower(measure) == "nc") {
-    title_txt <- "Meta-análise simples: Não Conformidade"
+    title_txt <- "Meta-análise simples: Não Conformidade (NC robusto)"
     ylab_txt  <- "Proporção de NC"
     meas_tag  <- "nc"
     sql <- sprintf("
       SELECT p.nomePerito AS perito,
-             SUM(CASE WHEN a.motivoNaoConformado != 0 THEN 1 ELSE 0 END) AS x,
+             SUM(
+               CASE
+                 WHEN CAST(IFNULL(a.conformado,1) AS INTEGER)=0 THEN 1
+                 WHEN TRIM(IFNULL(a.motivoNaoConformado,'')) <> ''
+                      AND CAST(IFNULL(a.motivoNaoConformado,'0') AS INTEGER) <> 0 THEN 1
+                 ELSE 0
+               END
+             ) AS x,
              COUNT(*) AS n
         FROM analises a
         JOIN peritos  p ON a.siapePerito = p.siapePerito
@@ -152,6 +167,30 @@ plot_two_groups <- function(df_plot, title_txt, subtitle_txt, ylab_txt, outfile)
   cat(sprintf("✓ salvo: %s\n", outfile))
 }
 
+fail_plot <- function(msg) {
+  ggplot() + annotate("text", x = 0, y = 0, label = msg, size = 5) + theme_void()
+}
+
+write_org_bundle <- function(png_base, caption, metodo_txt, interpreta_txt, org_main, org_comm, md_out=NULL) {
+  main_txt <- paste(
+    paste0("#+CAPTION: ", caption),
+    sprintf("[[file:%s]]", basename(png_base)),
+    "",
+    metodo_txt, "",
+    interpreta_txt, "",
+    sep = "\n"
+  )
+  writeLines(main_txt, org_main, useBytes = TRUE)
+
+  comm_txt <- paste(metodo_txt, "", interpreta_txt, "", sep = "\n")
+  writeLines(comm_txt, org_comm, useBytes = TRUE)
+
+  if (!is.null(md_out)) {
+    # resumo curtinho (retrocompat)
+    writeLines(paste(metodo_txt, "", interpreta_txt, "", sep = "\n"), md_out, useBytes = TRUE)
+  }
+}
+
 # ---------------- Execução ----------------
 con <- dbConnect(SQLite(), opt$db)
 
@@ -159,15 +198,65 @@ con <- dbConnect(SQLite(), opt$db)
 spec <- build_agg_query(opt$measure, opt$threshold, opt$start, opt$end)
 agg <- dbGetQuery(con, spec$sql)
 
+# Utilidades de nome/arquivos
+make_names_perito <- function(tag, perito_safe) {
+  png  <- file.path(export_dir, sprintf("rcheck_weighted_props_%s_%s.png", tag, perito_safe))
+  org  <- file.path(export_dir, sprintf("rcheck_weighted_props_%s_%s.org", tag, perito_safe))
+  orgc <- file.path(export_dir, sprintf("rcheck_weighted_props_%s_%s_comment.org", tag, perito_safe))
+  md   <- file.path(export_dir, sprintf("rcheck_weighted_props_%s_%s.md", tag, perito_safe))
+  list(png=png, org=org, orgc=orgc, md=md)
+}
+make_names_top10 <- function(tag) {
+  png  <- file.path(export_dir, sprintf("rcheck_top10_weighted_props_%s.png", tag))
+  org  <- file.path(export_dir, sprintf("rcheck_top10_weighted_props_%s.org", tag))
+  orgc <- file.path(export_dir, sprintf("rcheck_top10_weighted_props_%s_comment.org", tag))
+  md   <- file.path(export_dir, sprintf("rcheck_top10_weighted_props_%s.md", tag))
+  list(png=png, org=org, orgc=orgc, md=md)
+}
+
+# Se não houver dados no período, já gera artefatos de falha
 if (nrow(agg) == 0) {
-  dbDisconnect(con); stop("Nenhuma linha encontrada no período informado.")
+  dbDisconnect(con)
+  if (!opt$top10) {
+    per_safe <- safe(opt$perito)
+    nm <- make_names_perito(spec$tag, per_safe)
+    ggsave(nm$png, fail_plot("Nenhuma linha encontrada no período informado."), width=8, height=5, dpi=160)
+    metodo_txt <- paste0(
+      "*Método.* Comparamos duas proporções (grupo do perito vs demais) para a métrica '", opt$measure,
+      "' no período ", opt$start, "–", opt$end,
+      ", com IC de Wilson e teste z de duas proporções (pooled)."
+    )
+    interpreta_txt <- "Não há dados no período para estimar proporções."
+    write_org_bundle(nm$png, spec$title, metodo_txt, interpreta_txt, nm$org, nm$orgc, nm$md)
+  } else {
+    nm <- make_names_top10(spec$tag)
+    ggsave(nm$png, fail_plot("Top 10: sem dados no período."), width=8, height=5, dpi=160)
+    metodo_txt <- paste0(
+      "*Método.* Comparamos duas proporções (Top 10 piores por scoreFinal vs Brasil (excl.)) ",
+      "para a métrica '", opt$measure, "' no período ", opt$start, "–", opt$end,
+      ", com IC de Wilson e teste z de duas proporções (pooled)."
+    )
+    interpreta_txt <- "Não há dados no período para formar os grupos."
+    write_org_bundle(nm$png, spec$title, metodo_txt, interpreta_txt, nm$org, nm$orgc, nm$md)
+  }
+  quit(save="no")
 }
 
 if (!opt$top10) {
   # ---------------- modo perito ----------------
   if (!(opt$perito %in% agg$perito)) {
-    dbDisconnect(con); stop("Perito informado não encontrado no período.")
+    dbDisconnect(con)
+    per_safe <- safe(opt$perito)
+    nm <- make_names_perito(spec$tag, per_safe)
+    ggsave(nm$png, fail_plot("Perito informado não encontrado no período."), width=8, height=5, dpi=160)
+    metodo_txt <- paste0(
+      "*Método.* Duas proporções (perito vs demais) com IC de Wilson e teste z (pooled)."
+    )
+    interpreta_txt <- "Perito não encontrado entre os registros do período."
+    write_org_bundle(nm$png, spec$title, metodo_txt, interpreta_txt, nm$org, nm$orgc, nm$md)
+    quit(save="no")
   }
+
   p_row <- agg %>% filter(perito == opt$perito) %>% slice(1)
   o_row <- agg %>% filter(perito != opt$perito) %>% summarise(x = sum(x), n = sum(n), .groups="drop")
 
@@ -189,22 +278,55 @@ if (!opt$top10) {
   subtitle_txt <- sprintf("Período: %s a %s | n=%d vs %d | z=%s, p=%s",
                           opt$start, opt$end, p_row$n, o_row$n,
                           ifelse(is.na(zt$z), "NA", sprintf("%.2f", zt$z)),
-                          ifelse(is.na(zt$p), "NA", scales::pvalue(zt$p, accuracy = .001)))
+                          pvalue_s(zt$p))
 
   perito_safe <- safe(opt$perito)
-  outfile <- file.path(export_dir, sprintf("rcheck_weighted_props_%s_%s.png", spec$tag, perito_safe))
-  plot_two_groups(plot_df, spec$title, subtitle_txt, spec$ylab, outfile)
+  nm <- make_names_perito(spec$tag, perito_safe)
+  plot_two_groups(plot_df, spec$title, subtitle_txt, spec$ylab, nm$png)
 
-  cat(sprintf("\nResumo (perito): %s -> %d/%d (%.1f%%)\n", opt$perito, p_row$x, p_row$n, 100*p_hat))
-  cat(sprintf("Resumo (demais): %d/%d (%.1f%%)\n\n", o_row$x, o_row$n, 100*o_hat))
+  # Comentários (.org)
+  what_txt <- if (tolower(opt$measure) == "nc") {
+    "proporção de Não Conformidade (NC robusto)"
+  } else {
+    sprintf("proporção de perícias com duração ≤ %ds (entre válidas)", as.integer(opt$threshold))
+  }
+
+  metodo_txt <- paste0(
+    "*Método.* Comparamos a ", what_txt, " do perito (", opt$perito, ") contra o grupo 'Demais (excl.)' ",
+    "no período ", opt$start, "–", opt$end, ". As barras exibem a estimativa pontual; ",
+    "as hastes, IC 95% de Wilson. A linha de legenda no subtítulo traz o teste z de duas proporções ",
+    "(pooled) para diferença entre os grupos."
+  )
+
+  interp_txt <- paste0(
+    "*Interpretação.* Perito: ", percent_s(p_hat), " (", p_row$x, "/", p_row$n, "); ",
+    "Demais (excl.): ", percent_s(o_hat), " (", o_row$x, "/", o_row$n, "). ",
+    "Diferença ",
+    if (is.finite(p_hat) && is.finite(o_hat)) sprintf("= %s", percent_s(p_hat - o_hat)) else "= NA",
+    "; teste z: z=", ifelse(is.finite(zt$z), sprintf("%.2f", zt$z), "NA"),
+    ", p=", pvalue_s(zt$p), ". ",
+    "Valores positivos (perito acima) indicam pior desempenho quando a métrica é indesejável (ex.: NC, ≤threshold); ",
+    "leia conforme a natureza da métrica."
+  )
+
+  write_org_bundle(nm$png, spec$title, metodo_txt, interp_txt, nm$org, nm$orgc, nm$md)
 
 } else {
   # ---------------- modo top10 ----------------
   top10_names <- get_top10_names(con, opt$start, opt$end, opt$min_analises)
   dbDisconnect(con)
 
+  nm <- make_names_top10(spec$tag)
+
   if (length(top10_names) == 0) {
-    stop("Top 10: nenhum perito encontrado com os critérios no período.")
+    ggsave(nm$png, fail_plot("Top 10: nenhum perito encontrado com os critérios no período."), width=8, height=5, dpi=160)
+    metodo_txt <- paste0(
+      "*Método.* Comparamos a métrica '", opt$measure, "' entre o grupo Top 10 piores (scoreFinal) ",
+      "e o Brasil (excl.), com IC de Wilson e teste z de duas proporções (pooled)."
+    )
+    interpreta_txt <- "Sem peritos elegíveis no período para compor o Top 10."
+    write_org_bundle(nm$png, spec$title, metodo_txt, interpreta_txt, nm$org, nm$orgc, nm$md)
+    quit(save="no")
   }
 
   grp <- agg %>% filter(perito %in% top10_names) %>% summarise(x = sum(x), n = sum(n), .groups="drop")
@@ -230,14 +352,33 @@ if (!opt$top10) {
                           paste(head(top10_names, 5), collapse = ", "),
                           oth$n,
                           ifelse(is.na(zt$z), "NA", sprintf("%.2f", zt$z)),
-                          ifelse(is.na(zt$p), "NA", scales::pvalue(zt$p, accuracy = .001)))
+                          pvalue_s(zt$p))
 
   # IMPORTANTE: usa prefixo rcheck_top10_* para acionar comentários de grupo
-  outfile <- file.path(export_dir, sprintf("rcheck_top10_weighted_props_%s.png", spec$tag))
-  plot_two_groups(plot_df, spec$title, subtitle_txt, spec$ylab, outfile)
+  plot_two_groups(plot_df, spec$title, subtitle_txt, spec$ylab, nm$png)
 
-  cat(sprintf("\nResumo (Top10): %d/%d (%.1f%%)\n", grp$x, grp$n, 100*g_hat))
-  cat(sprintf("Resumo (Brasil excl.): %d/%d (%.1f%%)\n\n", oth$x, oth$n, 100*o_hat))
-  cat(sprintf("Peritos Top10 (%d): %s\n", length(top10_names), paste(top10_names, collapse = "; ")))
+  what_txt <- if (tolower(opt$measure) == "nc") {
+    "proporção de Não Conformidade (NC robusto)"
+  } else {
+    sprintf("proporção de perícias com duração ≤ %ds (entre válidas)", as.integer(opt$threshold))
+  }
+
+  metodo_txt <- paste0(
+    "*Método.* Comparamos a ", what_txt, " do grupo *Top 10 piores por scoreFinal* ",
+    "contra o Brasil (excl.) no período ", opt$start, "–", opt$end,
+    ". Estimativas com IC 95%% de Wilson; diferença testada via z de duas proporções (pooled)."
+  )
+
+  interp_txt <- paste0(
+    "*Interpretação.* Top 10: ", percent_s(g_hat), " (", grp$x, "/", grp$n, "); ",
+    "Brasil (excl.): ", percent_s(o_hat), " (", oth$x, "/", oth$n, "). ",
+    "Diferença ",
+    if (is.finite(g_hat) && is.finite(o_hat)) sprintf("= %s", percent_s(g_hat - o_hat)) else "= NA",
+    "; z=", ifelse(is.finite(zt$z), sprintf("%.2f", zt$z), "NA"),
+    ", p=", pvalue_s(zt$p), ". ",
+    "Sinal e magnitude devem ser lidos conforme a natureza da métrica."
+  )
+
+  write_org_bundle(nm$png, spec$title, metodo_txt, interp_txt, nm$org, nm$orgc, nm$md)
 }
 

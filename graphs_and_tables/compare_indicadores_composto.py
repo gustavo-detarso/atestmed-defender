@@ -22,7 +22,7 @@ Cortes (opcionais):
 Alvo de produtividade: --alvo-prod (padrão 50 análises/h)
 
 Saídas:
---export-png, --export-org, (opcionais: --chart ASCII)
+--export-png, --export-org, --export-comment, --export-comment-org (opcional: --chart ASCII, --call-api)
 """
 
 import os
@@ -40,13 +40,117 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import plotext as p
+try:
+    import plotext as p
+except Exception:
+    p = None
 
+from pathlib import Path
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Integração com utils/comentarios (opcional)
+# ────────────────────────────────────────────────────────────────────────────────
+try:
+    # ideal: recebe payload e retorna {'prompt','comment'} OU string
+    from utils.comentarios import comentar_composto as _comentar_composto_api  # type: ignore
+except Exception:
+    _comentar_composto_api = None
+
+# ────────────────────────────────────────────────────────────────────────────────
+# OpenAI helper (SDK 1.x e legado) + .env
+# ────────────────────────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DB_PATH    = os.path.join(BASE_DIR, 'db', 'atestmed.db')
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
+def _load_openai_key_from_dotenv() -> Optional[str]:
+    """Carrega OPENAI_API_KEY do .env na raiz do projeto (se existir)."""
+    env_path = os.path.join(BASE_DIR, ".env")
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv(env_path, override=False)
+    except Exception:
+        if os.path.exists(env_path) and not os.getenv("OPENAI_API_KEY"):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        if k.strip() == "OPENAI_API_KEY":
+                            os.environ.setdefault("OPENAI_API_KEY", v.strip().strip('"').strip("'"))
+                            break
+            except Exception:
+                pass
+    return os.getenv("OPENAI_API_KEY")
+
+def _call_openai(messages: List[Dict[str, str]], model: str = "gpt-4o-mini", temperature: float = 0.2) -> Optional[str]:
+    """Tenta SDK novo e legado; retorna texto limpo ou None."""
+    api_key = _load_openai_key_from_dotenv()
+    if not api_key:
+        return None
+    # SDK novo
+    try:
+        from openai import OpenAI  # type: ignore
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+        )
+        txt = (resp.choices[0].message.content or "").strip()
+        if txt:
+            return txt
+    except Exception:
+        pass
+    # SDK legado
+    try:
+        import openai  # type: ignore
+        openai.api_key = api_key
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+        )
+        txt = resp["choices"][0]["message"]["content"]
+        if txt:
+            return txt.strip()
+    except Exception:
+        pass
+    return None
+
+def _strip_markers(text: str) -> str:
+    """Remove cercas de código, blocos [..], tabelas md/org e diretivas org."""
+    if not text:
+        return ""
+    import re
+    text = re.sub(r"^```.*?$", "", text, flags=re.M)
+    text = re.sub(r"^~~~.*?$", "", text, flags=re.M)
+    kept = []
+    for ln in text.splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        if t.startswith("[") and t.endswith("]"):
+            continue
+        if t.startswith("|"):
+            continue
+        if t.startswith("#+"):
+            continue
+        kept.append(ln)
+    return "\n".join(kept).strip()
+
+def _to_one_paragraph(text: str) -> str:
+    import re
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\s*\n\s*", " ", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+def _cap_words(text: str, max_words: int) -> str:
+    ws = text.split()
+    return " ".join(ws[:max_words]).rstrip() + ("…" if len(ws) > max_words else "")
 
 # -----------------------
 # Utilidades de schema
@@ -75,13 +179,15 @@ def load_period(conn: sqlite3.Connection, start: str, end: str) -> pd.DataFrame:
                a.dataHoraIniPericia AS ini,
                a.dataHoraFimPericia AS fim,
                a.duracaoPericia     AS dur_txt,
-               a.motivoNaoConformado AS nc,
+               a.motivoNaoConformado AS nc_txt,
+               a.conformado          AS conf,
                p.nomePerito
           FROM {t} a
           JOIN peritos p ON p.siapePerito = a.siapePerito
          WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
     """
     df = pd.read_sql(sql, conn, params=(start, end))
+    df["nomePerito"] = df["nomePerito"].astype(str).str.strip()
     return df
 
 def parse_durations(df: pd.DataFrame) -> pd.DataFrame:
@@ -111,31 +217,41 @@ def parse_durations(df: pd.DataFrame) -> pd.DataFrame:
         dur.loc[need_fallback] = dur_fb.values
 
     df['dur_s'] = pd.to_numeric(dur, errors='coerce')
+
     # filtros: remover <=0, e >1h
     df = df[df['dur_s'].notna()]
     df = df[df['dur_s'] > 0]
     df = df[df['dur_s'] <= 3600]  # regra do projeto
-    # NC normalizar (0/1)
-    df['nc'] = pd.to_numeric(df['nc'], errors='coerce').fillna(0).astype(int).clip(0, 1)
+
+    # ---- NC robusto (texto) ----
+    # conf: default 1 (conformado) quando vazio/nulo
+    conf_int = pd.to_numeric(df.get('conf'), errors='coerce').fillna(1).astype(int)
+    # motivo como texto + cast
+    nc_txt = df.get('nc_txt').astype(str).str.strip().fillna("")
+    nc_cast = pd.to_numeric(nc_txt, errors='coerce').fillna(0).astype(int)
+
+    df['nc_flag'] = np.where(
+        (conf_int == 0) | ((nc_txt != "") & (nc_cast != 0)),
+        1, 0
+    ).astype(int)
+
     return df
 
 # -----------------------
-# Métricas por perito
+# Métricas por perito / grupos
 # -----------------------
 
 def overlap_percent_for_perito(rows: pd.DataFrame) -> float:
-    # marca análises que participam de qualquer overlap
     x = rows[['ini_dt', 'fim_dt']].sort_values('ini_dt').reset_index(drop=True)
     if x.empty:
         return 0.0
     overlapped = np.zeros(len(x), dtype=bool)
-    # sweep linear
     current_end = pd.Timestamp.min
     last_idx = -1
     for i, (ini, fim) in enumerate(zip(x['ini_dt'], x['fim_dt'])):
         if pd.isna(ini) or pd.isna(fim):
             continue
-        if ini < current_end:  # overlap com anterior recente
+        if ini < current_end:  # overlap com anterior
             overlapped[i] = True
             if last_idx >= 0:
                 overlapped[last_idx] = True
@@ -147,21 +263,16 @@ def overlap_percent_for_perito(rows: pd.DataFrame) -> float:
     return float(pct)
 
 def perito_metrics(rows: pd.DataFrame, alvo_prod: float) -> Dict[str, float]:
-    # rows: apenas um perito
     total = len(rows)
     if total == 0:
         return dict(nc_pct=0.0, prod_pct=0.0, le15s_pct=0.0, overlap_pct=0.0,
                     prod_abs=0.0)
-
     horas = rows['dur_s'].sum() / 3600.0
     prod_abs = (total / horas) if horas > 0 else 0.0
     prod_pct = (prod_abs / alvo_prod * 100.0) if alvo_prod > 0 else 0.0
-
-    nc_pct = rows['nc'].sum() / total * 100.0
+    nc_pct = rows['nc_flag'].sum() / total * 100.0
     le15s_pct = (rows['dur_s'] <= 15).sum() / total * 100.0
-    # precisa das datas para overlap
     overlap_pct = overlap_percent_for_perito(rows)
-
     return dict(nc_pct=float(nc_pct),
                 prod_pct=float(prod_pct),
                 le15s_pct=float(le15s_pct),
@@ -172,29 +283,15 @@ def build_panels(df: pd.DataFrame,
                  grupo: List[str],
                  alvo_prod: float) -> Tuple[Dict[str, float], Dict[str, float],
                                             pd.DataFrame]:
-    """
-    Retorna:
-      - painéis do GRUPO (selected)   → {'nc_pct', 'prod_pct', 'le15s_pct', 'overlap_pct'}
-      - painéis do BRASIL-EXCL        → mesmas chaves
-      - dataframe com métricas por perito do BR-excl (para média/mediana/DP)
-    """
     df_g = df[df['nomePerito'].str.upper().isin([g.upper() for g in grupo])]
     df_b = df[~df['nomePerito'].str.upper().isin([g.upper() for g in grupo])]
 
-    # métricas agregadas de GRUPO: (agregação correta: total/horas para prod)
     def panel_from(df_any: pd.DataFrame) -> Dict[str, float]:
         if df_any.empty:
             return dict(nc_pct=0.0, prod_pct=0.0, le15s_pct=0.0, overlap_pct=0.0)
-        # por perito para overlap (% de análises com overlap ponderado por contagem)
-        metrics = []
-        for nome, sub in df_any.groupby('nomePerito'):
-            metrics.append(perito_metrics(sub, alvo_prod))
-        mdf = pd.DataFrame(metrics)
-        # agregação ponderada por volume para NC e ≤15s
         total = len(df_any)
-        nc_pct = df_any['nc'].sum() / total * 100.0
+        nc_pct = df_any['nc_flag'].sum() / total * 100.0
         le15s_pct = (df_any['dur_s'] <= 15).sum() / total * 100.0
-        # prod: total / horas
         horas = df_any['dur_s'].sum() / 3600.0
         prod_abs = (total / horas) if horas > 0 else 0.0
         prod_pct = (prod_abs / alvo_prod * 100.0) if alvo_prod > 0 else 0.0
@@ -211,7 +308,6 @@ def build_panels(df: pd.DataFrame,
     grp_panel = panel_from(df_g)
     br_panel  = panel_from(df_b)
 
-    # métricas por perito do BR-excl (p/ média/mediana/DP das linhas)
     metrics_b = []
     for nome, sub in df_b.groupby('nomePerito'):
         m = perito_metrics(sub, alvo_prod)
@@ -219,6 +315,25 @@ def build_panels(df: pd.DataFrame,
         metrics_b.append(m)
     mdf_b = pd.DataFrame(metrics_b)
     return grp_panel, br_panel, mdf_b
+
+# -----------------------
+# Estatísticas (BR-excl.)
+# -----------------------
+
+def compute_br_stats(mdf_b: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    def stats(col: str) -> Dict[str, float]:
+        v = mdf_b[col].dropna().values if col in mdf_b.columns else np.array([])
+        if v.size == 0:
+            return dict(mean=0.0, median=0.0, mean_plus_sd=0.0)
+        mu = float(np.mean(v)); sd = float(np.std(v)); med = float(np.median(v))
+        return dict(mean=mu, median=med, mean_plus_sd=mu + sd)
+
+    return {
+        "nc_pct":       stats("nc_pct"),
+        "prod_pct":     stats("prod_pct"),
+        "le15s_pct":    stats("le15s_pct"),
+        "overlap_pct":  stats("overlap_pct"),
+    }
 
 # -----------------------
 # Contagem de “cortes”
@@ -231,10 +346,6 @@ def count_cut_hits(df: pd.DataFrame,
                    cut_prod_pct: Optional[float],
                    cut_le15s_pct: Optional[float],
                    cut_overlap_pct: Optional[float]) -> Dict[str, Any]:
-    """
-    Para Top10: retorna {'nc': x_y, 'prod': x_y, 'le15s': x_y, 'overlap': x_y}
-    Para Individual: {'nc': True/False, ...}
-    """
     peritos = sorted(set([n for n in df['nomePerito'].unique() if n]))
     sel = [p for p in peritos if p.upper() in {g.upper() for g in grupo}]
 
@@ -251,7 +362,6 @@ def count_cut_hits(df: pd.DataFrame,
         sub = df[df['nomePerito'].str.upper()==sel[0].upper()]
         return hit_row(sub)
 
-    # grupo
     hits = dict(nc=0, prod=0, le15s=0, overlap=0)
     for nome in sel:
         sub = df[df['nomePerito'].str.upper()==nome.upper()]
@@ -274,7 +384,7 @@ def plot_png(start: str, end: str,
              grp_title: str,
              grp_panel: Dict[str, float],
              br_panel: Dict[str, float],
-             mdf_b: pd.DataFrame,
+             br_stats: Dict[str, Dict[str, float]],
              alvo_prod: float,
              cut_prod_pct: Optional[float],
              cut_hits: Dict[str, Any],
@@ -284,19 +394,9 @@ def plot_png(start: str, end: str,
     grp_vals = [grp_panel['nc_pct'], grp_panel['prod_pct'], grp_panel['le15s_pct'], grp_panel['overlap_pct']]
     br_vals  = [br_panel['nc_pct'],  br_panel['prod_pct'],  br_panel['le15s_pct'],  br_panel['overlap_pct']]
 
-    def line_stat(col):
-        v = mdf_b[col].dropna().values if col in mdf_b.columns else np.array([])
-        if v.size == 0:
-            return 0.0, 0.0, 0.0
-        mu = float(np.mean(v)); sd = float(np.std(v)); med = float(np.median(v))
-        return mu, med, mu + sd
-
-    mean_nc, med_nc, dp_nc = line_stat('nc_pct')
-    mean_pr, med_pr, dp_pr = line_stat('prod_pct')
-    mean_15, med_15, dp_15 = line_stat('le15s_pct')
-    mean_ov, med_ov, dp_ov = line_stat('overlap_pct')
-
-    means, meds, meanp1 = [mean_nc, mean_pr, mean_15, mean_ov], [med_nc, med_pr, med_15, med_ov], [dp_nc, dp_pr, dp_15, dp_ov]
+    means  = [br_stats['nc_pct']['mean'],   br_stats['prod_pct']['mean'],   br_stats['le15s_pct']['mean'],   br_stats['overlap_pct']['mean']]
+    meds   = [br_stats['nc_pct']['median'], br_stats['prod_pct']['median'], br_stats['le15s_pct']['median'], br_stats['overlap_pct']['median']]
+    meanp1 = [br_stats['nc_pct']['mean_plus_sd'], br_stats['prod_pct']['mean_plus_sd'], br_stats['le15s_pct']['mean_plus_sd'], br_stats['overlap_pct']['mean_plus_sd']]
 
     fig, ax = plt.subplots(figsize=(11, 6.5), dpi=220)
     x = np.arange(len(labels)); width = 0.34
@@ -317,16 +417,13 @@ def plot_png(start: str, end: str,
                  f"{start} a {end}  |  alvo prod: {int(alvo_prod)}/h")
     ax.grid(axis='y', linestyle='--', alpha=0.4)
 
-    # legenda principal DENTRO do eixo (top-right)
     leg = ax.legend(loc='upper right', framealpha=0.95)
 
-    # rótulos nas barras
     ymax = max(grp_vals + br_vals + [1.0])
     for i in range(len(labels)):
         ax.text(x[i] - width/2, grp_vals[i] + ymax*0.02, f"{grp_vals[i]:.1f}%", ha='center', va='bottom', fontsize=9)
         ax.text(x[i] + width/2, br_vals[i]  + ymax*0.02, f"{br_vals[i]:.1f}%",  ha='center', va='bottom', fontsize=9)
 
-    # --- caixa “cortes atingidos” logo ABAIXO da legenda, dentro do eixo ---
     if '_n' in cut_hits:  # Top10
         n = cut_hits['_n']
         lines = [
@@ -347,12 +444,10 @@ def plot_png(start: str, end: str,
         ]
     box_text = "\n".join(lines)
 
-    # medir a legenda e posicionar a caixa logo abaixo, em coordenadas do AXES
-    fig.canvas.draw()  # necessário pra medir
+    fig.canvas.draw()
     bbox_px = leg.get_window_extent(fig.canvas.get_renderer())
     bbox_ax = bbox_px.transformed(ax.transAxes.inverted())
-
-    x_right = min(0.98, bbox_ax.x1)   # 0.98 para não colar na borda
+    x_right = min(0.98, bbox_ax.x1)
     y_below = max(0.05, bbox_ax.y0 - 0.02)
 
     ax.text(x_right, y_below, box_text,
@@ -367,7 +462,7 @@ def plot_png(start: str, end: str,
     return out
 
 # -----------------------
-# Export ORG
+# Export ORG (inclui estatísticas BR-excl.)
 # -----------------------
 
 def export_org(path_png: Optional[str],
@@ -375,6 +470,7 @@ def export_org(path_png: Optional[str],
                grp_title: str,
                grp_panel: Dict[str, float],
                br_panel: Dict[str, float],
+               br_stats: Dict[str, Dict[str, float]],
                alvo_prod: float,
                cuts: Dict[str, Optional[float]],
                cut_hits: Dict[str, Any],
@@ -398,6 +494,15 @@ def export_org(path_png: Optional[str],
     lines.append(f"| ≤ 15s (%) | {grp_panel['le15s_pct']:.2f}% | {br_panel['le15s_pct']:.2f}% |")
     lines.append(f"| Sobreposição (%) | {grp_panel['overlap_pct']:.2f}% | {br_panel['overlap_pct']:.2f}% |\n")
 
+    # Estatísticas BR-excl. (linhas)
+    lines.append("** Estatísticas BR-excl. (linhas)")
+    lines.append("| Indicador | Média | Mediana | Média+DP |")
+    lines.append("|-")
+    lines.append(f"| % NC | {br_stats['nc_pct']['mean']:.2f}% | {br_stats['nc_pct']['median']:.2f}% | {br_stats['nc_pct']['mean_plus_sd']:.2f}% |")
+    lines.append(f"| Prod (% alvo) | {br_stats['prod_pct']['mean']:.2f}% | {br_stats['prod_pct']['median']:.2f}% | {br_stats['prod_pct']['mean_plus_sd']:.2f}% |")
+    lines.append(f"| ≤ 15s (%) | {br_stats['le15s_pct']['mean']:.2f}% | {br_stats['le15s_pct']['median']:.2f}% | {br_stats['le15s_pct']['mean_plus_sd']:.2f}% |")
+    lines.append(f"| Sobreposição (%) | {br_stats['overlap_pct']['mean']:.2f}% | {br_stats['overlap_pct']['median']:.2f}% | {br_stats['overlap_pct']['mean_plus_sd']:.2f}% |\n")
+
     # Tabela cortes atingidos
     lines.append("** Cortes atingidos")
     if '_n' in cut_hits:
@@ -417,7 +522,6 @@ def export_org(path_png: Optional[str],
         lines.append(f"| ≤ 15s | {sym(cut_hits.get('le15s'))} |")
         lines.append(f"| Sobreposição | {sym(cut_hits.get('overlap'))} |\n")
 
-    # Imagem
     if path_png and os.path.exists(path_png):
         lines.append("#+CAPTION: Indicadores compostos (barras) e estatísticas do BR-excl. (linhas).")
         lines.append(f"[[file:{os.path.basename(path_png)}]]\n")
@@ -426,6 +530,97 @@ def export_org(path_png: Optional[str],
         f.write("\n".join(lines))
     print(f"✅ Org salvo em: {out_path}")
     return out_path
+
+# -----------------------
+# Comentários (composto)
+# -----------------------
+
+def _fallback_prompt_composto(payload: Dict[str, Any]) -> str:
+    start, end = payload["period"]
+    grp_title  = payload["grp_title"]
+    alvo_prod  = payload["alvo_prod"]
+    G = payload["metrics"]        # grupo
+    B = payload["br_metrics"]     # BR-excl.
+    S = payload["br_stats"]       # linhas
+    cuts = payload.get("cuts", {})
+    cut_hits = payload.get("cut_hits", {})
+    cuts_txt = ", ".join([f"{k}={v}" for k, v in cuts.items() if v is not None]) or "nenhum"
+
+    return (
+        f"[Contexto]\n"
+        f"Período: {start} a {end}. Grupo: {grp_title}. Alvo de produtividade: {int(alvo_prod)}/h.\n"
+        f"As barras mostram o grupo vs Brasil (excl.). As linhas referenciam o BR-excl.: média, mediana e média+DP.\n\n"
+        f"[Barras — valores]\n"
+        f"- % NC: {G['nc_pct']:.1f}% (grupo) vs {B['nc_pct']:.1f}% (BR-excl.)\n"
+        f"- Prod (% alvo): {G['prod_pct']:.1f}% vs {B['prod_pct']:.1f}%\n"
+        f"- ≤15s: {G['le15s_pct']:.1f}% vs {B['le15s_pct']:.1f}%\n"
+        f"- Sobreposição: {G['overlap_pct']:.1f}% vs {B['overlap_pct']:.1f}%\n\n"
+        f"[Linhas — BR-excl.]\n"
+        f"- % NC: média {S['nc_pct']['mean']:.1f}%, mediana {S['nc_pct']['median']:.1f}%, média+DP {S['nc_pct']['mean_plus_sd']:.1f}%\n"
+        f"- Prod: média {S['prod_pct']['mean']:.1f}%, mediana {S['prod_pct']['median']:.1f}%, média+DP {S['prod_pct']['mean_plus_sd']:.1f}%\n"
+        f"- ≤15s: média {S['le15s_pct']['mean']:.1f}%, mediana {S['le15s_pct']['median']:.1f}%, média+DP {S['le15s_pct']['mean_plus_sd']:.1f}%\n"
+        f"- Sobreposição: média {S['overlap_pct']['mean']:.1f}%, mediana {S['overlap_pct']['median']:.1f}%, média+DP {S['overlap_pct']['mean_plus_sd']:.1f}%\n\n"
+        f"[Cortes]\n"
+        f"Cortes configurados: {cuts_txt}. Resultado (grupo/perito): {cut_hits}.\n\n"
+        f"[Instruções ao modelo]\n"
+        f"1) Em 3–4 frases, descreva o posicionamento do grupo em cada indicador vs as linhas de referência do BR-excl.\n"
+        f"2) Aponte quais indicadores mais contribuem para o composto (ex.: %NC alto + ≤15s alto).\n"
+        f"3) Registre limitações de leitura (bases pequenas, dispersão alta, outliers) quando pertinente.\n"
+        f"4) Feche com uma ação objetiva (ex.: revisar motivos de NC mais discrepantes; verificar janelas de sobreposição).\n"
+    )
+
+def _build_messages_composto(payload: Dict[str, Any], max_words: int = 180) -> List[Dict[str, str]]:
+    """Prompt para GPT em texto corrido, um parágrafo, com resumo JSON dos dados."""
+    start, end = payload["period"]
+    grp_title  = payload["grp_title"]
+    resumo = {
+        "periodo": f"{start} a {end}",
+        "grupo": grp_title,
+        "alvo_prod": float(payload.get("alvo_prod", 50.0)),
+        "barras": {
+            "grupo": payload["metrics"],
+            "br_excl": payload["br_metrics"],
+        },
+        "linhas_br_excl": payload["br_stats"],
+        "cuts": payload.get("cuts", {}),
+        "cut_hits": payload.get("cut_hits", {}),
+    }
+    system = "Você é um analista de dados do ATESTMED. Escreva comentários claros, objetivos e tecnicamente corretos."
+    user = (
+        "Escreva um comentário interpretativo, em português (Brasil), para um gráfico composto com 4 indicadores "
+        "(barras) e linhas de referência do BR-excl. Use TEXTO CORRIDO (um único parágrafo, sem títulos/listas/tabelas), "
+        f"com no máximo {max_words} palavras. Inclua: (1) leitura comparativa por indicador; "
+        "(2) destaque de onde há maior desvio em pontos percentuais; "
+        "(3) referência às linhas (média, mediana, média+DP); "
+        "(4) ressalvas amostrais quando pertinente; e (5) uma ação objetiva de verificação. "
+        "Dados resumidos (JSON):\n\n" + __import__("json").dumps(resumo, ensure_ascii=False)
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+def _gerar_comentario_composto(payload: Dict[str, Any], call_api: bool, max_words: int = 180) -> str:
+    """Gera comentário final. Tenta utils.comentarios; se não, tenta API local; por fim retorna prompt fallback."""
+    # 1) Se houver função no utils, usar
+    if _comentar_composto_api:
+        try:
+            res = _comentar_composto_api(payload, call_api=call_api)
+            if isinstance(res, dict):
+                txt = (res.get("comment") or res.get("prompt") or "").strip()
+            else:
+                txt = str(res or "").strip()
+            if txt:
+                txt = _cap_words(_to_one_paragraph(_strip_markers(txt)), max_words)
+                return txt
+        except Exception as e:
+            print(f"⚠️ comentar_composto falhou: {e}. Tentando API direta/fallback.")
+    # 2) API direta (se houver chave)
+    if call_api or _load_openai_key_from_dotenv():
+        msgs = _build_messages_composto(payload, max_words=max_words)
+        txt = _call_openai(msgs, model="gpt-4o-mini", temperature=0.2)
+        if txt:
+            return _cap_words(_to_one_paragraph(_strip_markers(txt)), max_words)
+    # 3) Fallback: prompt instrucional
+    fb = _fallback_prompt_composto(payload)
+    return _cap_words(_to_one_paragraph(_strip_markers(fb)), max_words)
 
 # -----------------------
 # CLI e pipeline
@@ -444,13 +639,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--alvo-prod', type=float, default=50.0, help='Alvo de produtividade (análises/h) [50]')
 
     # cortes (opcionais)
-    ap.add_argument('--cut-prod-pct', type=float, default=100.0, help='Corte Produtividade (% do alvo) [100]')
-    ap.add_argument('--cut-nc-pct', type=float, default=None, help='Corte % NC (opcional)')
-    ap.add_argument('--cut-le15s-pct', type=float, default=None, help='Corte % ≤15s (opcional)')
-    ap.add_argument('--cut-overlap-pct', type=float, default=None, help='Corte % sobreposição (opcional)')
+    ap.add_argument('--cut-prod-pct', type=float, default=100.0, help='Corte Produtividade (%% do alvo) [100]')
+    ap.add_argument('--cut-nc-pct', type=float, default=None, help='Corte %% NC (opcional)')
+    ap.add_argument('--cut-le15s-pct', type=float, default=None, help='Corte %% ≤15s (opcional)')
+    ap.add_argument('--cut-overlap-pct', type=float, default=None, help='Corte %% sobreposição (opcional)')
 
+    # exportações/saídas
     ap.add_argument('--export-png', action='store_true')
     ap.add_argument('--export-org', action='store_true')
+    ap.add_argument('--export-comment', action='store_true', help='Gera *_comment.md (IA) ao lado do .org; se --call-api ausente, salva só o prompt')
+    ap.add_argument('--export-comment-org', action='store_true',
+                    help='Gera comentário (IA ou prompt) e incorpora no arquivo .org')
+    ap.add_argument('--call-api', action='store_true', help='Chama a API (utils.comentarios) ou OpenAI local para obter o texto final do comentário')
     ap.add_argument('--chart', action='store_true', help='Gráfico ASCII no terminal')
 
     return ap.parse_args()
@@ -498,6 +698,7 @@ def main():
 
     # painéis e estatísticas BR-excl.
     grp_panel, br_panel, mdf_b = build_panels(df, grupo, args.alvo_prod)
+    br_stats = compute_br_stats(mdf_b)
 
     # contagem de cortes
     cut_hits = count_cut_hits(
@@ -518,41 +719,95 @@ def main():
         png_path = plot_png(
             start=args.start, end=args.end,
             grp_title=grp_title,
-            grp_panel=grp_panel, br_panel=br_panel, mdf_b=mdf_b,
+            grp_panel=grp_panel, br_panel=br_panel, br_stats=br_stats,
             alvo_prod=args.alvo_prod,
             cut_prod_pct=args.cut_prod_pct,
             cut_hits=cut_hits,
             out_path=os.path.join(EXPORT_DIR, png_name)
         )
 
-    if args.export_org:
+    if args.export_org or args.export_comment or args.export_comment_org:
+        # garanta PNG para figlink no .org
+        if not png_path:
+            png_path = plot_png(
+                start=args.start, end=args.end,
+                grp_title=grp_title,
+                grp_panel=grp_panel, br_panel=br_panel, br_stats=br_stats,
+                alvo_prod=args.alvo_prod,
+                cut_prod_pct=args.cut_prod_pct,
+                cut_hits=cut_hits,
+                out_path=os.path.join(EXPORT_DIR, png_name)
+            )
+
         cuts_dict = dict(cut_prod_pct=args.cut_prod_pct,
                          cut_nc_pct=args.cut_nc_pct,
                          cut_le15s_pct=args.cut_le15s_pct,
                          cut_overlap_pct=args.cut_overlap_pct)
-        export_org(
+
+        org_path = export_org(
             path_png=png_path,
             start=args.start, end=args.end,
             grp_title=grp_title,
-            grp_panel=grp_panel, br_panel=br_panel,
+            grp_panel=grp_panel, br_panel=br_panel, br_stats=br_stats,
             alvo_prod=args.alvo_prod,
             cuts=cuts_dict,
             cut_hits=cut_hits,
             out_name=org_name
         )
 
-    if args.chart:
-        # gráfico ASCII rápido das barras do painel (grupo vs BR-excl.)
-        p.clear_data()
-        labels = ['%NC', 'Prod(%alvo)', '≤15s', 'Sobrep.']
-        p.multi_bar(labels,
-                    [[grp_panel['nc_pct'], grp_panel['prod_pct'], grp_panel['le15s_pct'], grp_panel['overlap_pct']],
-                     [br_panel['nc_pct'],  br_panel['prod_pct'],  br_panel['le15s_pct'],  br_panel['overlap_pct']]],
-                    label=[grp_title, 'Brasil (excl.)'])
-        p.title(f"Indicadores (composto) — {grp_title} vs BR-excl.")
-        p.plotsize(90, 20)
-        p.show()
+        # Se for salvar comentário (.md) ou incorporar no .org, gere o texto uma única vez
+        if args.export_comment or args.export_comment_org:
+            payload = {
+                "period": (args.start, args.end),
+                "grp_title": grp_title,
+                "grupo": "top10" if args.top10 else "perito",
+                "alvo_prod": args.alvo_prod,
+                "metrics": grp_panel,
+                "br_metrics": br_panel,
+                "br_stats": br_stats,
+                "cuts": cuts_dict,
+                "cut_hits": cut_hits,
+            }
+            # ativa API automaticamente se houver OPENAI_API_KEY, mesmo sem --call-api
+            call_api = bool(args.call_api or _load_openai_key_from_dotenv())
+            comment_text = _gerar_comentario_composto(payload, call_api=call_api)
 
+            if args.export_comment:
+                cpath = org_path.replace(".org", "_comment.md")
+                Path(cpath).write_text(comment_text, encoding="utf-8")
+                print(f"✅ Comentário salvo em: {cpath}")
+
+            if args.export_comment_org:
+                # Anexa ao .org sob uma seção própria
+                with open(org_path, "a", encoding="utf-8") as f:
+                    f.write("\n** Comentário\n")
+                    f.write(comment_text.strip() + "\n")
+                print(f"✅ Comentário incorporado ao ORG: {org_path}")
+
+    if args.chart:
+        if p is None:
+            print("plotext não instalado; pulei o gráfico ASCII.")
+        else:
+            labels = ['%NC', 'Prod(%alvo)', '≤15s', 'Sobrep.']
+            p.clear_data()
+            try:
+                func = getattr(p, "multiple_bar", None) or getattr(p, "multi_bar", None)
+                if func:
+                    func(labels,
+                         [[grp_panel['nc_pct'], grp_panel['prod_pct'], grp_panel['le15s_pct'], grp_panel['overlap_pct']],
+                          [br_panel['nc_pct'],  br_panel['prod_pct'],  br_panel['le15s_pct'],  br_panel['overlap_pct']]],
+                         label=[grp_title, 'Brasil (excl.)'])
+                else:
+                    p.bar(labels, [grp_panel['nc_pct'], grp_panel['prod_pct'], grp_panel['le15s_pct'], grp_panel['overlap_pct']], label=grp_title)
+                    p.bar(labels, [br_panel['nc_pct'],  br_panel['prod_pct'],  br_panel['le15s_pct'],  br_panel['overlap_pct']], label='Brasil (excl.)')
+                p.title(f"Indicadores (composto) — {grp_title} vs BR-excl.")
+                p.plotsize(90, 20)
+                p.show()
+            except Exception:
+                p.clear_data()
+                p.bar([grp_title, 'Brasil (excl.)'], [1, 1])  # placeholder para não quebrar
+                p.title("plotext incompatível; exibição simplificada")
+                p.show()
 
 if __name__ == "__main__":
     main()

@@ -8,18 +8,22 @@ Compara o percentual dos motivos de não conformidade (NC) de:
 
 usando a DESCRIÇÃO no eixo X (texto em protocolos.motivo, com fallback para o código).
 
-Fontes:
-- Descrição: protocolos.motivo (texto do CSV)
-- Flag NC: analises.motivoNaoConformado = 1
-  (fallback: motivo não vazio em protocolos, quando disponível)
-
-Compatibilidade:
-- Detecta a tabela de análises: analises OU analises_atestmed
-- Usa substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
+Regras IMPORTANTES:
+- A definição de NC é **robusta** e considera:
+    NC = (conformado = 0)  OU  (motivoNaoConformado, mesmo como TEXTO, não-vazio e CAST(...) <> 0)
+  OBS: O campo protocolos.motivo é usado APENAS como DESCRIÇÃO para o gráfico/tabelas, e não
+       influencia na contagem de NC.
+- Compatibilidade de schema:
+    * Detecta a tabela de análises: analises OU analises_atestmed
+    * Usa substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
 - Backend Matplotlib = Agg (gera PNG em ambiente headless)
 
 Saídas:
---export-org, --export-md (opcional), --export-png, --export-comment, --chart
+--export-org, --export-md, --export-png,
+--export-comment            (comentário em .md)
+--export-comment-org        (comentário inserido no .org)
+--chart (ASCII), --call-api
+
 Parâmetros visuais:
 --label-maxlen (abrevia rótulos do eixo X com “…”)
 --label-fontsize (tamanho da fonte dos rótulos do eixo X)
@@ -33,6 +37,12 @@ Cortes (cuts) para filtrar motivos antes do Top-N:
 --min-pct-brasil X     → descarta motivos com % do Brasil (excl.) < X
 --min-n-perito N       → descarta motivos com n do perito < N
 --min-n-brasil N       → descarta motivos com n do Brasil (excl.) < N
+
+Exemplo:
+python3 graphs_and_tables/compare_nc_rate.py \
+  --start 2025-07-01 --end 2025-07-31 \
+  --perito "CASSIO DE AZEVEDO MARQUES FILHO" \
+  --export-png --export-org --export-comment-org
 """
 
 import os
@@ -49,18 +59,51 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import plotext as p
+
+# ────────────────────────────────────────────────────────────────────────────────
+# plotext (compat: multi_bar vs multiple_bar; label vs labels)
+# ────────────────────────────────────────────────────────────────────────────────
+try:
+    import plotext as p
+except Exception:
+    p = None
+    def px_multi_bar(*args, **kwargs):
+        raise RuntimeError("plotext indisponível (p=None)")
+    def px_build():
+        return ""
+else:
+    _mb  = getattr(p, "multi_bar", None)
+    _mb2 = getattr(p, "multiple_bar", None)
+
+    def px_multi_bar(x, ys, labels=None, **kw):
+        f = _mb or _mb2
+        if f is None:
+            raise AttributeError("plotext sem multi_bar/multiple_bar")
+        try:
+            return f(x, ys, labels=labels, **kw)   # versões novas (labels=)
+        except TypeError:
+            return f(x, ys, label=labels, **kw)    # versões antigas (label=)
+
+    def px_build():
+        b = getattr(p, "build", None)
+        return b() if callable(b) else ""
 
 BASE_DIR   = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DB_PATH    = os.path.join(BASE_DIR, 'db', 'atestmed.db')
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
+# Integração com comentários (GPT)
 _COMENT_FUNC = None
 try:
-    from utils.comentarios import comentar_motivos_perito_vs_brasil as _COMENT_FUNC  # type: ignore
+    # novo nome (preferido)
+    from utils.comentarios import comentar_motivos as _COMENT_FUNC  # type: ignore
 except Exception:
-    _COMENT_FUNC = None
+    try:
+        # compat antigo
+        from utils.comentarios import comentar_motivos_perito_vs_brasil as _COMENT_FUNC  # type: ignore
+    except Exception:
+        _COMENT_FUNC = None
 
 
 # ============================
@@ -82,8 +125,8 @@ def _detect_schema(conn: sqlite3.Connection) -> Dict[str, Any]:
     """
     Detecta tabela de análises e colunas necessárias.
     Exige: siapePerito, dataHoraIniPericia
-    Usa: motivoNaoConformado (flag 0/1) se existir.
-    Protocolo é opcional (usado para pegar protocolos.motivo).
+    Usa: motivoNaoConformado (se existir) e conformado (se existir) para a regra robusta de NC.
+    Protocolo é opcional (usado para pegar protocolos.motivo como descrição).
     """
     table = None
     for t in ('analises', 'analises_atestmed'):
@@ -99,22 +142,23 @@ def _detect_schema(conn: sqlite3.Connection) -> Dict[str, Any]:
     if missing:
         raise RuntimeError(f"Tabela '{table}' sem colunas obrigatórias: {missing}")
 
-    motivo_col = 'motivoNaoConformado' if 'motivoNaoConformado' in cset else None
-    has_protocolo_col = 'protocolo' in cset
-    has_protocolos_tbl = _table_exists(conn, 'protocolos')
+    motivo_col      = 'motivoNaoConformado' if 'motivoNaoConformado' in cset else None
+    has_conformado  = 'conformado' in cset
+    has_protocolo   = 'protocolo' in cset
+    has_protocolos  = _table_exists(conn, 'protocolos')
 
     if not _table_exists(conn, 'peritos') or 'nomePerito' not in _cols(conn, 'peritos'):
         raise RuntimeError("Tabela 'peritos' ausente ou sem coluna 'nomePerito'.")
 
-    # indicadores é necessário só para --top10
     has_indicadores = _table_exists(conn, 'indicadores')
 
     return {
         'table': table,
-        'motivo_col': motivo_col,                # flag 0/1 se existir
+        'motivo_col': motivo_col,                # pode ser None
+        'has_conformado': has_conformado,        # True/False
         'date_col': 'dataHoraIniPericia',
-        'has_protocolo': has_protocolo_col,
-        'has_protocolos_table': has_protocolos_tbl,
+        'has_protocolo': has_protocolo,
+        'has_protocolos_table': has_protocolos,
         'has_indicadores': has_indicadores,
     }
 
@@ -130,22 +174,40 @@ def _get_counts_single(conn: sqlite3.Connection, start: str, end: str, perito: s
     """
     Retorna (df_perito, df_brasil_excl) com colunas: ['descricao', 'n'].
     Descrição: COALESCE(NULLIF(TRIM(pr.motivo), ''), CAST(código AS TEXT))
-    Critério de NC: (a.motivoNaoConformado = 1) OR (TRIM(pr.motivo) <> '')
+    Critério de NC (regra robusta):
+      - conformado = 0  OR
+      - motivoNaoConformado (texto) != '' E CAST(...) <> 0
     """
     t            = schema['table']
-    motivo_col   = schema['motivo_col']   # pode ser None
+    motivo_col   = schema['motivo_col']    # pode ser None
+    has_conf     = schema['has_conformado']
     date_col     = schema['date_col']
     has_protcol  = schema['has_protocolo']
     has_prot     = schema['has_protocolos_table']
 
     join_prot = "LEFT JOIN protocolos pr ON pr.protocolo = a.protocolo" if (has_protcol and has_prot) else ""
 
+    # texto para fallback do rótulo
     cast_target = f"a.{motivo_col}" if motivo_col else "NULL"
     desc_expr = f"COALESCE(NULLIF(TRIM(pr.motivo), ''), CAST({cast_target} AS TEXT)) AS descricao"
 
-    cond_nc_code = f"(a.{motivo_col} = 1)" if motivo_col else "0"
-    cond_nc_prot = "(TRIM(pr.motivo) <> '')" if (has_protcol and has_prot) else "0"
-    cond_nc_total = f"(({cond_nc_code}) OR ({cond_nc_prot}))"
+    # regra robusta de NC
+    if has_conf and motivo_col:
+        cond_nc_total = (
+            " (CAST(COALESCE(NULLIF(TRIM(a.conformado),''),'1') AS INTEGER) = 0) "
+            " OR (TRIM(COALESCE(a.motivoNaoConformado,'')) <> '' "
+            "     AND CAST(COALESCE(NULLIF(TRIM(a.motivoNaoConformado),''),'0') AS INTEGER) <> 0) "
+        )
+    elif has_conf and not motivo_col:
+        cond_nc_total = " (CAST(COALESCE(NULLIF(TRIM(a.conformado),''),'1') AS INTEGER) = 0) "
+    elif (not has_conf) and motivo_col:
+        cond_nc_total = (
+            " (TRIM(COALESCE(a.motivoNaoConformado,'')) <> '' "
+            "  AND CAST(COALESCE(NULLIF(TRIM(a.motivoNaoConformado),''),'0') AS INTEGER) <> 0) "
+        )
+    else:
+        # pior caso: não há nenhuma coluna — não conseguimos medir NC
+        cond_nc_total = " 0 "
 
     base_select = f"""
         SELECT {desc_expr},
@@ -155,7 +217,7 @@ def _get_counts_single(conn: sqlite3.Connection, start: str, end: str, perito: s
           {join_prot}
          WHERE TRIM(UPPER(p.nomePerito)) {{cmp}}
            AND substr(a.{date_col},1,10) BETWEEN ? AND ?
-           AND {cond_nc_total}
+           AND ( {cond_nc_total} )
          GROUP BY descricao
     """
 
@@ -182,6 +244,7 @@ def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: L
 
     t            = schema['table']
     motivo_col   = schema['motivo_col']
+    has_conf     = schema['has_conformado']
     date_col     = schema['date_col']
     has_protcol  = schema['has_protocolo']
     has_prot     = schema['has_protocolos_table']
@@ -190,9 +253,21 @@ def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: L
     cast_target = f"a.{motivo_col}" if motivo_col else "NULL"
     desc_expr = f"COALESCE(NULLIF(TRIM(pr.motivo), ''), CAST({cast_target} AS TEXT)) AS descricao"
 
-    cond_nc_code = f"(a.{motivo_col} = 1)" if motivo_col else "0"
-    cond_nc_prot = "(TRIM(pr.motivo) <> '')" if (has_protcol and has_prot) else "0"
-    cond_nc_total = f"(({cond_nc_code}) OR ({cond_nc_prot}))"
+    if has_conf and motivo_col:
+        cond_nc_total = (
+            " (CAST(COALESCE(NULLIF(TRIM(a.conformado),''),'1') AS INTEGER) = 0) "
+            " OR (TRIM(COALESCE(a.motivoNaoConformado,'')) <> '' "
+            "     AND CAST(COALESCE(NULLIF(TRIM(a.motivoNaoConformado),''),'0') AS INTEGER) <> 0) "
+        )
+    elif has_conf and not motivo_col:
+        cond_nc_total = " (CAST(COALESCE(NULLIF(TRIM(a.conformado),''),'1') AS INTEGER) = 0) "
+    elif (not has_conf) and motivo_col:
+        cond_nc_total = (
+            " (TRIM(COALESCE(a.motivoNaoConformado,'')) <> '' "
+            "  AND CAST(COALESCE(NULLIF(TRIM(a.motivoNaoConformado),''),'0') AS INTEGER) <> 0) "
+        )
+    else:
+        cond_nc_total = " 0 "
 
     placeholders = ",".join(["?"] * len(peritos))
     where_in  = f"IN ({placeholders})"
@@ -206,7 +281,7 @@ def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: L
           {join_prot}
          WHERE TRIM(UPPER(p.nomePerito)) {{cmp}}
            AND substr(a.{date_col},1,10) BETWEEN ? AND ?
-           AND {cond_nc_total}
+           AND ( {cond_nc_total} )
          GROUP BY descricao
     """
 
@@ -227,19 +302,34 @@ def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: L
 def _get_nc_rates_single(conn: sqlite3.Connection, start: str, end: str, perito: str, schema: Dict[str, Any]) -> Tuple[float, float]:
     """
     Retorna (taxa NC perito %, taxa NC Brasil excl. %) para um perito.
-    Taxa = NC / Total * 100 no período.
+    Regra robusta de NC:
+      conformado = 0  OR  (motivoNaoConformado texto != '' E CAST(...) != 0)
     """
     t            = schema['table']
     date_col     = schema['date_col']
     motivo_col   = schema['motivo_col']
+    has_conf     = schema['has_conformado']
     has_protcol  = schema['has_protocolo']
     has_prot     = schema['has_protocolos_table']
 
-    cond_nc_code = f"(a.{motivo_col} = 1)" if motivo_col else "0"
-    cond_nc_prot = "(TRIM(pr.motivo) <> '')" if (has_protcol and has_prot) else "0"
-    cond_nc_total = f"(({cond_nc_code}) OR ({cond_nc_prot}))"
-
+    # join com protocolos apenas para motivos (não entra na regra de NC)
     join_prot = "LEFT JOIN protocolos pr ON pr.protocolo = a.protocolo" if (has_protcol and has_prot) else ""
+
+    if has_conf and motivo_col:
+        cond_nc_total = (
+            " (CAST(COALESCE(NULLIF(TRIM(a.conformado),''),'1') AS INTEGER) = 0) "
+            " OR (TRIM(COALESCE(a.motivoNaoConformado,'')) <> '' "
+            "     AND CAST(COALESCE(NULLIF(TRIM(a.motivoNaoConformado),''),'0') AS INTEGER) <> 0) "
+        )
+    elif has_conf and not motivo_col:
+        cond_nc_total = " (CAST(COALESCE(NULLIF(TRIM(a.conformado),''),'1') AS INTEGER) = 0) "
+    elif (not has_conf) and motivo_col:
+        cond_nc_total = (
+            " (TRIM(COALESCE(a.motivoNaoConformado,'')) <> '' "
+            "  AND CAST(COALESCE(NULLIF(TRIM(a.motivoNaoConformado),''),'0') AS INTEGER) <> 0) "
+        )
+    else:
+        cond_nc_total = " 0 "
 
     q_base = f"""
         SELECT COUNT(*) AS total,
@@ -262,6 +352,8 @@ def _get_nc_rates_single(conn: sqlite3.Connection, start: str, end: str, perito:
 def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos: List[str], schema: Dict[str, Any]) -> Tuple[float, float]:
     """
     Retorna (taxa NC grupo %, taxa NC Brasil-excl-grupo %) para lista de peritos.
+    Regra robusta de NC:
+      conformado = 0  OR  (motivoNaoConformado texto != '' E CAST(...) != 0)
     """
     if not peritos:
         return 0.0, 0.0
@@ -269,14 +361,27 @@ def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos:
     t            = schema['table']
     date_col     = schema['date_col']
     motivo_col   = schema['motivo_col']
+    has_conf     = schema['has_conformado']
     has_protcol  = schema['has_protocolo']
     has_prot     = schema['has_protocolos_table']
 
-    cond_nc_code = f"(a.{motivo_col} = 1)" if motivo_col else "0"
-    cond_nc_prot = "(TRIM(pr.motivo) <> '')" if (has_protcol and has_prot) else "0"
-    cond_nc_total = f"(({cond_nc_code}) OR ({cond_nc_prot}))"
-
     join_prot = "LEFT JOIN protocolos pr ON pr.protocolo = a.protocolo" if (has_protcol and has_prot) else ""
+
+    if has_conf and motivo_col:
+        cond_nc_total = (
+            " (CAST(COALESCE(NULLIF(TRIM(a.conformado),''),'1') AS INTEGER) = 0) "
+            " OR (TRIM(COALESCE(a.motivoNaoConformado,'')) <> '' "
+            "     AND CAST(COALESCE(NULLIF(TRIM(a.motivoNaoConformado),''),'0') AS INTEGER) <> 0) "
+        )
+    elif has_conf and not motivo_col:
+        cond_nc_total = " (CAST(COALESCE(NULLIF(TRIM(a.conformado),''),'1') AS INTEGER) = 0) "
+    elif (not has_conf) and motivo_col:
+        cond_nc_total = (
+            " (TRIM(COALESCE(a.motivoNaoConformado,'')) <> '' "
+            "  AND CAST(COALESCE(NULLIF(TRIM(a.motivoNaoConformado),''),'0') AS INTEGER) <> 0) "
+        )
+    else:
+        cond_nc_total = " 0 "
 
     placeholders = ",".join(["?"] * len(peritos))
     where_in  = f"IN ({placeholders})"
@@ -462,8 +567,59 @@ def _abbrev(s: str, maxlen: int) -> str:
     s = (str(s) or "").strip()
     return s if len(s) <= maxlen else s[:max(1, maxlen - 1)] + "…"
 
-def _ascii_label(s: str, maxlen: int) -> str:
+def _ascii_label(s: str, maxlen: int = 18) -> str:
     return _abbrev(s, maxlen=maxlen)
+
+def _build_motivos_payload(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "period": (meta['start'], meta['end']),
+        "nc_rate": {"lhs": meta.get("nc_rate_p"), "rhs": meta.get("nc_rate_b")},
+        "rows": [
+            {
+                "descricao": str(r['descricao']),
+                "pct_perito": float(r['pct_perito']),
+                "pct_brasil": float(r['pct_brasil']),
+                "n_perito": int(r['n_perito']),
+                "n_brasil": int(r['n_brasil']),
+            }
+            for _, r in df.iterrows()
+        ],
+        "mode": meta.get("mode", "single"),
+        "meta": {
+            "lhs_label": meta.get("label_lhs", "Grupo"),
+            "rhs_label": meta.get("label_rhs", "Brasil (excl.)"),
+            "peritos_lista": meta.get("peritos_lista", []),
+            "cuts": cuts or {},
+        },
+    }
+
+def gerar_comentario(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict[str, Any]], call_api: bool) -> str:
+    if _COMENT_FUNC is None or df.empty:
+        # fallback curto
+        return ("Sem dados suficientes para um comentário interpretativo." if df.empty
+                else "Comparativo dos motivos de NC entre os grupos, considerando percentuais dentro do conjunto de NC.")
+    payload = _build_motivos_payload(df, meta, cuts or {})
+    try:
+        out = _COMENT_FUNC(payload, call_api=call_api)
+        if isinstance(out, dict):
+            return (out.get("comment") or out.get("prompt") or "").strip()
+        if isinstance(out, str):
+            return out.strip()
+        return str(out).strip()
+    except TypeError:
+        # compat assinatura antiga
+        try:
+            tabela_md = "| Motivo | % A | % B | n A | n B |\n" + "\n".join(
+                f"| {r['descricao']} | {r['pct_perito']:.2f}% | {r['pct_brasil']:.2f}% | {int(r['n_perito'])} | {int(r['n_brasil'])} |"
+                for _, r in df.iterrows()
+            )
+            out = _COMENT_FUNC(tabela_md=tabela_md, chart_ascii="", start=meta['start'], end=meta['end'],
+                               perito=meta.get('label_lhs', 'Grupo'))
+            return out.strip() if isinstance(out, str) else str(out).strip()
+        except Exception:
+            return "Comentário não disponível no momento."
+    except Exception:
+        return "Comentário não disponível no momento."
 
 def exportar_md(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any]) -> str:
     safe = _safe_name(meta['safe_stub'])
@@ -520,7 +676,7 @@ def exportar_md(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any]) ->
     print(f"✅ Markdown salvo em: {path}")
     return path
 
-def exportar_org(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any], png_path: Optional[str]) -> str:
+def exportar_org(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any], png_path: Optional[str], comment_text: Optional[str] = None) -> str:
     safe = _safe_name(meta['safe_stub'])
     fname = "motivos_top10_vs_brasil.org" if meta['mode'] == 'top10' else f"motivos_perito_vs_brasil_{safe}.org"
     path = os.path.join(EXPORT_DIR, fname)
@@ -544,14 +700,23 @@ def exportar_org(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any], p
     lines.append("| Motivo (descrição) | % " + meta['label_lhs'] + " | % " + meta['label_rhs'] +
                  " | n " + meta['label_lhs'] + " | n " + meta['label_rhs'] + " |")
     lines.append("|-")
-    for _, r in df.iterrows():
-        lines.append(f"| {r['descricao']} | {r['pct_perito']:.2f}% | {r['pct_brasil']:.2f}% | {int(r['n_perito'])} | {int(r['n_brasil'])} |")
+    if not df.empty:
+        for _, r in df.iterrows():
+            lines.append(f"| {r['descricao']} | {r['pct_perito']:.2f}% | {r['pct_brasil']:.2f}% | {int(r['n_perito'])} | {int(r['n_brasil'])} |")
+    else:
+        lines.append("| — | — | — | — | — |")
 
     # Imagem (se existir)
     if png_path and os.path.exists(png_path):
         rel_png = os.path.basename(png_path)
-        lines.append("\n#+CAPTION: Distribuição percentual dos motivos (barras lado a lado)")
+        lines.append("\n#+CAPTION: Distribuição percentual dos motivos (barras lado a lado).")
         lines.append(f"[[file:{rel_png}]]")
+
+    # Comentário (opcional)
+    if comment_text:
+        lines.append("\n** Comentário")
+        # texto corrido (um parágrafo)
+        lines.append(comment_text.strip())
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -610,6 +775,9 @@ def exportar_png(df: pd.DataFrame, meta: Dict[str, Any],
     return path
 
 def exibir_chart_ascii(df: pd.DataFrame, meta: Dict[str, Any], label_maxlen: int = 18) -> None:
+    if p is None:
+        print("plotext não instalado; pulei o gráfico ASCII.")
+        return
     if df.empty:
         print("⚠️ Sem dados para exibir gráfico ASCII.")
         return
@@ -617,10 +785,10 @@ def exibir_chart_ascii(df: pd.DataFrame, meta: Dict[str, Any], label_maxlen: int
     motivos = [_ascii_label(m, maxlen=label_maxlen) for m in df['descricao'].astype(str).tolist()]
     label_lhs = f"{meta['label_lhs']} (NC {meta.get('nc_rate_p', 0.0):.1f}%)"
     label_rhs = f"{meta['label_rhs']} (NC {meta.get('nc_rate_b', 0.0):.1f}%)"
-    p.multi_bar(
+    px_multi_bar(
         motivos,
         [df['pct_perito'].tolist(), df['pct_brasil'].tolist()],
-        label=[label_lhs, label_rhs]
+        labels=[label_lhs, label_rhs]
     )
     p.title("Motivos de NC – Top 10 piores vs Brasil (excl.)" if meta['mode']=='top10'
             else f"Motivos de NC – {meta['label_lhs']} vs {meta['label_rhs']}")
@@ -628,76 +796,37 @@ def exibir_chart_ascii(df: pd.DataFrame, meta: Dict[str, Any], label_maxlen: int
     p.plotsize(100, 20)
     p.show()
 
-def exportar_comment(df: pd.DataFrame, meta: Dict[str, Any], md_path: Optional[str] = None) -> str:
+def exportar_comment(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict[str, Any]] = None, call_api: bool = False) -> str:
+    """
+    Gera e salva comentário (ou prompt) sobre os motivos **em .md** (compat legado).
+    """
     safe = _safe_name(meta['safe_stub'])
     fname = "motivos_top10_vs_brasil_comment.md" if meta['mode']=='top10' else f"motivos_perito_vs_brasil_{safe}_comment.md"
     path = os.path.join(EXPORT_DIR, fname)
 
-    if df.empty:
-        comentario = (
-            f"**Período:** {meta['start']} a {meta['end']}\n\n"
-            f"Sem dados de NC para {meta['label_lhs']} e/ou {meta['label_rhs']} no período."
-        )
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(comentario)
-        print(f"⚠️ Comentário salvo (sem dados) em: {path}")
-        return path
+    comment_text = gerar_comentario(df, meta, cuts, call_api=call_api)
 
-    header = []
-    if meta['mode']=='top10':
-        header.append(f"**Top 10 piores (scoreFinal):** {', '.join(meta.get('peritos_lista', []))}")
-    header.append(f"**Taxa NC {meta['label_lhs']}:** {meta['nc_rate_p']:.1f}%  "
-                  f"**Taxa NC {meta['label_rhs']}:** {meta['nc_rate_b']:.1f}%")
-    header.append("")
-
-    tabela_md = [
-        "| Motivo (descrição) | % " + meta['label_lhs'] + " | % " + meta['label_rhs'] + " | Δ p.p. |",
-        "|--------------------|---------:|---------:|-------:|"
+    # tabela MD para rastreabilidade no arquivo de comentário
+    header_tbl = [
+        "| Motivo (descrição) | % " + meta['label_lhs'] + " | % " + meta['label_rhs'] + " | n " + meta['label_lhs'] + " | n " + meta['label_rhs'] + " |",
+        "|--------------------|---------:|---------:|---------:|---------:|"
     ]
-    diffs = []
     for _, r in df.iterrows():
-        dpp = r['pct_perito'] - r['pct_brasil']
-        diffs.append((dpp, r))
-        tabela_md.append(
-            f"| {r['descricao']} | {r['pct_perito']:.2f}% | {r['pct_brasil']:.2f}% | {dpp:+.2f} |"
+        header_tbl.append(
+            f"| {r['descricao']} | {r['pct_perito']:.2f}% | {r['pct_brasil']:.2f}% | {int(r['n_perito'])} | {int(r['n_brasil'])} |"
         )
-    tabela_md = "\n".join(header + tabela_md)
+    tabela_md = "\n".join(header_tbl)
 
-    p.clear_data()
-    p.multi_bar(
-        [_ascii_label(m) for m in df['descricao'].astype(str).tolist()],
-        [df['pct_perito'].tolist(), df['pct_brasil'].tolist()],
-        label=[f"{meta['label_lhs']} (NC {meta['nc_rate_p']:.1f}%)",
-               f"{meta['label_rhs']} (NC {meta['nc_rate_b']:.1f}%)"]
-    )
-    p.title("Motivos de NC – Top 10 piores vs Brasil (excl.)" if meta['mode']=='top10'
-            else f"Motivos de NC – {meta['label_lhs']} vs {meta['label_rhs']}")
-    p.plotsize(100, 18)
-    chart_ascii = p.build()
-
-    if _COMENT_FUNC is not None:
-        comentario = _COMENT_FUNC(
-            tabela_md=tabela_md,
-            chart_ascii=chart_ascii,
-            start=meta['start'],
-            end=meta['end'],
-            perito=meta['label_lhs']
-        )
-    else:
-        diffs_sorted = sorted(diffs, key=lambda x: abs(x[0]), reverse=True)[:3]
-        destaques = []
-        for dpp, r in diffs_sorted:
-            direcao = "acima" if dpp > 0 else "abaixo"
-            destaques.append(f"- **{r['descricao']}**: {abs(dpp):.2f} p.p. {direcao} de {meta['label_rhs']}.")
-        comentario = (
-            f"**Período:** {meta['start']} a {meta['end']}\n\n" +
-            "\n".join(header) + "\n" +
-            ("\n".join(destaques) if destaques else "Sem diferenças relevantes.") +
-            "\n\nObservação: percentuais calculados dentro do conjunto de NC de cada grupo."
-        )
+    md_out = []
+    md_out.append(f"**Período:** {meta['start']} a {meta['end']}")
+    md_out.append(f"**Comparação:** {meta['label_lhs']} vs {meta['label_rhs']}")
+    md_out.append("\n### Tabela\n")
+    md_out.append(tabela_md)
+    md_out.append("\n### Comentário\n")
+    md_out.append(comment_text.strip() if comment_text else "(sem comentário)")
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write(comentario)
+        f.write("\n".join(md_out))
     print(f"✅ Comentário salvo em: {path}")
     return path
 
@@ -708,7 +837,10 @@ def exportar_comment(df: pd.DataFrame, meta: Dict[str, Any], md_path: Optional[s
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Compara % de motivos de NC: perito (ou Top 10 piores por scoreFinal) vs Brasil (excluindo o(s) perito(s)) no período (X = descrição)."
+        description=(
+            "Compara a porcentagem dos motivos de NC: perito (ou Top 10 piores por scoreFinal) "
+            "vs Brasil (excluindo o(s) perito(s)) no período (X = descrição)."
+        )
     )
     ap.add_argument('--start', required=True, help='Data inicial YYYY-MM-DD')
     ap.add_argument('--end',   required=True, help='Data final   YYYY-MM-DD')
@@ -717,30 +849,51 @@ def parse_args() -> argparse.Namespace:
     g.add_argument('--perito', help='Nome do perito (exato)')
     g.add_argument('--top10', action='store_true', help='Usar o grupo dos 10 piores por scoreFinal no período')
 
-    ap.add_argument('--min-analises', type=int, default=50, help='Mínimo de análises no período para elegibilidade ao Top 10 (padrão 50)')
-    ap.add_argument('--topn', type=int, default=10, help='Top-N motivos exibidos (padrão 10)')
+    ap.add_argument('--min-analises', type=int, default=50,
+                    help='Mínimo de análises no período para elegibilidade ao Top 10 (padrão 50)')
+    ap.add_argument('--topn', type=int, default=10,
+                    help='Quantidade de motivos exibidos (Top-N, padrão 10)')
 
-    # cuts
-    ap.add_argument('--min-pct-perito', type=float, default=None, help='Filtro: % do perito ≥ X')
-    ap.add_argument('--min-pct-brasil', type=float, default=None, help='Filtro: % do Brasil (excl.) ≥ X')
-    ap.add_argument('--min-n-perito', type=int, default=None, help='Filtro: n do perito ≥ N')
-    ap.add_argument('--min-n-brasil', type=int, default=None, help='Filtro: n do Brasil (excl.) ≥ N')
+    # cuts (sem % no texto do help)
+    ap.add_argument('--min-pct-perito', type=float, default=None,
+                    help='Filtro: porcentagem do perito maior ou igual a X')
+    ap.add_argument('--min-pct-brasil', type=float, default=None,
+                    help='Filtro: porcentagem do Brasil (excl.) maior ou igual a X')
+    ap.add_argument('--min-n-perito', type=int, default=None,
+                    help='Filtro: contagem do perito maior ou igual a N')
+    ap.add_argument('--min-n-brasil', type=int, default=None,
+                    help='Filtro: contagem do Brasil (excl.) maior ou igual a N')
 
     # layout
-    ap.add_argument('--label-maxlen', type=int, default=18, help='Tamanho máx. dos rótulos do eixo X (abrevia com …)')
-    ap.add_argument('--label-fontsize', type=int, default=8, help='Fonte dos rótulos do eixo X (px)')
+    ap.add_argument('--label-maxlen', type=int, default=18,
+                    help='Comprimento máximo dos rótulos do eixo X (abrevia com …)')
+    ap.add_argument('--label-fontsize', type=int, default=8,
+                    help='Tamanho da fonte dos rótulos do eixo X (px)')
 
     # outputs
-    ap.add_argument('--chart', action='store_true', help='Exibe gráfico ASCII no terminal (plotext)')
-    ap.add_argument('--export-md', action='store_true', help='(Opcional) Exporta tabela em Markdown')
-    ap.add_argument('--export-org', action='store_true', help='Exporta tabela (e imagem, se existir) em Org-mode')
-    ap.add_argument('--export-png', action='store_true', help='Exporta gráfico em PNG')
-    ap.add_argument('--export-comment', action='store_true', help='Exporta comentário para GPT')
-    ap.add_argument('--add-comments', action='store_true', help='Gera comentário automaticamente (modo PDF)')
+    ap.add_argument('--chart', action='store_true',
+                    help='Exibe gráfico ASCII no terminal (plotext)')
+    ap.add_argument('--export-md', action='store_true',
+                    help='(Opcional) Exporta tabela em Markdown')
+    ap.add_argument('--export-org', action='store_true',
+                    help='Exporta tabela (e imagem, se existir) em Org-mode')
+    ap.add_argument('--export-png', action='store_true',
+                    help='Exporta gráfico em PNG')
+    ap.add_argument('--export-comment', action='store_true',
+                    help='Exporta comentário em .md (legado)')
+    ap.add_argument('--export-comment-org', action='store_true',
+                    help='Insere o comentário diretamente no .org gerado')
+
+    # chamar API de comentários (usa OPENAI_API_KEY se disponível)
+    ap.add_argument('--call-api', action='store_true',
+                    help='Usa a API (se disponível) para gerar o comentário')
+
     return ap.parse_args()
 
 def main() -> None:
     args = parse_args()
+    # liga API automaticamente se existir OPENAI_API_KEY no ambiente
+    call_api = bool(args.call_api or os.getenv("OPENAI_API_KEY"))
 
     # monta DF base (sem filtros)
     if args.top10:
@@ -776,16 +929,25 @@ def main() -> None:
         'topn': args.topn
     }
 
-    # Exports (se for gerar org e png, gere PNG primeiro para o link existir no .org)
+    # Exports
     png_path = None
-    if args.export_png:
+    if args.export_png or args.export_org or args.export_comment_org:
+        # garanta PNG para figlink no .org quando necessário
         png_path = exportar_png(df, meta, label_maxlen=args.label_maxlen, label_fontsize=args.label_fontsize)
-    if args.export_org:
-        exportar_org(df, meta, cuts_info, png_path)
+
     if args.export_md:
         exportar_md(df, meta, cuts_info)
-    if args.export_comment or args.add_comments:
-        exportar_comment(df, meta)
+
+    # Comentário (string) — usado tanto no .md legado quanto no .org novo
+    comment_for_org = None
+    if args.export_comment:
+        exportar_comment(df, meta, cuts_info, call_api=call_api)
+    if args.export_comment_org:
+        comment_for_org = gerar_comentario(df, meta, cuts_info, call_api=call_api)
+
+    if args.export_org or args.export_comment_org:
+        exportar_org(df, meta, cuts_info, png_path, comment_text=comment_for_org)
+
     if args.chart:
         exibir_chart_ascii(df, meta, label_maxlen=args.label_maxlen)
 
