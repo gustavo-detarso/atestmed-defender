@@ -13,20 +13,24 @@ NOVIDADES DESTE ARQUIVO:
 - --psa N                   → sensibilidade probabilística (α ~ Beta, p_BR ~ Beta) + histograma e ICs de w
 - --all-tests               → executa tudo acima (permute=5000, psa=10000, cmh=cr)
 
+NOVIDADES (INTEGRAÇÕES/SEÇÕES):
+- Comentário para CADA teste com utils.comentarios (quando disponível)
+- --per-top10-sections      → subseções por perito do TopN com impacto e estatísticas (comentadas)
+- --top10-aggregate         → bloco agregado do TopN (IV_top, peso_top, ΔTMEA_top) + comentário
+- --explain-methods         → seção opcional de metodologia (fórmulas e definições)
+
 Mantém: --bootstrap-peso, --bootstrap-recalc-sstar, --sens-plot, --sens-alpha-frac, --sens-pbr-pp,
 --by (sumários estratificados), --final-org (header + front + org gerado) etc.
 
 Arredondamentos (ceil): E_i, IV_i, IV_sel, IV_período e ΔTMEA.
 """
 
-import os, sys, re, json, math, sqlite3, argparse, subprocess
+import os, sys, re, json, math, sqlite3, argparse, subprocess, shutil
 from typing import Dict, Any, Tuple, Optional, List
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
 import pandas as pd
-
-import shutil
 from datetime import datetime
 
 import matplotlib
@@ -43,12 +47,26 @@ DB_PATH    = os.path.join(BASE_DIR, 'db', 'atestmed.db')
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
+# ──────────────────────────────────────────────────────────────────────
 # Integração GPT (comentários)
+# ──────────────────────────────────────────────────────────────────────
 _COMENT_FUNC = None
+_COMENT_BIN = _COMENT_BB = _COMENT_PERM = _COMENT_CMH = _COMENT_PSA = None
+_COMENT_TOPN = _COMENT_PERITO = None
 try:
-    from utils.comentarios import comentar_impacto_fila as _COMENT_FUNC  # type: ignore
+    from utils.comentarios import (
+        comentar_impacto_fila as _COMENT_FUNC,              # visão geral
+        comentar_teste_binomial as _COMENT_BIN,             # teste binomial
+        comentar_teste_betabin as _COMENT_BB,               # teste beta-binomial
+        comentar_teste_permutacao as _COMENT_PERM,          # permutação do peso
+        comentar_teste_cmh as _COMENT_CMH,                  # CMH
+        comentar_psa as _COMENT_PSA,                        # PSA
+        comentar_topn_aggregate as _COMENT_TOPN,            # agregado TopN
+        comentar_perito_top as _COMENT_PERITO,              # comentário por perito
+    )
 except Exception:
-    _COMENT_FUNC = None
+    # fallback seguro se o módulo não estiver disponível
+    pass
 
 # ──────────────────────────────────────────────────────────────────────
 # Pequenas utilidades estatísticas (sem SciPy/Statsmodels)
@@ -129,48 +147,47 @@ def _mh_cmh_test(strata_tables: List[Tuple[int,int,int,int]]) -> Tuple[float,flo
       a=NC_sel, b=Conf_sel, c=NC_nsel, d=Conf_nsel
     Retorna (OR_MH, X2_MH, p_value).
     """
-    from math import isnan
+    from math import erf
     eps = 1e-9
     sum_num = 0.0
     sum_den = 0.0
     sum_E = 0.0
     sum_V = 0.0
+    A_sum = 0.0
     for (a,b,c,d) in strata_tables:
         a=float(a); b=float(b); c=float(c); d=float(d)
         n = a+b+c+d
         if n <= 0:
             continue
-        # OR_MH componentes
         sum_num += (a*d)/max(n, eps)
         sum_den += (b*c)/max(n, eps)
-        # E[a_k] e Var[a_k] para X2_MH
         row1 = a + b; row2 = c + d
         col1 = a + c; col2 = b + d
         Ek = (row1 * col1) / max(n, eps)
         Vk = (row1 * row2 * col1 * col2) / max(n*n*(n-1), eps)
         sum_E += Ek
         sum_V += Vk
+        A_sum += a
     OR_MH = (sum_num / max(sum_den, 1e-12)) if sum_den > 0 else float('inf')
-    X2_MH = 0.0 if sum_V <= 0 else ( (abs(sum([t[0] for t in strata_tables]) - sum_E))**2 / sum_V )
-    # Nota: fórmula acima usa Σa_k no numerador.
-    Ak_total = float(sum([t[0] for t in strata_tables]))
-    if sum_V > 0:
-        X2_MH = ((Ak_total - sum_E)**2) / sum_V
-    else:
-        X2_MH = 0.0
-    # p-valor ~ χ²(1)
+    X2_MH = ((A_sum - sum_E)**2) / sum_V if sum_V > 0 else 0.0
     try:
-        # CDF qui-quadrado(1): p = 1 - F(X2)
-        # F(x;1) = erf(sqrt(x/2))
-        from math import erf, sqrt
         pval = float(1.0 - (erf(math.sqrt(X2_MH/2.0))))
     except Exception:
-        # fallback grosseiro
         pval = float(np.exp(-0.5*X2_MH))
     return (OR_MH, X2_MH, max(min(pval,1.0),0.0))
 
+_PT_MONTHS = {
+    1:"janeiro", 2:"fevereiro", 3:"março", 4:"abril", 5:"maio", 6:"junho",
+    7:"julho", 8:"agosto", 9:"setembro", 10:"outubro", 11:"novembro", 12:"dezembro"
+}
+def _date_pt_br(dt: datetime) -> str:
+    try:
+        return f"{dt.day:02d} de {_PT_MONTHS.get(dt.month, dt.month)} de {dt.year}"
+    except Exception:
+        return dt.strftime("%Y-%m-%d")
+
 # ──────────────────────────────────────────────────────────────────────
-# OpenAI helpers (comentários auto)
+# OpenAI helpers (para comentários fallback internos)
 # ──────────────────────────────────────────────────────────────────────
 
 def _load_openai_key_from_dotenv(env_path: str) -> Optional[str]:
@@ -236,8 +253,22 @@ def _protect_comment_text(text: str, word_cap: int = 220) -> str:
         out=" ".join(words[:word_cap]).rstrip()+"…"
     return out
 
+def _fmt2(x):
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return "—"
+
+def _fmtp2(x):
+    """Duas casas decimais; usa notação científica se < 0,01."""
+    try:
+        v = float(x)
+        return f"{v:.2f}" if v >= 0.01 else f"{v:.2e}"
+    except Exception:
+        return "—"
+        
 # ──────────────────────────────────────────────────────────────────────
-# Schema helpers (iguais ao anterior)
+# Schema helpers
 # ──────────────────────────────────────────────────────────────────────
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -285,7 +316,7 @@ def _cond_nc_total(has_conf: bool, motivo_col: Optional[str]) -> str:
     return " 0 "
 
 # ──────────────────────────────────────────────────────────────────────
-# Queries e cálculos principais (iguais + pequenas adições)
+# Queries e cálculos principais
 # ──────────────────────────────────────────────────────────────────────
 
 def _fetch_perito_n_nc(conn: sqlite3.Connection, start: str, end: str, schema: Dict[str, Any]) -> pd.DataFrame:
@@ -377,7 +408,61 @@ def _recompute_with_params(df_all_base: pd.DataFrame, alpha: float, p_br: float,
     return m, df_sel
 
 # ──────────────────────────────────────────────────────────────────────
-# Exports comuns (PNG/ORG/MD) — preserva sua versão, com espaço para testes
+# Blocos auxiliares (TopN agregado e Metodologia)
+# ──────────────────────────────────────────────────────────────────────
+
+def _topn_subset(df_sel: pd.DataFrame, topn: int) -> pd.DataFrame:
+    if df_sel.empty: return df_sel.copy()
+    return df_sel.sort_values("IV_vagas", ascending=False).head(int(topn)).copy()
+
+def _calc_topn_aggregate(df_sel: pd.DataFrame, iv_total_period: int, topn: int,
+                         tmea_br: Optional[float]=None, cap_br: Optional[float]=None, att_br: Optional[int]=None) -> Dict[str, Any]:
+    top = _topn_subset(df_sel, topn)
+    iv_top = int(top["IV_vagas"].sum()) if not top.empty else 0
+    peso_top = (iv_top / iv_total_period) if iv_total_period > 0 else 0.0
+    delta_top = _calc_delta_tmea(iv_top, tmea_br=tmea_br, cap_br=cap_br, att_br=att_br)
+    return {"iv_top": iv_top, "peso_top": float(peso_top), "delta_tmea_top": None if delta_top is None else int(delta_top), "n_top": int(top.shape[0])}
+
+def _metodologia_block() -> str:
+    return r"""
+* Metodologia
+** Excesso por perito
+E_i = max(0, NC_i − N_i · p_BR).
+
+** Impacto (vagas)
+IV_i = ceil(α · E_i).
+IV_período = ceil(α · Σ_i NC_i).
+Peso (w) = IV_sel / IV_período.
+
+** Projeção de tempo (ΔTMEA)
+Aproximações usadas:
+1) ΔTMEA ≈ ceil( IV / capacidade_diária )  (quando cap_br informado)
+2) ΔTMEA ≈ ceil( TMEA_base · IV / atendimento_diário )  (quando att_br e TMEA_base informados)
+
+** IC de Wilson (p̂)
+Para k sucessos em n, z=1,96.
+center = (p̂ + z²/(2n)) / (1 + z²/n)
+half = z * sqrt((p̂(1−p̂) + z²/(4n))/n) / (1 + z²/n)
+IC95% = [center − half, center + half].
+
+** Beta-binomial e ρ (overdispersão)
+Var[Y] = n p (1−p) (1 + (n−1) ρ); ρ por momentos.
+p ~ Beta(a,b) com média p_BR e ρ ≈ 1/(a+b+1).
+Teste: P(Y ≥ k | BetaBin(n,a,b)) unilateral.
+
+** Permutação do peso (w)
+Mantém o tamanho do grupo selecionado e (opcionalmente) a distribuição por estrato.
+
+** CMH (2×2×K)
+Estratos K (ex.: CR/DR/UO), linha = Selecionado/Não, coluna = NC/Conforme.
+Relata OR_MH, X²_MH e p.
+
+** PSA (sensibilidade probabilística)
+Amostra α ~ Beta(αK,(1−α)K) e p_BR ~ Beta(nc+1, total−nc+1); recalcula w em R réplicas.
+"""
+
+# ──────────────────────────────────────────────────────────────────────
+# Exports comuns (PNG/ORG/MD)
 # ──────────────────────────────────────────────────────────────────────
 
 def exportar_png_top(df_sel: pd.DataFrame, meta: Dict[str, Any], label_maxlen: int=18, label_fontsize: int=8) -> Optional[str]:
@@ -390,7 +475,7 @@ def exportar_png_top(df_sel: pd.DataFrame, meta: Dict[str, Any], label_maxlen: i
     fig,ax=plt.subplots(figsize=(max(7.8,len(labels)*0.60),5.2), dpi=300)
     ax.bar(labels, vals, edgecolor='black')
     ax.set_ylabel("Vagas presenciais (IV)")
-    ax.set_title(f"Impacto na Fila — Top {topn} Peritos | {meta['start']} a {meta['end']}")
+    ax.set_title(f"Impacto na Fila — Top {topn} Peritos (impacto negativo) | {meta['start']} a {meta['end']}")
     ax.grid(axis='y', linestyle='--', alpha=0.5)
     for i,v in enumerate(vals):
         ax.text(i, v + (max(vals)*0.01 if max(vals) else 0.1), f"{int(v)}", ha='center', va='bottom', fontsize=max(7,label_fontsize-1))
@@ -424,7 +509,7 @@ def plot_curva_cotovelo(df: pd.DataFrame, s_star: Optional[float], start: str, e
         ax.axvline(s_star, linestyle="--")
         ax.text(s_star, y.max()*0.05 if y.max()>0 else 0.05, f"S*={s_star:.2f}", rotation=90, va="bottom", ha="right", fontsize=9)
     ax.set_xlabel("Score Final (corte)"); ax.set_ylabel("Impacto acumulado (vagas)")
-    ax.set_title(f"Curva de Impacto x Score — {start} a {end}")
+    ax.set_title(f"Curva de Impacto negativo x Score — {start} a {end}")
     ax.grid(True, axis="both", linestyle="--", alpha=0.4)
     parts=[]
     if iv_selected is not None: parts.append(f"IV sel: {int(iv_selected)}")
@@ -445,8 +530,8 @@ def exportar_png_tornado(meta: Dict[str, Any], delta: Dict[str, float], alpha_fr
     labels=[f"α -{alpha_frac*100:.0f}%", f"α +{alpha_frac*100:.0f}%",
             f"p_BR -{pbr_pp*100:.0f} p.p.", f"p_BR +{pbr_pp*100:.0f} p.p."]
     base=meta["peso_sel"]*100.0
-    vals=[ (delta["alpha_minus"]-base), (delta["alpha_plus"]-base),
-           (delta["pbr_minus"]-base), (delta["pbr_plus"]-base) ]
+    vals=[ (delta.get("alpha_minus",base)-base), (delta.get("alpha_plus",base)-base),
+           (delta.get("pbr_minus",base)-base), (delta.get("pbr_plus",base)-base) ]
     y=np.arange(len(labels))
     fig,ax=plt.subplots(figsize=(7.2,4.8), dpi=300)
     ax.barh(y, vals, edgecolor='black'); ax.set_yticks(y); ax.set_yticklabels(labels)
@@ -468,18 +553,18 @@ def exportar_png_strat(df_strat_tot: pd.DataFrame, df_strat_sel: pd.DataFrame, b
     ax.bar(x - width/2, iv_tot, width, label="IV_total", edgecolor="black")
     ax.bar(x + width/2, iv_sel, width, label="IV_sel", edgecolor="black")
     ax.set_xticks(x); ax.set_xticklabels(labels, rotation=45, ha="right")
-    ax.set_ylabel("Vagas (IV)"); ax.set_title(f"Impacto por {by.upper()} — {meta['start']} a {meta['end']}")
+    ax.set_ylabel("Vagas (IV)"); ax.set_title(f"Impacto negativo por {by.upper()} — {meta['start']} a {meta['end']}")
     ax.legend(); ax.grid(axis="y", linestyle="--", alpha=0.5)
     for i,(a,b) in enumerate(zip(iv_tot,iv_sel)):
         ax.text(i - width/2, a + max(iv_tot+iv_sel+[1])*0.01, str(int(a)), ha="center", va="bottom", fontsize=8)
         ax.text(i + width/2, b + max(iv_tot+iv_sel+[1])*0.01, str(int(b)), ha="center", va="bottom", fontsize=8)
     plt.tight_layout()
     path=os.path.join(EXPORT_DIR, f"impacto_estratos_{by}_{meta['start']}_a_{meta['end']}.png")
-    fig.savefig(path, bbox_inches="tight"); plt.close(fig); plt.close("all")
+    fig.savefig(path, bbox_inches='tight'); plt.close(fig); plt.close("all")
     return path
 
 # ──────────────────────────────────────────────────────────────────────
-# Comentários automáticos (por gráfico) e conclusão
+# Comentários automáticos (fallback interno)
 # ──────────────────────────────────────────────────────────────────────
 
 def _comment_from_gpt_or_fallback(title: str, data: dict, fallback: str,
@@ -488,12 +573,18 @@ def _comment_from_gpt_or_fallback(title: str, data: dict, fallback: str,
     prompt = (
         f"Escreva um único parágrafo em português (≤ {max_words} palavras), claro e objetivo, "
         f"explicando o gráfico '{title}'. Diga o que o gráfico mostra, destaque 2–3 pontos e conclua com 1 frase interpretativa. "
-        f"Evite jargão e causalidade. Dados JSON:\n{json.dumps(data, ensure_ascii=False)}"
+        f"Evite jargão e causalidade. Interprete 'selecionados' como **perfis de alto risco** e trate o impacto como **negativo** para a fila. "
+        f"Dados JSON:\n{json.dumps(data, ensure_ascii=False)}"
     )
     try:
         txt = _call_openai_chat(
-            [{"role":"system","content":"Você é um analista do ATESTMED, conciso e técnico."},
-             {"role":"user","content":prompt}],
+            [
+                {
+                    "role":"system",
+                    "content":"Você é um analista do ATESTMED, conciso e técnico. IMPORTANTÍSSIMO: trate métricas elevadas de produtividade ≥ limiar, tarefas ≤15s e sobreposição como indicadores de risco; e considere que 'selecionados' = perfis de maior probabilidade de não conformidade (impacto negativo)."
+                },
+                {"role":"user","content":prompt}
+            ],
             model=model, temperature=temperature
         )
         if txt:
@@ -518,10 +609,11 @@ def _comment_fig_top(df_sel: pd.DataFrame, meta: Dict[str,Any],
             for _, r in top.iterrows()
         ]
     }
-    fb = (f"Os barras ranqueiam peritos por impacto (IV). O grupo somou {int(meta['iv_total_sel'])} vagas, "
-          f"equivalentes a {meta['peso_sel']*100:.1f}% do IV do período. Os maiores contributos concentram-se no topo; "
-          f"o restante da cauda tem ganho marginal bem menor. A leitura sustenta o foco corretivo nos nomes à esquerda.")
-    return _comment_from_gpt_or_fallback("Top peritos por impacto (vagas)", payload, fb, model, max_words, temperature)
+    fb = (f"As barras ranqueiam peritos pelo **impacto negativo (IV)** na fila. O grupo **selecionado** somou "
+          f"{int(meta['iv_total_sel'])} vagas (~{meta['peso_sel']*100:.1f}% do IV do período), concentrando o **risco de não conformidade**. "
+          f"Os nomes à esquerda respondem pela maior parcela do aumento da fila; a cauda agrega volumes menores. "
+          f"Recomenda-se priorizar **auditoria e ações corretivas** nesses perfis.")
+    return _comment_from_gpt_or_fallback("Top peritos por impacto negativo (vagas)", payload, fb, model, max_words, temperature)
 
 def _comment_fig_cotovelo(df_all: pd.DataFrame, meta: Dict[str,Any], s_star: Optional[float],
                           iv_selected: int, iv_periodo: int,
@@ -531,10 +623,10 @@ def _comment_fig_cotovelo(df_all: pd.DataFrame, meta: Dict[str,Any], s_star: Opt
         "s_star": s_star, "iv_sel": int(iv_selected), "iv_periodo": int(iv_periodo),
         "peso_sel_pct": round((iv_selected/max(1,iv_periodo))*100, 2)
     }
-    fb = (f"A curva mostra o impacto acumulado ao afrouxar o corte de score. O joelho em S*={s_star:.2f} "
-          f"captura {iv_selected} de {iv_periodo} vagas (~{(iv_selected/max(1,iv_periodo))*100:.1f}%). "
-          f"Abaixo desse ponto, o ganho marginal por reduzir o corte diminui rapidamente, indicando bom equilíbrio entre foco e cobertura.")
-    return _comment_from_gpt_or_fallback("Curva de impacto x score (S*)", payload, fb, model, max_words, temperature)
+    fb = (f"A curva mostra como o **impacto negativo** se acumula ao afrouxar o corte de score. O joelho em S*={s_star:.2f} "
+          f"captura {iv_selected} de {iv_periodo} vagas (~{(iv_selected/max(1,iv_periodo))*100:.1f}%), concentrando os perfis de **maior risco**. "
+          f"Reduzir o corte após esse ponto **dilui o foco** e passa a incluir casos de menor prioridade para fiscalização.")
+    return _comment_from_gpt_or_fallback("Curva de impacto negativo x score (S*)", payload, fb, model, max_words, temperature)
 
 def _comment_fig_tornado(meta: Dict[str,Any], sens_delta: Dict[str,float],
                          model="gpt-4o-mini", max_words=120, temperature=0.2) -> str:
@@ -542,33 +634,17 @@ def _comment_fig_tornado(meta: Dict[str,Any], sens_delta: Dict[str,float],
     payload = {"periodo":[meta["start"],meta["end"]], "peso_base_pct": round(base,2),
                "alpha_minus": sens_delta.get("alpha_minus"), "alpha_plus": sens_delta.get("alpha_plus"),
                "pbr_minus": sens_delta.get("pbr_minus"), "pbr_plus": sens_delta.get("pbr_plus")}
-    fb = (f"O tornado avalia a sensibilidade do peso em torno da base ({base:.1f}%). "
-          f"Variações plausíveis em α e p_BR deslocam o peso por poucos pontos percentuais, "
-          f"sugerindo robustez da ordem de grandeza observada.")
+    fb = (f"O tornado avalia a sensibilidade do **peso** (participação dos selecionados no **impacto negativo**) em torno da base ({base:.1f}%). "
+          f"Variações plausíveis em α e p_BR alteram o resultado por poucos pontos percentuais, "
+          f"sugerindo **robustez** da ordem de grandeza estimada do risco.")
     return _comment_from_gpt_or_fallback("Tornado de sensibilidade do peso", payload, fb, model, max_words, temperature)
-
-def _comment_fig_strat(by: str, df_strat_tot: pd.DataFrame, df_strat_sel: pd.DataFrame,
-                       model="gpt-4o-mini", max_words=120, temperature=0.2) -> str:
-    m = df_strat_tot.merge(df_strat_sel, on=f"{by}_val", how="left").fillna(0)
-    m["share_sel"] = m["IV_sel"]/m["IV_tot"].replace(0,np.nan)
-    dom = m.sort_values("IV_tot", ascending=False).head(3)
-    payload = {
-        "by": by, "estratos": [
-            {"estrato": str(r[f"{by}_val"]), "iv_tot": int(r["IV_tot"]), "iv_sel": int(r["IV_sel"]),
-             "share_sel": None if pd.isna(r["share_sel"]) else round(float(r["share_sel"]*100),2)}
-            for _, r in dom.iterrows()
-        ]
-    }
-    fb = ("O sumário estratificado indica onde o impacto total (IV_total) se concentra e quanto do esforço "
-          "(IV_sel) está focado nesses estratos. Os primeiros grupos respondem pela maior parcela do volume, "
-          "reforçando a prioridade tática de atuação segmentada.")
-    return _comment_from_gpt_or_fallback(f"Impacto por {by.upper()}", payload, fb, model, max_words, temperature)
 
 def _comment_fig_permutation(pval: Optional[float], R: int,
                              model="gpt-4o-mini", max_words=120, temperature=0.2) -> str:
     payload = {"R": R, "p_perm": None if pval is None else float(pval)}
     fb = (f"O teste de permutação compara o peso observado a grupos aleatórios de mesmo tamanho. "
-          f"Um p-valor baixo indica que o agrupamento por score gerou peso incomum sob o acaso, apoiando a seleção.")
+          f"**P-valor baixo** indica que o agrupamento pelo score concentra **risco acima do acaso**, "
+          f"corroborando o foco nos perfis selecionados.")
     return _comment_from_gpt_or_fallback("Permutação do peso (w)", payload, fb, model, max_words, temperature)
 
 def _comment_fig_psa(ci: Optional[Tuple[float,float,float]], R: int,
@@ -576,7 +652,7 @@ def _comment_fig_psa(ci: Optional[Tuple[float,float,float]], R: int,
     med, lo, hi = (None, None, None) if (not ci or any(v is None for v in ci)) else (ci[0]*100, ci[1]*100, ci[2]*100)
     payload = {"R": R, "median_pct": med, "ci95_pct": [lo, hi] if lo is not None else None}
     fb = ("A análise de sensibilidade probabilística propaga incertezas de α e p_BR. "
-          "A mediana e o intervalo de 95% do peso mostram a faixa provável do efeito, "
+          "A mediana e o IC95% do **peso (risco)** mostram a faixa provável da participação dos selecionados, "
           "indicando estabilidade do resultado central.")
     return _comment_from_gpt_or_fallback("PSA do peso (w)", payload, fb, model, max_words, temperature)
 
@@ -596,18 +672,17 @@ def _conclusao_text(meta: Dict[str,Any], tests: Dict[str,Any],
         "psa_ci": tests.get("psa_ci"),
     }
     fb = (
-        f"No período, estimamos {int(meta['iv_total_period'])} vagas adicionadas à fila (α={meta['alpha']}). "
-        f"O grupo selecionado respondeu por {meta['peso_sel']*100:.1f}% do total, "
-        f"com acréscimo projetado de {meta.get('delta_tmea_period','n/d')} dia(s) no TMEA "
+        f"No período, estimamos {int(meta['iv_total_period'])} **vagas adicionadas à fila** (α={meta['alpha']}). "
+        f"O **grupo selecionado** reúne {meta['peso_sel']*100:.1f}% desse impacto e representa os **perfis de maior probabilidade de não conformidade**. "
+        f"A projeção sugere acréscimo de {meta.get('delta_tmea_period','n/d')} dia(s) no TMEA "
         f"(dos quais {meta.get('delta_tmea_sel','n/d')} atribuíveis ao grupo). "
-        f"Testes estatísticos sustentam o achado (binomial/beta-binomial com múltiplas sinalizações; "
-        f"permutação e CMH indicam efeito acima do acaso). Recomenda-se priorização dos perfis líderes e monitoramento contínuo."
+        f"Os testes (binomial/beta-binomial, permutação e CMH) indicam concentração de risco **acima do acaso**. "
+        f"**Recomenda-se auditoria direcionada, supervisão clínica, reforço de padrões e monitoramento contínuo** priorizando esses perfis."
     )
     return _comment_from_gpt_or_fallback("Conclusão do Impacto na Fila", resumo, fb, model, max_words, temperature)
 
-
 # ──────────────────────────────────────────────────────────────────────
-# Export ORG/MD (agora com seção de TESTES)
+# Export ORG/MD (agora com seção de TESTES e blocos novos)
 # ──────────────────────────────────────────────────────────────────────
 
 def exportar_md(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any]) -> str:
@@ -622,7 +697,8 @@ def exportar_md(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any]
                 f"**α:** {meta['alpha']}  **p_BR:** {meta['p_br']*100:.2f}%  **Score-cut:** {meta['score_cut'] if meta['score_cut'] is not None else 'auto/nd'}  \n"
                 f"**IV sel (vagas):** {int(meta['iv_total_sel'])}  {delta_sel}\n"
                 f"**IV período (vagas):** {int(meta['iv_total_period'])}  **peso sel:** {meta['peso_sel']*100:.2f}%{boot_str}  {delta_per}\n\n"
-                f"**Peritos selecionados:** {meta['n_sel']}/{meta['n_all']}  **Cortes:** {cuts}\n\n")
+                f"**Peritos selecionados:** {meta['n_sel']}/{meta['n_all']}  **Cortes:** {cuts}\n\n"
+                f"**Interpretação:** os selecionados representam **perfis de alto risco** (maior probabilidade de não conformidade e maior contribuição ao IV).\n\n")
         tbl=["| Perito | CR | DR | UO | N | NC | Excesso | IV (vagas) | Score |",
              "|--------|----|----|----|---:|---:|--------:|-----------:|------:|"]
         for _,r in df_sel.sort_values("IV_vagas",ascending=False).head(meta.get("topn",10)).iterrows():
@@ -638,7 +714,13 @@ def exportar_org(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any
                  png_strat: Optional[str] = None,
                  tests: Optional[Dict[str, Any]] = None,
                  png_cotovelo: Optional[str] = None,
-                 model: str = "gpt-4o-mini", max_words: int = 120, temperature: float = 0.2
+                 topn_agg: Optional[Dict[str, Any]] = None,
+                 per_top10_sections: bool = False,
+                 explain_methods: bool = False,
+                 model: str = "gpt-4o-mini", max_words: int = 120, temperature: float = 0.2,
+                 table_font: str = "\\scriptsize",
+                 firstcol_width: str = "4.2cm",
+                 estrato_width: str = "3.6cm"
                  ) -> str:
     fname = f"impacto_fila_{meta['start']}_a_{meta['end']}.org"
     path = os.path.join(EXPORT_DIR, fname)
@@ -659,20 +741,32 @@ def exportar_org(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any
     cuts_str = ", ".join([f"{k}={v}" for k, v in cuts.items() if v is not None]) or "nenhum"
     L.append(f":CUTS: {cuts_str}"); L.append(f":SELECIONADOS: {meta['n_sel']}/{meta['n_all']}"); L.append(":END:\n")
 
-    # Resumo executivo
+    # Resumo
     resumo = (f"No período analisado, o impacto total estimado na fila foi de *{int(meta['iv_total_period'])}* vagas "
               f"(α={meta['alpha']}). O grupo selecionado respondeu por *{int(meta['iv_total_sel'])}* vagas "
               f"(*{meta['peso_sel']*100:.1f}%* do total"
-              + (f", IC95% {meta['peso_ci'][0]*100:.1f}%–{meta['peso_ci'][1]*100:.1f}%" if meta.get('peso_ci') else "") + "). ")
-    if meta.get('delta_tmea_period') is not None:
-        resumo += f"A projeção indica acréscimo de *{int(meta['delta_tmea_period'])}* dia(s) (base {meta.get('tmea_br',0):.0f}d)"
-        if meta.get('delta_tmea_sel') is not None:
-            resumo += f", dos quais *{int(meta['delta_tmea_sel'])}* dia(s) atribuíveis ao grupo selecionado"
-        resumo += "."
+              + (f", IC95% {meta['peso_ci'][0]*100:.1f}%–{meta['peso_ci'][1]*100:.1f}%" if meta.get('peso_ci') else "") + "). "
+              f"Os *selecionados* representam *perfis de alto risco* (impacto negativo concentrado).")
     L.append("** Resumo"); L.append(resumo + "\n")
 
-    # Tabela Top
-    L.append("** Peritos selecionados (Top por impacto)")
+    # TopN (agregado)
+    if topn_agg is not None:
+        L.append("** TopN (agregado)")
+        L.append(f"IV_top{meta['topn']}: *{int(topn_agg['iv_top'])}*  |  peso_top{meta['topn']}: *{topn_agg['peso_top']*100:.2f}%*  "
+                 + (f"|  ΔTMEA_top≈ *{int(topn_agg['delta_tmea_top'])}* d" if topn_agg['delta_tmea_top'] is not None else ""))
+        L.append("")
+        if _COMENT_TOPN is not None:
+            try:
+                top_df = df_sel.sort_values("IV_vagas", ascending=False).head(meta.get("topn", 10))
+                L.append(_COMENT_TOPN(top_df, int(meta['iv_total_period']), int(meta['topn']), meta,
+                                      model=model, temperature=temperature, max_words=max_words))
+                L.append("")
+            except Exception:
+                pass
+
+    # Tabela Top — com fonte menor e coluna 1 como p{...} para quebrar linha
+    L.append("** Peritos selecionados (alto risco por impacto)")
+    L.append(f"#+ATTR_LATEX: :font {table_font} :align p{{{firstcol_width}}} l l l r r r r r")
     L.append("| Perito | CR | DR | UO | N | NC | Excesso | IV (vagas) | Score |"); L.append("|-")
     if df_sel.empty:
         L.append("| — | — | — | — | — | — | — | — | — |")
@@ -684,18 +778,17 @@ def exportar_org(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any
                 E=int(r["E"]), IV=int(r["IV_vagas"]), S=float(r.get('score_final') or 0.0)
             ))
 
-    # Gráfico: Top peritos
+    # Gráfico Top
     if png_top and os.path.exists(png_top):
-        L.append("\n#+CAPTION: Top peritos por impacto (vagas); banner com IV sel, IV período, peso e ΔTMEA.")
+        L.append("\n#+CAPTION: Top peritos por impacto negativo (vagas); banner com IV sel, IV período, peso e ΔTMEA.")
         L.append(f"[[file:{os.path.basename(png_top)}]]")
-        # Comentário logo abaixo
         L.append("")
         L.append(_comment_fig_top(df_sel, meta, model=model, max_words=max_words, temperature=temperature))
         L.append("")
 
-    # Gráfico: Curva cotovelo
+    # Curva cotovelo
     if png_cotovelo and os.path.exists(png_cotovelo):
-        L.append("\n#+CAPTION: Curva de impacto acumulado x corte de score (S*).")
+        L.append("\n#+CAPTION: Curva de impacto negativo acumulado x corte de score (S*).")
         L.append(f"[[file:{os.path.basename(png_cotovelo)}]]")
         L.append("")
         L.append(_comment_fig_cotovelo(df_sel if 'score_final' in df_sel.columns else pd.DataFrame(),
@@ -703,19 +796,18 @@ def exportar_org(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any
                                        model=model, max_words=max_words, temperature=temperature))
         L.append("")
 
-    # Gráfico: Tornado
+    # Tornado
     if png_tornado and os.path.exists(png_tornado):
         L.append("\n#+CAPTION: Tornado de sensibilidade do peso (α± e p_BR±).")
         L.append(f"[[file:{os.path.basename(png_tornado)}]]")
         L.append("")
-        # Recupera deltas para comentar, se existirem
-        # (não guardamos os deltas; o comentário usará uma mensagem genérica robusta)
         L.append(_comment_fig_tornado(meta, sens_delta={}, model=model, max_words=max_words, temperature=temperature))
         L.append("")
 
     # Estratos
     if by and (df_strat_tot is not None) and (df_strat_sel is not None):
         L.append(f"\n** Sumário estratificado por {by.upper()}")
+        L.append(f"#+ATTR_LATEX: :font {table_font} :align p{{{estrato_width}}} r r r r r")
         L.append("| Estrato | N_total | NC_total | E_total | IV_total | IV_sel |"); L.append("|-")
         idx = f"{by}_val"
         merged = df_strat_tot.merge(df_strat_sel, on=idx, how="left", suffixes=("_tot", "_sel")).fillna(0)
@@ -725,10 +817,45 @@ def exportar_org(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any
                 E=int(r["E_tot"]), IV=int(r["IV_tot"]), IVs=int(r["IV_sel"])
             ))
         if png_strat and os.path.exists(png_strat):
-            L.append("\n#+CAPTION: Impacto por estrato (IV_total e IV_sel).")
+            L.append("\n#+CAPTION: Impacto negativo por estrato (IV_total e IV_sel).")
             L.append(f"[[file:{os.path.basename(png_strat)}]]")
             L.append("")
             L.append(_comment_fig_strat(by, df_strat_tot, df_strat_sel, model=model, max_words=max_words, temperature=temperature))
+            L.append("")
+
+    # Seções por perito do TopN
+    if per_top10_sections and not df_sel.empty:
+        L.append("** TopN — impacto individual (cada perito)")
+        df_bin = tests.get("binomial_df"); df_bb  = tests.get("betabin_df")
+        top = df_sel.sort_values('IV_vagas', ascending=False).head(meta.get('topn', 10))
+        for _, r in top.iterrows():
+            nome = r['nomePerito']
+            N=int(r['N']); NC=int(r['NC']); E=int(r['E']); IVi=int(r['IV_vagas'])
+            p_hat = (NC / max(1, N)); wl, wh = _wilson_ci(NC, N)
+            p_b = q_b = p_bb = q_bb = None
+            if isinstance(df_bin, pd.DataFrame) and not df_bin.empty:
+                row = df_bin.loc[df_bin['nomePerito']==nome]
+                if not row.empty: p_b=float(row.iloc[0]['p']); q_b=float(row.iloc[0]['q'])
+            if isinstance(df_bb, pd.DataFrame) and not df_bb.empty:
+                row = df_bb.loc[df_bb['nomePerito']==nome]
+                if not row.empty: p_bb=float(row.iloc[0]['p_bb']); q_bb=float(row.iloc[0]['q_bb'])
+            L.append(f"*** {nome}")
+            L.append(f"- N={N}, NC={NC}, p̂={p_hat:.3f}, IC95%=[{wl:.3f};{wh:.3f}]")
+            L.append(f"- E_i=max(0, NC−N·p_BR)={E}  |  IV_i=ceil(α·E_i)={IVi}")
+            L.append(f"- score={float(r.get('score_final') or 0.0):.2f}  |  CR={r.get('cr','—')}  DR={r.get('dr','—')}  UO={r.get('uo','—')}")
+            if p_b is not None:  L.append(f"- Binomial: p={p_b:.3g}  q={q_b:.3g}")
+            if p_bb is not None: L.append(f"- Beta-binomial: p_bb={p_bb:.3g}  q_bb={q_bb:.3g}")
+            if _COMENT_PERITO is not None:
+                try:
+                    row_payload = {"nomePerito": nome, "N": N, "NC": NC, "E": E, "IV_vagas": IVi,
+                                   "p_hat": p_hat, "wilson_low": wl, "wilson_high": wh,
+                                   "p": p_b, "q": q_b, "p_bb": p_bb, "q_bb": q_bb,
+                                   "score": float(r.get('score_final') or 0.0),
+                                   "cr": r.get('cr','—'), "dr": r.get('dr','—'), "uo": r.get('uo','—')}
+                    L.append(_COMENT_PERITO(row_payload, float(meta['p_br']), float(meta['alpha']),
+                                            model=model, temperature=temperature, max_words=max_words))
+                except Exception:
+                    pass
             L.append("")
 
     # Comentário geral (se existir)
@@ -736,7 +863,7 @@ def exportar_org(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any
         L.append("\n** Comentário")
         L.append(comment_text.strip())
 
-    # Seção de TESTES + comentários gráficos de testes
+    # TESTES (com tabelas menores)
     if tests:
         L.append("\n* Validação estatística")
         # Binomial
@@ -744,22 +871,37 @@ def exportar_org(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any
             df = tests["binomial_df"].copy()
             L.append("** Teste binomial (unilateral, p_i > p_BR) com FDR (BH)")
             L.append(f":P_BR: {meta['p_br']*100:.2f}%")
+            # usa longtable e fonte menor; primeira coluna p{...} permite quebra de linha no nome
+            L.append(f"#+ATTR_LATEX: :environment longtable :font {table_font} :align p{{{firstcol_width}}} r r r l r r r")
             L.append("| Perito | N | NC | p̂_i | IC95%(Wilson) | Excesso | p | q(BH) |")
             L.append("|-")
-            show = df.sort_values("p", ascending=True).head(25)
+
+            # mostra TODAS as linhas, ordenando por p (mais significativo primeiro)
+            show = df.sort_values("p", ascending=True)
             for _, r in show.iterrows():
-                L.append("| {nome} | {N} | {NC} | {ph:.3f} | [{l:.3f};{u:.3f}] | {E} | {pval:.3g} | {qval:.3g} |".format(
-                    nome=r["nomePerito"], N=int(r["N"]), NC=int(r["NC"]), ph=float(r["p_hat"]),
-                    l=float(r["wilson_low"]), u=float(r["wilson_high"]), E=int(r["E"]),
-                    pval=float(r["p"]), qval=float(r["q"])
+                L.append("| {nome} | {N} | {NC} | {ph} | [{l}; {u}] | {E} | {pval} | {qval} |".format(
+                    nome=r["nomePerito"],
+                    N=int(r["N"]), NC=int(r["NC"]),
+                    ph=_fmt2(r["p_hat"]),
+                    l=_fmt2(r["wilson_low"]), u=_fmt2(r["wilson_high"]),
+                    E=int(r["E"]),
+                    pval=_fmtp2(r["p"]), qval=_fmtp2(r["q"])
                 ))
+
             L.append(f"\nPeritos com q<0,05: {int((df['q']<0.05).sum())} de {df.shape[0]}.\n")
+            if _COMENT_BIN is not None:
+                try:
+                    L.append(_COMENT_BIN(df, float(meta['p_br']), model=model, temperature=temperature, max_words=max_words))
+                    L.append("")
+                except Exception:
+                    pass
 
         # Beta-binomial
         if tests.get("betabin_df") is not None:
             df = tests["betabin_df"].copy()
             L.append("** Teste beta-binomial (overdispersão) com FDR (BH)")
             L.append(f":RHO_MOM: {tests.get('rho_mom', float('nan')):.4f}")
+            L.append(f"#+ATTR_LATEX: :font {table_font} :align p{{{firstcol_width}}} r r r r r r")
             L.append("| Perito | N | NC | p̂_i | Excesso | p_betaBin | q(BH) |")
             L.append("|-")
             show = df.sort_values("p_bb", ascending=True).head(25)
@@ -769,6 +911,12 @@ def exportar_org(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any
                     E=int(r["E"]), pbb=float(r["p_bb"]), qval=float(r["q_bb"])
                 ))
             L.append(f"\nPeritos com q<0,05: {int((df['q_bb']<0.05).sum())} de {df.shape[0]}.\n")
+            if _COMENT_BB is not None:
+                try:
+                    L.append(_COMENT_BB(df, float(tests.get('rho_mom', float('nan'))), model=model, temperature=temperature, max_words=max_words))
+                    L.append("")
+                except Exception:
+                    pass
 
         # Permutação
         if tests.get("perm_png") is not None and os.path.exists(tests["perm_png"]):
@@ -776,15 +924,30 @@ def exportar_org(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any
             L.append(f"Observado: *w = {meta['peso_sel']*100:.2f}%*; réplicas: {int(tests.get('perm_R',0))}; p-valor: {tests.get('perm_p',float('nan')):.4f}")
             L.append(f"[[file:{os.path.basename(tests['perm_png'])}]]")
             L.append("")
-            L.append(_comment_fig_permutation(tests.get("perm_p"), int(tests.get("perm_R",0)),
-                                              model=model, max_words=max_words, temperature=temperature))
-            L.append("")
+            if _COMENT_PERM is not None:
+                try:
+                    w_obs_pct = float(meta.get('peso_sel', 0.0))*100.0
+                    L.append(_COMENT_PERM(tests.get("perm_p"), int(tests.get("perm_R",0)), w_obs_pct,
+                                          model=model, temperature=temperature, max_words=max_words))
+                    L.append("")
+                except Exception:
+                    pass
+            else:
+                L.append(_comment_fig_permutation(tests.get("perm_p"), int(tests.get("perm_R",0)),
+                                                  model=model, max_words=max_words, temperature=temperature))
+                L.append("")
 
         # CMH
         if tests.get("cmh") is not None:
             ormh, x2, pval, by_key = tests["cmh"]
             L.append(f"** CMH por {by_key.upper()} (2×2×K, selecionado vs. não; NC vs. conforme)")
             L.append(f"OR_MH: {ormh:.3f} | X2_MH: {x2:.3f} | p: {pval:.4g}\n")
+            if _COMENT_CMH is not None:
+                try:
+                    L.append(_COMENT_CMH(ormh, x2, pval, by_key, model=model, temperature=temperature, max_words=max_words))
+                    L.append("")
+                except Exception:
+                    pass
 
         # PSA
         if tests.get("psa_png") is not None and os.path.exists(tests["psa_png"]):
@@ -793,13 +956,24 @@ def exportar_org(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any
             L.append(f"Réplicas: {int(tests.get('psa_R',0))} | Mediana: {ci[0]*100:.2f}% | IC95%: [{ci[1]*100:.2f}%; {ci[2]*100:.2f}%]")
             L.append(f"[[file:{os.path.basename(tests['psa_png'])}]]")
             L.append("")
-            L.append(_comment_fig_psa(ci, int(tests.get("psa_R",0)),
-                                      model=model, max_words=max_words, temperature=temperature))
-            L.append("")
+            if _COMENT_PSA is not None:
+                try:
+                    L.append(_COMENT_PSA(ci, int(tests.get("psa_R",0)), model=model, temperature=temperature, max_words=max_words))
+                    L.append("")
+                except Exception:
+                    pass
+            else:
+                L.append(_comment_fig_psa(ci, int(tests.get("psa_R",0)),
+                                          model=model, max_words=max_words, temperature=temperature))
+                L.append("")
 
-    # Conclusão final
+    # Conclusão
     L.append("\n* Conclusão")
     L.append(_conclusao_text(meta, tests, model=model, max_words=140, temperature=temperature))
+
+    # Metodologia
+    if explain_methods:
+        L.append(_metodologia_block())
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(L) + "\n")
@@ -812,80 +986,90 @@ def _read_text_or_empty(path: Optional[str]) -> str:
     try:
         with open(path,"r",encoding="utf-8") as f:
             return f.read().rstrip()+"\n\n"
-    except Exception as e:
+    except Exception:
         return f"* Aviso\nNão foi possível ler o arquivo: {path}\n\n"
 
 def montar_org_final(header_org: str, front_org: str, org_gerado: str,
-                     start: str, end: str, final_org_name: Optional[str] = None) -> str:
+                     start: str, end: str, final_org_name: Optional[str] = None,
+                     author: Optional[str] = None, doc_date: Optional[str] = None) -> str:
     """
     Monta o ORG final:
       header_mps.org  +  impacto_fila.org (front)  +  org_gerado (inline)
-    - Força EXPORT_FILE_NAME para o final (não deixa o front sobrescrever).
+    - Força TITLE/AUTHOR/DATE e EXPORT_FILE_NAME.
     - Converte links [[file:...]] para basename e copia as imagens p/ a pasta destino.
     """
-    # Destino
     safe_name = final_org_name or f"impacto_fila_FINAL_{start}_a_{end}"
     dest_dir  = EXPORT_DIR
     os.makedirs(dest_dir, exist_ok=True)
     final_org = os.path.join(dest_dir, f"{safe_name}.org")
 
     def _read(path: str) -> str:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        except Exception:
+            return ""
 
-    # Carrega as partes
     head = _read(header_org) if header_org and os.path.exists(header_org) else ""
     front = _read(front_org) if front_org and os.path.exists(front_org) else ""
-    body = _read(org_gerado) if org_gerado and os.path.exists(org_gerado) else ""
+    body  = _read(org_gerado) if org_gerado and os.path.exists(org_gerado) else ""
 
-    # Sanitiza: remove metadados que atrapalham do front (title/export name)
+    # Remove metadados conflitantes do front
     def _strip_conflicting_meta(s: str) -> str:
         out = []
         for ln in s.splitlines():
             l = ln.strip().lower()
-            if l.startswith("#+export_file_name:"):
-                continue
-            if l.startswith("#+title:"):
+            if l.startswith("#+export_file_name:") or l.startswith("#+title:") or l.startswith("#+author:") or l.startswith("#+date:"):
                 continue
             out.append(ln)
         return "\n".join(out)
 
     front_clean = _strip_conflicting_meta(front)
 
-    # Cabeçalho fixo do final (titulo + export filename)
+    # Cabeçalho fixo do final — ATENÇÃO: aqui garantimos “o que tem que sair”
+    doc_title  = f"Impacto na Fila — {start} a {end}"
+    doc_author = (author or "").strip()
+    if not doc_author:
+        doc_author = "Gustavo M. Mendes de Tarso"
+    doc_date_s = (doc_date or _date_pt_br(datetime.today()))
+
     header_final = [
-        
+        f"#+TITLE: {doc_title}",
+        f"#+AUTHOR: {doc_author}",
+        f"#+DATE: {doc_date_s}",
+        f"#+EXPORT_FILE_NAME: {safe_name}",
+        "#+OPTIONS: toc:nil",
+        "#+LATEX_HEADER: \\usepackage{array}",
+        "#+LATEX_HEADER: \\setlength{\\tabcolsep}{4pt}",
+        "#+LATEX_HEADER: \\renewcommand{\\arraystretch}{1.05}",
+        ""
     ]
+
     # Conteúdo combinado
     combined = "\n".join([
         head.strip(),
         "\n".join(header_final),
         front_clean.strip(),
         "\n* Resultados",
-        body.strip(),  # org gerado inline (evita INCLUDE com caminho relativo)
+        body.strip(),
         ""
     ]).strip() + "\n"
 
-    # Normaliza caminhos de imagens → basename e coleta lista
-    import re, shutil
+    # Normaliza links de imagem → basename e copia assets
     img_paths = set()
     def _norm_link(m):
-        p = m.group(1).strip()
-        # mantem só basename; Emacs resolverá local
-        base = os.path.basename(p)
-        img_paths.add((p, base))
+        pth = m.group(1).strip()
+        base = os.path.basename(pth)
+        img_paths.add((pth, base))
         return f"[[file:{base}]]"
-
     combined = re.sub(r"\[\[file:([^\]\|]+)\]\]", _norm_link, combined)
 
-    # Escreve ORG final
     with open(final_org, "w", encoding="utf-8") as f:
         f.write(combined)
 
-    # Copia assets (se não estiverem no mesmo diretório)
-    src_dir_generated = os.path.dirname(os.path.abspath(org_gerado))
+    # Copia imagens
+    src_dir_generated = os.path.dirname(os.path.abspath(org_gerado or dest_dir))
     for src, base in img_paths:
-        # tenta achar no dir do org gerado, depois no header/front
         cand = [
             os.path.join(src_dir_generated, src),
             os.path.join(src_dir_generated, base),
@@ -895,7 +1079,7 @@ def montar_org_final(header_org: str, front_org: str, org_gerado: str,
         ]
         src_exist = next((c for c in cand if os.path.exists(c)), None)
         if not src_exist:
-            print(f"⚠️ Não encontrei asset '{src}'. O PDF pode pular essa imagem.")
+            print(f"⚠️ Não encontrei asset '{src}'.")
             continue
         dst = os.path.join(dest_dir, os.path.basename(base))
         if os.path.abspath(src_exist) != os.path.abspath(dst):
@@ -916,8 +1100,7 @@ def run_test_binomial(df_all: pd.DataFrame, p_br: float) -> pd.DataFrame:
     """Retorna DF com p, q(BH), IC Wilson e excesso E."""
     out=df_all[["nomePerito","N","NC","E"]].copy()
     out["p_hat"]=out["NC"]/out["N"].replace(0,np.nan)
-    pvals=[]
-    low=[]; high=[]
+    pvals=[]; low=[]; high=[]
     for _,r in out.iterrows():
         n=int(r["N"]); k=int(r["NC"])
         pval=_binom_sf_one_sided(k, n, p_br) if n>0 else 1.0
@@ -932,11 +1115,8 @@ def run_test_betabin(df_all: pd.DataFrame, p_br: float) -> Tuple[pd.DataFrame, f
     """Estima ρ via MoM; testa p_i > p_BR no beta-binomial. Retorna DF e ρ."""
     N=df_all["N"].astype(int).values; NC=df_all["NC"].astype(int).values
     rho=_estimate_rho_mom(N, NC, p_br)
-    # converte para (a,b): rho = 1/(a+b+1) → a+b = 1/rho - 1
     if rho <= 1e-9:
-        a=b=np.inf  # degenera para binomial; cairemos no binomial se quiser
-        # Para coerência, use rho mínimo pequeno
-        rho=1e-9
+        rho = 1e-9
     ab = (1.0/rho) - 1.0
     a = float(p_br*ab); b=float((1.0-p_br)*ab)
     pvals=[]
@@ -958,14 +1138,10 @@ def run_permutation_weight(df_all: pd.DataFrame, df_sel: pd.DataFrame, alpha: fl
     if df_sel.empty or df_all.empty or R<=0:
         return (float('nan'), "")
     n_sel = df_sel.shape[0]
-    # IV período (constante)
     iv_period = int(math.ceil(float(alpha)*float(df_all["NC"].sum())))
-    # Pré-cálculo E/IV (já estão em df_all)
-    # Estratégia de permutação:
     rng=np.random.default_rng()
     weights=[]
     if stratify_by and stratify_by in df_all.columns:
-        # mantém mesma contagem por estrato
         counts=df_sel[stratify_by].fillna("—").value_counts().to_dict()
         strata_groups={}
         for g,sub in df_all.groupby(df_all[stratify_by].fillna("—")):
@@ -977,7 +1153,6 @@ def run_permutation_weight(df_all: pd.DataFrame, df_sel: pd.DataFrame, alpha: fl
                 if pool.size==0: continue
                 pick=rng.choice(pool, size=min(c, pool.size), replace=False)
                 idx.extend(list(pick))
-            # se faltou por estrato inexistente, completa aleatório
             if len(idx)<n_sel:
                 pool_extra=np.setdiff1d(df_all.index.values, np.array(idx,dtype=int), assume_unique=False)
                 if pool_extra.size>0:
@@ -1059,7 +1234,7 @@ def run_psa(df_all_base: pd.DataFrame, df_sel_base: pd.DataFrame, alpha: float, 
     return ((p50,p2,p97), psa_png)
 
 # ──────────────────────────────────────────────────────────────────────
-# Estratos (iguais)
+# Estratos
 # ──────────────────────────────────────────────────────────────────────
 
 def _compute_strata(df_all: pd.DataFrame, df_sel: pd.DataFrame, by: str, alpha: float, p_br: float) -> Tuple[pd.DataFrame,pd.DataFrame]:
@@ -1079,6 +1254,24 @@ def _compute_strata(df_all: pd.DataFrame, df_sel: pd.DataFrame, by: str, alpha: 
     sel=sel[[f"{by}_val","IV_sel"]].copy(); sel["IV_sel"]=sel["IV_sel"].astype(int)
     return tot, sel
 
+# Comentário de estratos (fallback genérico)
+def _comment_fig_strat(by: str, df_strat_tot: pd.DataFrame, df_strat_sel: pd.DataFrame,
+                       model="gpt-4o-mini", max_words=120, temperature=0.2) -> str:
+    m = df_strat_tot.merge(df_strat_sel, on=f"{by}_val", how="left").fillna(0)
+    m["share_sel"] = m["IV_sel"]/m["IV_tot"].replace(0,np.nan)
+    dom = m.sort_values("IV_tot", ascending=False).head(3)
+    payload = {
+        "by": by, "estratos": [
+            {"estrato": str(r[f"{by}_val"]), "iv_tot": int(r["IV_tot"]), "iv_sel": int(r["IV_sel"]),
+             "share_sel": None if pd.isna(r["share_sel"]) else round(float(r["share_sel"]*100),2)}
+            for _, r in dom.iterrows()
+        ]
+    }
+    fb = ("O sumário estratificado indica **onde o impacto negativo (IV_total)** se concentra e em quais estratos o esforço "
+          "(IV_sel) está direcionado. Os primeiros grupos respondem pela maior parcela do risco, "
+          "reforçando a prioridade de **mitigação segmentada**.")
+    return _comment_from_gpt_or_fallback(f"Impacto por {by.upper()}", payload, fb, model, max_words, temperature)
+
 # ──────────────────────────────────────────────────────────────────────
 # Shipping/movimentação de saídas
 # ──────────────────────────────────────────────────────────────────────
@@ -1087,10 +1280,8 @@ def _ship_outputs(paths: List[Optional[str]], out_root: str, out_date: Optional[
     Move os arquivos de `paths` para BASE_DIR/out_root/YYYY-MM-DD/out_subdir.
     Ignora caminhos inexistentes/None. Retorna o diretório final.
     """
-    # data destino
     date_str = (out_date or "").strip()
     if not date_str:
-        # fallback: tenta hoje
         date_str = datetime.today().strftime("%Y-%m-%d")
     dest_dir = os.path.join(BASE_DIR, out_root, date_str, out_subdir)
     os.makedirs(dest_dir, exist_ok=True)
@@ -1103,7 +1294,6 @@ def _ship_outputs(paths: List[Optional[str]], out_root: str, out_date: Optional[
             if not os.path.exists(pth):
                 continue
             dst = os.path.join(dest_dir, os.path.basename(pth))
-            # evita mover para o mesmo lugar
             if os.path.abspath(pth) == os.path.abspath(dst):
                 continue
             shutil.move(pth, dst)
@@ -1145,7 +1335,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--sens-pbr-pp', type=float, default=0.02)
     ap.add_argument('--by', choices=['cr','dr','uo'])
 
-    # TESTES novos
+    # TESTES
     ap.add_argument('--test-binomial', action='store_true')
     ap.add_argument('--betabin', action='store_true')
     ap.add_argument('--permute-weight', type=int, default=0, metavar="N")
@@ -1164,11 +1354,11 @@ def parse_args() -> argparse.Namespace:
 
     # Shipping de saídas
     ap.add_argument('--ship-outputs', action='store_true',
-                    help='Move os arquivos gerados para reports/outputs/YYYY-MM-DD/impacto_fila')
+                    help='Move os arquivos gerados para reports/outputs/PERIODO/impacto_fila (limpa EXPORT_DIR).')
     ap.add_argument('--out-date', default=None,
-                    help='Data da pasta destino (YYYY-MM-DD). Padrão: usa --end')
+                    help='Data da pasta destino (YYYY-MM-DD). Se vazio, usa --end.')
     ap.add_argument('--out-root', default='reports/outputs',
-                    help='Raiz dos relatórios (relativo ao projeto). Padrão: reports/outputs')
+                    help='Raiz dos relatórios (relativo ao projeto).')
     ap.add_argument('--out-subdir', default='impacto_fila',
                     help='Subpasta do módulo. Padrão: impacto_fila')
 
@@ -1177,20 +1367,27 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--header-org', default='/home/gustavodetarso/Documentos/.share/header_mps_org/header_mps.org')
     ap.add_argument('--front-org',  default='/home/gustavodetarso/Documentos/.share/header_mps_org/impacto_fila.org')
     ap.add_argument('--final-org-name', default=None)
-    
-    ap.add_argument('--export-pdf', action='store_true',
-                    help='Converte o ORG final para PDF (tenta pandoc; fallback Emacs/ox-latex).')
+    ap.add_argument('--export-pdf', action='store_true', help='Converte o ORG final para PDF (tenta pandoc; fallback Emacs/ox-latex).')
 
     # OpenAI
     ap.add_argument('--model', default='gpt-4o-mini'); ap.add_argument('--max-words', type=int, default=200)
     ap.add_argument('--temperature', type=float, default=0.2)
 
+    # Blocos novos
+    ap.add_argument('--per-top10-sections', action='store_true', help='Cria subseções por perito do TopN com comentários e estatísticas.')
+    ap.add_argument('--top10-aggregate', action='store_true', help='Inclui bloco agregado do TopN (IV_top, peso_top, ΔTMEA_top).')
+    ap.add_argument('--explain-methods', action='store_true', help='Anexa seção de metodologia.')
+
+    # ⚠️ NOVA FLAG: não aplicar S*
+    ap.add_argument('--no-sstar', action='store_true', help='Desliga o corte S*; usa TODOS os peritos (TopN apenas por IV).')
+
     # atalho para tudo
     ap.add_argument('--all-tests', action='store_true', help="Executa: --test-binomial --betabin --permute-weight 5000 --cmh by=cr --psa 10000")
     return ap.parse_args()
 
+
 # ──────────────────────────────────────────────────────────────────────
-# Build (single / group) — iguais ao anterior
+# Build (single / group)
 # ──────────────────────────────────────────────────────────────────────
 
 def _build_single(start: str, end: str, perito: str, alpha: float, p_br_opt: Optional[float]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -1240,6 +1437,10 @@ def _build_group(start: str, end: str, alpha: float, p_br_opt: Optional[float],
           'total_period':int(total_calc), 'nc_period':int(nc_calc)}
     return df_sel, meta, df_all
 
+# ──────────────────────────────────────────────────────────────────────
+# Exportação para PDF
+# ──────────────────────────────────────────────────────────────────────
+
 def _export_org_to_pdf(org_path: str) -> Optional[str]:
     """
     Converte um arquivo .org para .pdf.
@@ -1257,16 +1458,14 @@ def _export_org_to_pdf(org_path: str) -> Optional[str]:
         pdf_basename = os.path.splitext(org_basename)[0] + ".pdf"
         out_pdf_abs_expected = os.path.join(cwd, pdf_basename)
 
-        # Lê o .org para detectar uso explícito de 'babel' no cabeçalho
         try:
             with open(org_path, "r", encoding="utf-8", errors="ignore") as f:
                 content_lower = f.read().lower()
         except Exception:
             content_lower = ""
 
-        prefers_emacs = ("babel" in content_lower)  # se seu header injeta \usepackage[...]{babel}, vá de Emacs
+        prefers_emacs = ("babel" in content_lower)
 
-        # Helper: tenta Pandoc (com xelatex)
         def _try_pandoc() -> Optional[str]:
             if not shutil.which("pandoc"):
                 return None
@@ -1275,31 +1474,23 @@ def _export_org_to_pdf(org_path: str) -> Optional[str]:
                 if shutil.which(e):
                     engine = e
                     break
-            # Para reduzir conflitos, forçamos xelatex se disponível e informamos o idioma.
             cmd = ["pandoc", org_basename, "-o", pdf_basename]
             if engine:
                 cmd.append(f"--pdf-engine={engine}")
-            # dica de idioma (evita default en-US); não adiciona babel se engine=xelatex (usa polyglossia)
             cmd.extend(["-V", "lang=pt-BR"])
             r = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if r.returncode == 0 and os.path.exists(out_pdf_abs_expected):
                 print(f"🖨️ PDF gerado (pandoc/{engine or 'default'}): {out_pdf_abs_expected}")
                 return out_pdf_abs_expected
             else:
-                # Mostra parte do erro
                 print(f"⚠️ Falha pandoc ({r.returncode}). Detalhe (parcial): {r.stderr[:400]}")
                 return None
 
-        # Helper: tenta Emacs e captura o caminho retornado pelo exporter
         def _try_emacs() -> Optional[str]:
             if not shutil.which("emacs"):
                 return None
-            # marcamos o instante para poder achar PDFs gerados depois disso (fallback)
             import time, glob
             t0 = time.time()
-
-            # Script Elisp: exporta e imprime o caminho do PDF.
-            # Também configura latexmk silencioso (se existir).
             elisp = (
                 "(progn "
                 "(require 'ox-latex) "
@@ -1314,32 +1505,22 @@ def _export_org_to_pdf(org_path: str) -> Optional[str]:
                 ["emacs", "--batch", "-Q", "--eval", elisp],
                 cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
-            # Emacs costuma retornar 0 mesmo com warnings; priorize o stdout (caminho)
             out_path = (r.stdout or "").strip().splitlines()[-1] if r.stdout else ""
             if out_path:
                 out_pdf_abs = out_path if os.path.isabs(out_path) else os.path.join(cwd, out_path)
                 if os.path.exists(out_pdf_abs):
                     print(f"🖨️ PDF gerado (Emacs): {out_pdf_abs}")
                     return out_pdf_abs
-
-            # Fallback: pega o PDF mais novo no diretório, criado após t0
             pdfs = glob.glob(os.path.join(cwd, "*.pdf"))
             pdfs_after = [p for p in pdfs if os.path.getmtime(p) >= (t0 - 1.0)]
             if pdfs_after:
                 newest = max(pdfs_after, key=os.path.getmtime)
                 print(f"🖨️ PDF gerado (Emacs, detectado por mtime): {newest}")
                 return newest
-
             print(f"⚠️ Falha Emacs/ox-latex ({r.returncode}). Detalhe (parcial): {r.stderr[:400]}")
             return None
 
-        # Orquestração: se usar babel, vá de Emacs primeiro; senão, tente Pandoc e caia para Emacs.
-        pdf_path = None
-        if prefers_emacs:
-            pdf_path = _try_emacs() or _try_pandoc()
-        else:
-            pdf_path = _try_pandoc() or _try_emacs()
-
+        pdf_path = _try_emacs() or _try_pandoc() if prefers_emacs else _try_pandoc() or _try_emacs()
         if not pdf_path:
             print("⚠️ Não foi possível gerar PDF (verifique Pandoc/Emacs+LaTeX).")
         return pdf_path
@@ -1348,13 +1529,14 @@ def _export_org_to_pdf(org_path: str) -> Optional[str]:
         print(f"⚠️ Erro ao gerar PDF: {e}")
         return None
 
-
 # ──────────────────────────────────────────────────────────────────────
-# Main
+# Main 
 # ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     args = parse_args()
+
+    # Atalho: --all-tests liga um conjunto de testes e parâmetros padrão
     if args.all_tests:
         args.test_binomial = True
         args.betabin = True
@@ -1364,327 +1546,328 @@ def main() -> None:
 
     # Build bases
     if args.perito:
-        df_sel, meta = _build_single(args.start, args.end, args.perito, args.alpha, args.pbr)
-        df_all = df_sel.copy()
         with sqlite3.connect(DB_PATH) as conn:
             schema = _detect_schema(conn)
-            p_br_calc, total_calc, nc_calc = _compute_p_br_and_totals(conn, args.start, args.end, schema)
-            if args.pbr is None:
-                meta['p_br'] = p_br_calc
-            meta['total_period'] = int(total_calc)
-            meta['nc_period'] = int(nc_calc)
+            df_n = _fetch_perito_n_nc(conn, args.start, args.end, schema)
+            if df_n.empty:
+                df_all = pd.DataFrame(columns=['nomePerito','N','NC','cr','dr','uo','E','IV_vagas','score_final'])
+                df_sel = df_all.copy()
+                meta = {
+                    'mode': 'single',
+                    'perito': args.perito,
+                    'start': args.start,
+                    'end': args.end,
+                    'alpha': args.alpha,
+                    'p_br': 0.0,
+                    'score_cut': None,
+                    'n_all': 0,
+                    'n_sel': 0,
+                    'label_lhs': args.perito,
+                    'safe_stub': args.perito,
+                    'topn': args.topn
+                }
+                total_calc = 0
+                nc_calc = 0
+            else:
+                p_br_calc, total_calc, nc_calc = _compute_p_br_and_totals(conn, args.start, args.end, schema) if args.pbr is None else (args.pbr, None, None)
+                p_br = p_br_calc if args.pbr is None else args.pbr
+                df_scores = _fetch_scores(conn)
+                df_all = _prep_base(df_n, df_scores, p_br, args.alpha, min_analises=0)
+                df_sel = df_all.loc[df_all["nomePerito"].str.strip().str.upper() == args.perito.strip().upper()].copy()
+                meta = {
+                    'mode': 'single',
+                    'perito': args.perito,
+                    'start': args.start,
+                    'end': args.end,
+                    'alpha': args.alpha,
+                    'p_br': p_br,
+                    'score_cut': None,
+                    'n_all': int(df_all.shape[0]),
+                    'n_sel': int(df_sel.shape[0]),
+                    'label_lhs': args.perito,
+                    'safe_stub': args.perito,
+                    'topn': args.topn
+                }
+        s_star = None
     else:
         df_sel, meta, df_all = _build_group(
             args.start, args.end, args.alpha, args.pbr,
             min_analises=args.min_analises, topn=args.topn,
             minimo_duplo_nc=args.minimo_duplo_nc
         )
+        s_star = meta.get("score_cut", None)
 
-    # Totais/ΔTMEA/peso
-    iv_total_period = int(math.ceil(float(args.alpha) * float(meta.get('nc_period', 0))))
+        # ⚠️ NOVO: se --no-sstar, desliga o corte e usa TODOS os peritos
+        if args.no_sstar:
+            s_star = None
+            df_sel = df_all.copy()
+            meta['score_cut'] = None
+            meta['n_sel'] = int(df_sel.shape[0])
+            meta['label_lhs'] = 'Grupo (sem corte de score)'
+
+        total_calc = meta.get("total_period", None)
+        nc_calc = meta.get("nc_period", None)
+
+    # Métricas de impacto
+    NC_period = int(df_all["NC"].sum()) if not df_all.empty else int(nc_calc or 0)
+    iv_total_period = int(math.ceil(float(args.alpha) * float(NC_period)))
     iv_total_sel = int(df_sel["IV_vagas"].sum()) if not df_sel.empty else 0
     peso_sel = (iv_total_sel / iv_total_period) if iv_total_period > 0 else 0.0
+
     delta_tmea_sel = _calc_delta_tmea(iv_total_sel, tmea_br=args.tmea_br, cap_br=args.cap_br, att_br=args.att_br)
     delta_tmea_period = _calc_delta_tmea(iv_total_period, tmea_br=args.tmea_br, cap_br=args.cap_br, att_br=args.att_br)
+
     meta.update({
         'iv_total_sel': iv_total_sel,
         'iv_total_period': iv_total_period,
         'peso_sel': peso_sel,
-        'tmea_br': args.tmea_br,
         'delta_tmea_sel': delta_tmea_sel,
         'delta_tmea_period': delta_tmea_period,
-        'topn': args.topn
+        'tmea_br': args.tmea_br,
+        'topn': args.topn,
+        'n_all': int(df_all.shape[0]),
+        'n_sel': int(df_sel.shape[0])
     })
 
-    # Rastrear saídas geradas nesta execução
-    outputs: List[Optional[str]] = []
-
-    # Bootstrap do peso
+    # Bootstrap do peso (IC95%)
     if args.bootstrap_peso and not df_all.empty:
-        df_all_idx = df_all.reset_index(drop=True).copy()
-        df_all_idx.index = np.arange(df_all_idx.shape[0])
-        boot = bootstrap_peso(
-            df_all_idx, meta.get('score_cut'), meta['alpha'], meta['p_br'],
-            int(args.bootstrap_peso), bool(args.bootstrap_recalc_sstar)
-        )
-        if boot:
-            meta['peso_ci'] = (boot[1], boot[2])  # IC95%
+        R = int(args.bootstrap_peso)
+        rng = np.random.default_rng()
+        weights = []
+        base_idx = df_all.index.values
+        n_sel = df_sel.shape[0]
+        for _ in range(R):
+            boot_idx = rng.choice(base_idx, size=len(base_idx), replace=True)
+            boot = df_all.loc[boot_idx].copy()
+            if args.bootstrap_recalc_sstar and 'score_final' in boot.columns and not boot['score_final'].isna().all():
+                m_all, sel = _recompute_with_params(boot, args.alpha, meta['p_br'], _elbow_cutoff_score(boot))
+            else:
+                m_all, sel_ref = _recompute_with_params(boot, args.alpha, meta['p_br'], s_star)
+                if s_star is None and n_sel > 0 and sel_ref.shape[0] != n_sel:
+                    sel = m_all.sort_values("IV_vagas", ascending=False).head(n_sel).copy()
+                else:
+                    sel = sel_ref
+            iv_period_b = int(math.ceil(float(args.alpha) * float(m_all["NC"].sum())))
+            iv_sel_b = int(sel["IV_vagas"].sum()) if not sel.empty else 0
+            w_b = (iv_sel_b / iv_period_b) if iv_period_b > 0 else 0.0
+            weights.append(w_b)
+        ws = np.array(weights, dtype=float)
+        lo = float(np.percentile(ws, 2.5))
+        hi = float(np.percentile(ws, 97.5))
+        meta['peso_ci'] = (lo, hi)
+    else:
+        meta['peso_ci'] = None
 
-    # Sensibilidade (tornado)
-    tornado_path = None
-    sens_delta = None
+    # Sensibilidade determinística (tornado)
+    png_tornado = None
+    sens_delta = {}
     if args.sens_plot and not df_all.empty:
-        sens_delta = sensibilidade_peso(
-            df_all, meta.get('score_cut'), meta,
-            args.sens_alpha_frac, args.sens_pbr_pp
-        )
-        tornado_path = exportar_png_tornado(meta, sens_delta, args.sens_alpha_frac, args.sens_pbr_pp)
-        outputs.append(tornado_path)
+        for sign, key in [(-1, "alpha_minus"), (1, "alpha_plus")]:
+            a2 = max(min(args.alpha * (1.0 + sign * args.sens_alpha_frac), 0.9999), 1e-4)
+            m2, sel2 = _recompute_with_params(df_all, a2, meta['p_br'], s_star)
+            ivp2 = int(math.ceil(a2 * float(m2["NC"].sum())))
+            ivs2 = int(sel2["IV_vagas"].sum()) if not sel2.empty else 0
+            sens_delta[key] = (ivs2 / ivp2) * 100.0 if ivp2 > 0 else 0.0
+        for sign, key in [(-1, "pbr_minus"), (1, "pbr_plus")]:
+            p2 = max(min(meta['p_br'] + sign * args.sens_pbr_pp, 0.9999), 1e-6)
+            m2, sel2 = _recompute_with_params(df_all, args.alpha, p2, s_star)
+            ivp2 = int(math.ceil(args.alpha * float(m2["NC"].sum())))
+            ivs2 = int(sel2["IV_vagas"].sum()) if not sel2.empty else 0
+            sens_delta[key] = (ivs2 / ivp2) * 100.0 if ivp2 > 0 else 0.0
+        png_tornado = exportar_png_tornado(meta, sens_delta, args.sens_alpha_frac, args.sens_pbr_pp)
 
     # Estratos
-    df_strat_tot = df_strat_sel = None
-    strat_png = None
-    if args.by:
-        df_strat_tot, df_strat_sel = _compute_strata(df_all, df_sel, args.by, meta['alpha'], meta['p_br'])
-        if args.export_png:
-            strat_png = exportar_png_strat(df_strat_tot, df_strat_sel, args.by, meta)
-            outputs.append(strat_png)
+    df_strat_tot = pd.DataFrame()
+    df_strat_sel = pd.DataFrame()
+    png_strat = None
+    by_key = None
+    if args.by and not df_all.empty:
+        by_key = args.by
+        df_strat_tot, df_strat_sel = _compute_strata(df_all, df_sel, by_key, args.alpha, meta['p_br'])
+        png_strat = exportar_png_strat(df_strat_tot, df_strat_sel, by_key, meta)
 
-    # Console básico
-    if df_sel.empty:
-        print("\n⚠️ Não há dados suficientes para cálculo de impacto no período informado.\n")
-    else:
-        delta_sel_str = f" | ΔTMEA sel≈ {delta_tmea_sel} d" if delta_tmea_sel is not None else ""
-        delta_per_str = f" | ΔTMEA período≈ {delta_tmea_period} d" if delta_tmea_period is not None else ""
-        boot_str = f" | IC95% peso: {meta['peso_ci'][0]*100:.1f}%–{meta['peso_ci'][1]*100:.1f}%" if meta.get('peso_ci') else ""
-        print(f"\n📊 Impacto na Fila | {meta['start']} a {meta['end']}")
-        print(f"   α={meta['alpha']} | p_BR={meta['p_br']*100:.2f}% | Score-cut: {meta['score_cut'] if meta['score_cut'] is not None else 'auto/nd'} | TMEA={args.tmea_br:.1f}d{delta_sel_str}{delta_per_str}{boot_str}")
-        print(f"   IV período: {iv_total_period} | IV selecionado: {iv_total_sel} | peso sel: {peso_sel*100:.2f}%")
-        print(f"   Selecionados: {meta['n_sel']}/{meta['n_all']}\n")
-        cols = ['nomePerito', 'cr', 'dr', 'uo', 'N', 'NC', 'E', 'IV_vagas', 'score_final']
-        print(df_sel.sort_values("IV_vagas", ascending=False)[cols].head(meta.get("topn", 10)))
+    # TESTES estatísticos
+    tests: Dict[str, Any] = {}
+    if args.test_binomial and not df_all.empty:
+        tests['binomial_df'] = run_test_binomial(df_all, meta['p_br'])
 
-    cuts_info = {
-        'min_pct_perito': None,
-        'min_pct_brasil': None,
-        'min_n_perito': None,
-        'min_n_brasil': None,
-        'topn': args.topn
+    if args.betabin and not df_all.empty:
+        bb_df, rho_mom = run_test_betabin(df_all, meta['p_br'])
+        tests['betabin_df'] = bb_df
+        tests['rho_mom'] = rho_mom
+
+    if args.permute_weight and not df_all.empty and not df_sel.empty:
+        stratify = by_key if (args.permute_stratify and by_key in ('cr','dr','uo')) else None
+        perm_p, perm_png = run_permutation_weight(df_all, df_sel, args.alpha, meta['p_br'], args.permute_weight, stratify_by=stratify)
+        tests['perm_p'] = perm_p
+        tests['perm_png'] = perm_png
+        tests['perm_R'] = int(args.permute_weight)
+
+    if args.cmh:
+        cmh_arg = args.cmh.strip()
+        if cmh_arg.lower().startswith("by="):
+            cmh_by = cmh_arg.split("=", 1)[1].strip().lower()
+        else:
+            cmh_by = cmh_arg.strip().lower()
+        if cmh_by in ("cr","dr","uo") and not df_all.empty:
+            ormh, x2, pval = run_cmh(df_all, df_sel, cmh_by)
+            tests['cmh'] = (ormh, x2, pval, cmh_by)
+
+    if args.psa and not df_all.empty:
+        ci, psa_png = run_psa(df_all, df_sel, args.alpha, meta['p_br'],
+                              total=int(total_calc or df_all["N"].sum()),
+                              nc=int(nc_calc or df_all["NC"].sum()),
+                              R=int(args.psa), s_star=s_star, alpha_strength=args.psa_alpha_strength)
+        tests['psa_ci'] = ci
+        tests['psa_png'] = psa_png
+        tests['psa_R'] = int(args.psa)
+
+    # Comentário geral adicional (via utils.comentarios se disponível)
+    comment_text = None
+    if args.add_comments and _COMENT_FUNC is not None:
+        try:
+            comment_text = _COMENT_FUNC(df_all.copy(), df_sel.copy(), dict(meta)) or None
+            if comment_text:
+                comment_text = _protect_comment_text(comment_text, word_cap=args.max_words)
+        except Exception:
+            comment_text = None
+
+    # PNGs
+    png_top = exportar_png_top(df_sel, meta, args.label_maxlen, args.label_fontsize) if args.export_png else None
+    png_cotovelo = None
+    if 'score_final' in df_all.columns and not df_all['score_final'].isna().all():
+        png_cotovelo = plot_curva_cotovelo(
+            df_all.copy(), s_star,
+            args.start, args.end,
+            iv_selected=iv_total_sel, iv_periodo=iv_total_period,
+            peso_selected=peso_sel, delta_tmea_sel=delta_tmea_sel,
+            delta_tmea_periodo=delta_tmea_period, tmea_br=args.tmea_br
+        )
+
+    cuts = {
+        "alpha": args.alpha,
+        "p_br": meta['p_br'],
+        "score_cut": None if s_star is None else round(float(s_star), 6),
+        "min_analises": args.min_analises if not args.perito else None,
+        "minimo_duplo_nc": args.minimo_duplo_nc if not args.perito else None,
+        "by": by_key
     }
 
-    # PNGs principais
-    png_top = None
-    if args.export_png or args.export_org or args.export_comment_org or args.add_comments:
-        png_top = exportar_png_top(
-            df_sel, meta, label_maxlen=args.label_maxlen, label_fontsize=args.label_fontsize
-        )
-        outputs.append(png_top)
-
-    if args.chart:
-        _plot_ascii_curva(df_all, meta.get('score_cut'))
-
-    curva_png = None
-    if (args.export_png or args.export_org or args.add_comments) and not df_all.dropna(subset=["score_final"]).empty:
-        curva_png = plot_curva_cotovelo(
-            df_all, meta.get('score_cut'), meta['start'], meta['end'],
-            iv_selected=iv_total_sel, iv_periodo=iv_total_period, peso_selected=peso_sel,
-            delta_tmea_sel=delta_tmea_sel, delta_tmea_periodo=delta_tmea_period, tmea_br=args.tmea_br
-        )
-        outputs.append(curva_png)
-
-    # Comentário GPT
-    comment_for_org = None
-    if args.export_comment_org or args.add_comments or args.export_comment:
-        payload = {
-            "periodo": {"start": meta['start'], "end": meta['end']},
-            "alpha": meta['alpha'], "p_br": meta['p_br'],
-            "score_cut": meta.get('score_cut'),
-            "iv_total_period": int(meta['iv_total_period']),
-            "iv_total_sel": int(meta['iv_total_sel']),
-            "peso_sel": float(meta['peso_sel']),
-            "peso_ci": [meta['peso_ci'][0], meta['peso_ci'][1]] if meta.get('peso_ci') else None,
-            "delta_tmea_sel": int(meta['delta_tmea_sel']) if meta.get('delta_tmea_sel') is not None else None,
-            "delta_tmea_period": int(meta['delta_tmea_period']) if meta.get('delta_tmea_period') is not None else None,
-            "tmea_br": meta.get('tmea_br'),
-            "top_peritos": (
-                df_sel.sort_values("IV_vagas", ascending=False).head(5)[["nomePerito", "IV_vagas", "score_final", "cr", "dr"]]
-                .rename(columns={"IV_vagas": "iv", "score_final": "score"})
-                .assign(iv=lambda d: d["iv"].astype(int)).to_dict(orient="records")
-                if not df_sel.empty else []
-            )
-        }
-        if _COMENT_FUNC is not None and not df_sel.empty:
+    # Agregado TopN (opcional)
+    topn_agg = None
+    if args.top10_aggregate and not df_sel.empty:
+        topn_agg = _calc_topn_aggregate(df_sel, iv_total_period, args.topn, tmea_br=args.tmea_br, cap_br=args.cap_br, att_br=args.att_br)
+        if _COMENT_TOPN is None:
             try:
-                bruto = _COMENT_FUNC(payload, call_api=True)
-                comment_for_org = bruto if isinstance(bruto, str) else str(bruto)
+                payload = dict(topn_agg); payload.update({"topn": int(args.topn), "periodo":[args.start,args.end]})
+                _ = _comment_from_gpt_or_fallback("TopN agregado", payload,
+                    f"O Top{args.topn} concentra {topn_agg['iv_top']} vagas (~{topn_agg['peso_top']*100:.1f}% do período), "
+                    f"com estimativa de ΔTMEA≈ {topn_agg['delta_tmea_top'] or 'n/d'} dia(s).")
             except Exception:
-                comment_for_org = None
-        if not comment_for_org:
-            try:
-                comment_for_org = _call_openai_chat(
-                    [
-                        {"role": "system", "content": "Você é um analista do ATESTMED."},
-                        {"role": "user", "content": f"Escreva um comentário (≤{args.max_words} palavras) sobre IV do período e dos selecionados: {json.dumps(payload, ensure_ascii=False)}"}
-                    ],
-                    model=args.model, temperature=args.temperature
-                )
-            except Exception:
-                comment_for_org = None
-        if not comment_for_org:
-            tops = ", ".join([f"{r['nomePerito']} ({int(r['IV_vagas'])})"
-                              for _, r in df_sel.sort_values('IV_vagas', ascending=False).head(3).iterrows()])
-            comment_for_org = (
-                f"No período {meta['start']} a {meta['end']}, IV_total={int(meta['iv_total_period'])} "
-                f"e IV_sel={int(meta['iv_total_sel'])} ({meta['peso_sel']*100:.1f}%). Destaques: {tops}."
-            )
-        comment_for_org = _protect_comment_text(comment_for_org, word_cap=args.max_words)
+                pass
 
-    # ====================== TESTES ======================
-    tests = {}
-    if (args.test_binomial or args.betabin or args.permute_weight or args.cmh or args.psa) and df_all.shape[0] > 0:
-        # Base comum (já tem N, NC, E, IV_vagas, score_final, cr/dr/uo)
-        if args.test_binomial:
-            tests["binomial_df"] = run_test_binomial(df_all, meta['p_br'])
-        if args.betabin:
-            bb_df, rho = run_test_betabin(df_all, meta['p_br'])
-            tests["betabin_df"] = bb_df
-            tests["rho_mom"] = rho
-        if args.permute_weight:
-            stratify = args.permute_stratify and bool(args.by)
-            by_key = args.by if stratify else None
-            p_perm, perm_png = run_permutation_weight(df_all, df_sel, meta['alpha'], meta['p_br'],
-                                                      int(args.permute_weight), by_key)
-            tests["perm_p"] = p_perm
-            tests["perm_png"] = perm_png
-            tests["perm_R"] = int(args.permute_weight)
-            outputs.append(perm_png)
-        if args.cmh:
-            by_key = args.cmh.strip()
-            if "=" in by_key:
-                by_key = by_key.split("=", 1)[1].strip()
-            if by_key not in ("cr", "dr", "uo"):
-                print("⚠️ --cmh precisa ser cr, dr ou uo (ou 'by=cr'). Pulei.")
-            else:
-                ormh, x2, pval = run_cmh(df_all, df_sel, by_key)
-                tests["cmh"] = (ormh, x2, pval, by_key)
-        if args.psa:
-            ci, psa_png = run_psa(
-                df_all, df_sel, meta['alpha'], meta['p_br'],
-                total=meta.get('total_period', 0), nc=meta.get('nc_period', 0),
-                R=int(args.psa), s_star=meta.get('score_cut'),
-                alpha_strength=float(args.psa_alpha_strength)
-            )
-            tests["psa_ci"] = ci
-            tests["psa_png"] = psa_png
-            tests["psa_R"] = int(args.psa)
-            outputs.append(psa_png)
-
-    # ====================== EXPORTS ======================
-    path_org_generated = None
+    # Exportar MD/ORG/PDF
+    md_path = org_path = final_org = pdf_path = None
 
     if args.export_md:
-        md_path = exportar_md(df_sel, meta, cuts_info)
-        outputs.append(md_path)
+        md_path = exportar_md(df_sel, meta, cuts)
 
     if args.export_org:
-        path_org_generated = exportar_org(
-            df_sel, meta, cuts_info, png_top,
-            comment_text=(comment_for_org if args.add_comments else None),
-            png_tornado=tornado_path, by=args.by,
-            df_strat_tot=df_strat_tot, df_strat_sel=df_strat_sel,
-            png_strat=strat_png, tests=tests,
-            png_cotovelo=curva_png,
+        org_path = exportar_org(
+            df_sel, meta, cuts,
+            png_top=png_top,
+            comment_text=comment_text if args.export_comment_org or args.add_comments else None,
+            png_tornado=png_tornado,
+            by=by_key,
+            df_strat_tot=df_strat_tot if not df_strat_tot.empty else None,
+            df_strat_sel=df_strat_sel if not df_strat_sel.empty else None,
+            png_strat=png_strat,
+            tests=tests,
+            png_cotovelo=png_cotovelo,
+            topn_agg=topn_agg,
+            per_top10_sections=bool(args.per_top10_sections),
+            explain_methods=bool(args.explain_methods),
             model=args.model, max_words=args.max_words, temperature=args.temperature
         )
-        outputs.append(path_org_generated)
 
-    if args.export_comment:
-        cmt_md = exportar_comment(df_sel, meta, cuts_info)
-        outputs.append(cmt_md)
-
-    if args.export_comment_org and comment_for_org:
-        cmt_org = exportar_comment_org(comment_for_org, meta)
-        outputs.append(cmt_org)
-
-    if args.final_org:
-        if not path_org_generated:
-            path_org_generated = exportar_org(
-                df_sel, meta, cuts_info, png_top,
-                comment_text=(comment_for_org if args.add_comments else None),
-                png_tornado=tornado_path, by=args.by,
-                df_strat_tot=df_strat_tot, df_strat_sel=df_strat_sel,
-                png_strat=strat_png, tests=tests,
-                png_cotovelo=curva_png,
-                model=args.model, max_words=args.max_words, temperature=args.temperature
-            )
-            outputs.append(path_org_generated)
-
+    if args.final_org and org_path:
         final_org = montar_org_final(
-            args.header_org, args.front_org, path_org_generated,
-            meta['start'], meta['end'], args.final_org_name
+            header_org=args.header_org,
+            front_org=args.front_org,
+            org_gerado=org_path,
+            start=args.start,
+            end=args.end,
+            final_org_name=args.final_org_name
         )
-        outputs.append(final_org)
-
-        # PDF do ORG final (se requisitado)
         if args.export_pdf:
             pdf_path = _export_org_to_pdf(final_org)
-            if pdf_path:
-                outputs.append(pdf_path)
-    else:
-        # Se não houve --final-org, ainda assim permitir PDF do ORG principal
-        if args.export_pdf and path_org_generated:
-            pdf_path = _export_org_to_pdf(path_org_generated)
-            if pdf_path:
-                outputs.append(pdf_path)
 
-    # Shipping das saídas para reports/outputs/YYYY-MM-DD_a_YYYY-MM-DD/impacto_fila
+    # Shipping (movimenta e limpa EXPORT_DIR)
     if args.ship_outputs:
-        out_date = args.out_date or f"{args.start}_a_{args.end}"  # padrão: intervalo
-        _ship_outputs(outputs, out_root=args.out_root, out_date=out_date, out_subdir=args.out_subdir)
+        out_period = f"{args.start}_a_{args.end}"
+        dest_root = os.path.join(BASE_DIR, args.out_root, out_period, args.out_subdir)
+        os.makedirs(dest_root, exist_ok=True)
+        # subpastas padrão (png/org/pdf/md/testes)
+        sub_png = os.path.join(dest_root, "png"); os.makedirs(sub_png, exist_ok=True)
+        sub_org = os.path.join(dest_root, "org"); os.makedirs(sub_org, exist_ok=True)
+        sub_pdf = os.path.join(dest_root, "pdf"); os.makedirs(sub_pdf, exist_ok=True)
+        sub_md  = os.path.join(dest_root, "md");  os.makedirs(sub_md,  exist_ok=True)
+        sub_tests = os.path.join(dest_root, "testes"); os.makedirs(sub_tests, exist_ok=True)
 
-    print("✅ Concluído.\n")
+        def _mv(p, subdir):
+            if not p or not os.path.exists(p): return
+            shutil.move(p, os.path.join(subdir, os.path.basename(p)))
 
+        # move artefatos
+        for pth in [png_top, png_tornado, png_strat, png_cotovelo]:
+            _mv(pth, sub_png)
+        for pth in [org_path, final_org]:
+            _mv(pth, sub_org)
+        if pdf_path: _mv(pdf_path, sub_pdf)
+        if md_path:  _mv(md_path, sub_md)
+        for pth in [tests.get("perm_png"), tests.get("psa_png")]:
+            _mv(pth, sub_tests)
 
+        # limpa EXPORT_DIR (somente o que sobrar)
+        try:
+            for name in os.listdir(EXPORT_DIR):
+                try:
+                    os.remove(os.path.join(EXPORT_DIR, name))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-# ──────────────────────────────────────────────────────────────────────
-# Funções previamente existentes: bootstrap_peso, sensibilidade_peso, exportar_comment/org-comment, etc.
-# (Agora definidas abaixo para manter o arquivo autocontido.)
-# ──────────────────────────────────────────────────────────────────────
+        print(f"📦 Artefatos organizados em: {dest_root}")
 
-def bootstrap_peso(df_all: pd.DataFrame, s_star: Optional[float], alpha: float, p_br: float, n: int, recalc_sstar: bool) -> Optional[Tuple[float,float,float]]:
-    if df_all.empty or n<=0: return None
-    peritos=df_all.index.to_list(); pes=[]
-    for _ in range(n):
-        idx=np.random.choice(peritos, size=len(peritos), replace=True)
-        sample=df_all.loc[idx].copy()
-        m=sample.copy()
-        m["E_raw"]=m["NC"] - m["N"]*float(p_br)
-        m["E"]=np.maximum(0, m["E_raw"]); m["E"]=np.ceil(m["E"]).astype(int)
-        m["IV_vagas"]=np.ceil(float(alpha)*m["E"]).astype(int)
-        s_used = _elbow_cutoff_score(m) if recalc_sstar else s_star
-        sel = m if s_used is None else m.loc[m["score_final"]>=s_used].copy()
-        iv_period=int(math.ceil(float(alpha)*float(m["NC"].sum())))
-        iv_sel=int(sel["IV_vagas"].sum()) if not sel.empty else 0
-        peso=(iv_sel/iv_period) if iv_period>0 else 0.0
-        pes.append(peso)
-    pes=np.array(pes,dtype=float)
-    return (float(np.percentile(pes,50)), float(np.percentile(pes,2.5)), float(np.percentile(pes,97.5)))
-
-def sensibilidade_peso(df_all: pd.DataFrame, s_star: Optional[float], meta: Dict[str, Any], alpha_frac: float, pbr_pp: float) -> Dict[str, float]:
-    alpha=meta["alpha"]; pbr=meta["p_br"]
-    a_minus, a_plus = max(0.0, alpha*(1.0-alpha_frac)), min(1.0, alpha*(1.0+alpha_frac))
-    p_minus, p_plus = max(0.0, pbr - pbr_pp), min(1.0, pbr + pbr_pp)
-    def _peso(a,p):
-        m,sel=_recompute_with_params(df_all, a, p, s_star)
-        ivp=int(math.ceil(float(a)*float(m["NC"].sum())))
-        ivs=int(sel["IV_vagas"].sum()) if not sel.empty else 0
-        return (ivs/ivp)*100.0 if ivp>0 else 0.0
-    return {"alpha_minus":_peso(a_minus,pbr), "alpha_plus":_peso(a_plus,pbr),
-            "pbr_minus":_peso(alpha,p_minus), "pbr_plus":_peso(alpha,p_plus)}
-
-def exportar_comment(df_sel: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict[str, Any]]=None) -> str:
-    fname=f"impacto_fila_{meta['start']}_a_{meta['end']}_comment.md"; path=os.path.join(EXPORT_DIR,fname)
-    if df_sel.empty:
-        texto=f"**Período:** {meta['start']} a {meta['end']}\n\nSem dados elegíveis no período."
+    # Resumo console
+    print("\n=== Impacto na Fila — Resumo ===")
+    if args.perito:
+        print(f"Perito: {args.perito}")
     else:
-        top=df_sel.sort_values("IV_vagas", ascending=False).head(5)
-        bullets=[f"- **{r['nomePerito']}**: {int(r['IV_vagas'])} vagas (score {float(r.get('score_final') or 0.0):.2f})" for _,r in top.iterrows()]
-        dsel=f"ΔTMEA sel≈ {int(meta['delta_tmea_sel'])} d" if meta.get('delta_tmea_sel') is not None else ""
-        dper=f"ΔTMEA período≈ {int(meta['delta_tmea_period'])} d" if meta.get('delta_tmea_period') is not None else ""
-        boot=meta.get('peso_ci'); boot_str=f" (IC95%: {boot[0]*100:.1f}%–{boot[1]*100:.1f}%)" if boot else ""
-        texto=(f"**Período:** {meta['start']} a {meta['end']}**\n\n"
-               f"**IV período:** {int(meta['iv_total_period'])}  **IV sel:** {int(meta['iv_total_sel'])} "
-               f"(**peso sel:** {meta['peso_sel']*100:.2f}%{boot_str})  {dper}  {dsel}\n\n"+("\n".join(bullets) if bullets else "Sem destaques."))
-    texto=_protect_comment_text(texto)
-    with open(path,"w",encoding="utf-8") as f: f.write(texto.strip()+"\n")
-    return path
+        sstar_str = "sem corte" if args.no_sstar else (meta.get('score_cut', 'auto/nd'))
+        print(f"Grupo (score ≥ S*): S* = {sstar_str}")
+    print(f"Período: {args.start} a {args.end}")
+    print(f"α = {args.alpha} | p_BR = {meta['p_br']:.4f}")
+    print(f"IV período (vagas): {iv_total_period} | IV selecionado: {iv_total_sel} | peso: {peso_sel*100:.2f}%")
+    if meta.get('peso_ci'):
+        lo, hi = meta['peso_ci']
+        print(f"IC95% (peso): [{lo*100:.2f}%; {hi*100:.2f}%]")
+    if delta_tmea_period is not None:
+        print(f"ΔTMEA período ≈ {delta_tmea_period} dia(s)")
+    if delta_tmea_sel is not None:
+        print(f"ΔTMEA selecionado ≈ {delta_tmea_sel} dia(s)")
+    if topn_agg:
+        print(f"Top{args.topn}: IV={topn_agg['iv_top']} | peso={topn_agg['peso_top']*100:.2f}% | ΔTMEA≈ {topn_agg['delta_tmea_top'] or 'n/d'} d")
+    if png_top: print(f"PNG Top: {png_top}")
+    if png_cotovelo: print(f"PNG Cotovelo: {png_cotovelo}")
+    if png_tornado: print(f"PNG Tornado: {png_tornado}")
+    if png_strat: print(f"PNG Estratos: {png_strat}")
+    if md_path: print(f"Markdown: {md_path}")
+    if org_path: print(f"ORG (gerado): {org_path}")
+    if final_org: print(f"ORG Final: {final_org}")
+    if pdf_path: print(f"PDF: {pdf_path}")
 
-def exportar_comment_org(comment_text: str, meta: Dict[str, Any]) -> str:
-    fname=f"impacto_fila_{meta['start']}_a_{meta['end']}_comment.org"; path=os.path.join(EXPORT_DIR,fname)
-    lines=[f"* Impacto na Fila — Comentário ({meta['start']} a {meta['end']})","",comment_text.strip()]
-    with open(path,"w",encoding="utf-8") as f: f.write("\n".join(lines)+"\n")
-    return path
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
-
