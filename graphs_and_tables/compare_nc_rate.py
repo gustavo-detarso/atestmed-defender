@@ -643,6 +643,9 @@ def aplicar_cuts_e_topn(df: pd.DataFrame,
 def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in name).strip("_")
 
+def _abbrev(s: str) -> str:
+    return s
+
 def _abbrev(s: str, maxlen: int) -> str:
     s = (str(s) or "").strip()
     return s if len(s) <= maxlen else s[:max(1, maxlen - 1)] + "…"
@@ -803,6 +806,21 @@ def exportar_png(df: pd.DataFrame, meta: Dict[str, Any],
     print(f"✅ PNG salvo em: {path}")
     return path
 
+def _stem_from_meta(meta: Dict[str, Any]) -> str:
+    """Base do nome de arquivo (igual à imagem) para gerar o sidecar de comentário."""
+    safe = _safe_name(meta['safe_stub'])
+    return "motivos_top10_vs_brasil" if meta['mode'] == 'top10' else f"motivos_perito_vs_brasil_{safe}"
+
+def _export_comment_sidecar_org(meta: Dict[str, Any], text: Optional[str]) -> Optional[str]:
+    """Grava graphs_and_tables/exports/<stem>_comment.org com o parágrafo interpretativo."""
+    if not text:
+        return None
+    stem = _stem_from_meta(meta)
+    path = os.path.join(EXPORT_DIR, f"{stem}_comment.org")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.strip() + "\n")
+    print(f"📝 Comentário(ORG) salvo em: {path}")
+    return path
 
 def _plotext_multi_bar(x_labels, series_list, labels):
     """Compat: usa multiple_bar (novo) ou multi_bar (antigo); fallback em p.bar."""
@@ -844,6 +862,7 @@ def exibir_chart_ascii(df: pd.DataFrame, meta: Dict[str, Any], label_maxlen: int
 
 # ──────────────────────────────────────────────────────────────────────
 # Comentários (MD retrocompat + geração para ORG)
+#   → PRIORIDADE: API direta por valores → utils.comentarios → heurístico
 # ──────────────────────────────────────────────────────────────────────
 
 def _build_payload_motivos_for_gpt(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -877,8 +896,9 @@ def _build_payload_motivos_for_gpt(df: pd.DataFrame, meta: Dict[str, Any], cuts:
     return payload
 
 
-def exportar_comment(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict[str, Any]] = None) -> str:
-    """Retrocompat: gera comentário separado em Markdown."""
+def exportar_comment(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict[str, Any]] = None,
+                     model: str = "gpt-4o-mini", max_words: int = 180, temperature: float = 0.2) -> str:
+    """Retrocompat: gera comentário separado em Markdown, priorizando VALORES (API) e com fallbacks."""
     safe = _safe_name(meta['safe_stub'])
     fname = "motivos_top10_vs_brasil_comment.md" if meta['mode']=='top10' else f"motivos_perito_vs_brasil_{safe}_comment.md"
     path = os.path.join(EXPORT_DIR, fname)
@@ -893,15 +913,25 @@ def exportar_comment(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict
         print(f"⚠️ Comentário salvo (sem dados) em: {path}")
         return path
 
-    texto: str = ""
-    if _COMENT_FUNC is not None:
+    # 1) API direta (VALORES)
+    texto = None
+    try:
+        _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
+        texto = gerar_comentario_gpt(df, meta, cuts, model=model, max_words=max_words, temperature=temperature)
+    except Exception:
+        texto = None
+
+    # 2) utils.comentarios (fallback)
+    if (not texto) and (_COMENT_FUNC is not None):
         payload = _build_payload_motivos_for_gpt(df, meta, cuts)
         try:
             bruto = _COMENT_FUNC(payload, call_api=True)  # string
             texto = bruto if isinstance(bruto, str) else str(bruto)
         except Exception as e:
             print(f"⚠️ Falha ao gerar comentário via utils.comentarios: {e}")
+            texto = None
 
+    # 3) heurístico local
     if not texto:
         diffs = [(float(r['pct_perito']) - float(r['pct_brasil']), r) for _, r in df.iterrows()]
         diffs_sorted = sorted(diffs, key=lambda x: abs(x[0]), reverse=True)[:3]
@@ -933,23 +963,28 @@ def _gerar_texto_comentario_para_org(
     max_words: int,
     temperature: float
 ) -> str:
-    """Gera texto corrido para inserir no .org (utils → API → fallback)."""
-    # 1) utils.comentarios
+    """Gera texto corrido para inserir no .org
+       PRIORIDADE: API por valores → utils.comentarios → heurístico."""
     texto = None
-    if _COMENT_FUNC is not None and not df.empty:
+
+    # 1) API direta (valores)
+    if not df.empty:
+        try:
+            _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
+            texto = gerar_comentario_gpt(df, meta, cuts, model=model, max_words=max_words, temperature=temperature)
+        except Exception:
+            texto = None
+
+    # 2) utils.comentarios (fallback)
+    if (not texto) and (_COMENT_FUNC is not None) and (not df.empty):
         try:
             payload = _build_payload_motivos_for_gpt(df, meta, cuts)
             bruto = _COMENT_FUNC(payload, call_api=True)
             texto = bruto if isinstance(bruto, str) else str(bruto)
         except Exception:
             texto = None
-    # 2) API direta
-    if (not texto) and (not df.empty):
-        try:
-            texto = gerar_comentario_gpt(df, meta, cuts, model=model, max_words=max_words, temperature=temperature)
-        except Exception:
-            texto = None
-    # 3) fallback
+
+    # 3) heurístico local
     if not texto:
         if df.empty:
             texto = (f"Sem dados de não conformidade suficientes no período "
@@ -967,6 +1002,7 @@ def _gerar_texto_comentario_para_org(
                 partes.append("Maiores diferenças em: " + "; ".join(destaques) + ".")
             partes.append("Percentuais referem-se à distribuição interna dos NC em cada grupo.")
             texto = " ".join(partes)
+
     return _protect_comment_text(texto or "", word_cap=max_words + 40)
 
 
@@ -1078,7 +1114,7 @@ def main() -> None:
     if args.export_png or args.export_org or args.export_comment_org or args.add_comments:
         png_path = exportar_png(df, meta, label_maxlen=args.label_maxlen, label_fontsize=args.label_fontsize)
 
-    # Comentário a ser inserido no .org
+    # Comentário a ser inserido no .org (valores → utils → heurístico)
     comment_for_org = None
     if args.export_comment_org or args.add_comments:
         comment_for_org = _gerar_texto_comentario_para_org(
@@ -1089,10 +1125,12 @@ def main() -> None:
         exportar_md(df, meta, cuts_info)
 
     if args.export_comment:
-        exportar_comment(df, meta, cuts_info)  # MD retrocompat
+        exportar_comment(df, meta, cuts_info, model=args.model, max_words=args.max_words, temperature=args.temperature)
 
     if args.export_org or args.export_comment_org or args.add_comments:
         exportar_org(df, meta, cuts_info, png_path, comment_text=comment_for_org)
+        # sidecar .org para o coletor
+        _export_comment_sidecar_org(meta, comment_for_org)
 
     if args.chart:
         exibir_chart_ascii(df, meta, label_maxlen=args.label_maxlen)

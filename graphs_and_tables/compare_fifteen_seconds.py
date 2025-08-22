@@ -64,7 +64,7 @@ except Exception as e:
 
 from pathlib import Path
 
-# Preferência: usar utils/comentarios.comentar_le15s se existir
+# Preferência: usar utils/comentarios.comentar_le15s se existir (fallback caso não haja API direta)
 _COMENT_FUNCS: List[Callable[..., Any]] = []
 try:
     # Assinatura moderna preferida:
@@ -73,7 +73,6 @@ try:
     _COMENT_FUNCS.append(_cf_le15s)
 except Exception:
     pass
-# (Sem problemas se não existir; o fallback local cobre.)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Paths
@@ -82,6 +81,158 @@ BASE_DIR   = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DB_PATH    = os.path.join(BASE_DIR, 'db', 'atestmed.db')
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# OpenAI helpers (API direta por VALORES)
+# ────────────────────────────────────────────────────────────────────────────────
+def _load_openai_key_from_dotenv(env_path: str) -> Optional[str]:
+    """Carrega OPENAI_API_KEY do .env (python-dotenv se disponível; senão parse manual)."""
+    if not os.path.exists(env_path):
+        return os.getenv("OPENAI_API_KEY")
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv(env_path, override=False)
+        if os.getenv("OPENAI_API_KEY"):
+            return os.getenv("OPENAI_API_KEY")
+    except Exception:
+        pass
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == "OPENAI_API_KEY":
+                    v = v.strip().strip('"').strip("'")
+                    if v:
+                        os.environ.setdefault("OPENAI_API_KEY", v)
+                        return v
+    except Exception:
+        pass
+    return os.getenv("OPENAI_API_KEY")
+
+def _call_openai_chat(messages: List[Dict[str, str]], model: str, temperature: float) -> Optional[str]:
+    """Compat com SDK novo (openai>=1.x) e legado."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI  # type: ignore
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
+        txt = (resp.choices[0].message.content or "").strip()
+        if txt:
+            return txt
+    except Exception:
+        pass
+    try:
+        import openai  # type: ignore
+        openai.api_key = api_key
+        resp = openai.ChatCompletion.create(model=model, messages=messages, temperature=temperature)
+        txt = resp["choices"][0]["message"]["content"]
+        if txt:
+            return txt.strip()
+    except Exception:
+        pass
+    return None
+
+def _sanitize_paragraph(text: str, max_words: int = 180) -> str:
+    """Limpa cercas, cabeçalhos, tabelas e compacta em um parágrafo com limite de palavras."""
+    if not text:
+        return ""
+    text = re.sub(r"^```.*?$", "", text, flags=re.M)
+    text = re.sub(r"^~~~.*?$", "", text, flags=re.M)
+    kept = []
+    for ln in text.splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        if t.startswith("[") and t.endswith("]"):
+            continue
+        if t.startswith("|"):
+            continue
+        if t.startswith("#+"):
+            continue
+        kept.append(ln)
+    text = " ".join(" ".join(kept).split())
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[:max_words]).rstrip() + "…"
+    return text
+
+def _build_leq_messages(start: str, end: str,
+                        lhs_label: str, rhs_label: str,
+                        lhs_leq: int, lhs_tot: int, lhs_pct: float,
+                        rhs_leq: int, rhs_tot: int, rhs_pct: float,
+                        threshold: int, cut_n: int,
+                        max_words: int) -> List[Dict[str, str]]:
+    payload = {
+        "periodo": {"inicio": start, "fim": end},
+        "metric": "share_pericias_leq_threshold",
+        "threshold_s": threshold,
+        "cut_n_per_perito": cut_n,
+        "lhs": {"label": lhs_label, "leq": lhs_leq, "tot": lhs_tot, "pct": round(float(lhs_pct), 2)},
+        "rhs": {"label": rhs_label, "leq": rhs_leq, "tot": rhs_tot, "pct": round(float(rhs_pct), 2)},
+        "diff_pp": round(float(lhs_pct - rhs_pct), 2)
+    }
+    system = "Você é um analista de dados do ATESTMED. Escreva comentários claros, objetivos e tecnicamente corretos."
+    user = (
+        "Escreva um único parágrafo (máx. {mw} palavras) interpretando a comparação do % de perícias ≤ threshold "
+        "entre dois grupos, considerando que o numerador inclui apenas peritos com pelo menos 'cut_n' tarefas ≤ threshold. "
+        "Inclua: (1) leitura direta; (2) diferença em pontos percentuais; (3) os denominadores e a regra do corte; "
+        "(4) ressalva de análise descritiva sem causalidade. Dados em JSON:\n\n{json}"
+    ).format(mw=max_words, json=json.dumps(payload, ensure_ascii=False))
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+def _heuristic_comment_leq(start: str, end: str,
+                           lhs_label: str, lhs_leq: int, lhs_tot: int, lhs_pct: float,
+                           rhs_label: str, rhs_leq: int, rhs_tot: int, rhs_pct: float,
+                           threshold: int, cut_n: int, max_words: int = 180) -> str:
+    diff = lhs_pct - rhs_pct
+    small_l = lhs_tot < 50
+    small_r = rhs_tot < 50
+    alerta = []
+    if small_l: alerta.append(f"{lhs_label.lower()} com amostra reduzida")
+    if small_r: alerta.append(f"{rhs_label.lower()} com amostra reduzida")
+    alerta_txt = f" Atenção: {', '.join(alerta)}." if alerta else ""
+    txt = (
+        f"No período {start} a {end}, considerando o limiar de ≤{threshold}s e o corte por perito "
+        f"(apenas profissionais com ≥{cut_n} tarefas ≤{threshold}s entram no numerador), "
+        f"{lhs_label} registrou {lhs_pct:.1f}% ({lhs_leq}/{lhs_tot}), enquanto {rhs_label} apresentou "
+        f"{rhs_pct:.1f}% ({rhs_leq}/{rhs_tot}), diferença de {abs(diff):.1f} p.p. "
+        f"Os percentuais refletem a participação relativa de tarefas muito curtas entre os elegíveis e podem "
+        f"variar com o mix de casos e horários de pico; resultados são descritivos e não implicam causalidade."
+        f"{alerta_txt}"
+    )
+    return _sanitize_paragraph(txt, max_words=max_words)
+
+def _comment_from_values_leq(start: str, end: str,
+                             lhs_label: str, lhs_leq: int, lhs_tot: int, lhs_pct: float,
+                             rhs_label: str, rhs_leq: int, rhs_tot: int, rhs_pct: float,
+                             threshold: int, cut_n: int,
+                             *, call_api: bool, model: str, max_words: int, temperature: float) -> str:
+    """Gera comentário exclusivamente a partir dos VALORES (API direta → heurístico)."""
+    if call_api:
+        try:
+            _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
+            messages = _build_leq_messages(
+                start, end, lhs_label, rhs_label,
+                lhs_leq, lhs_tot, lhs_pct,
+                rhs_leq, rhs_tot, rhs_pct,
+                threshold, cut_n, max_words
+            )
+            api_txt = _call_openai_chat(messages, model=model, temperature=temperature)
+            if api_txt:
+                return _sanitize_paragraph(api_txt, max_words=max_words)
+        except Exception:
+            pass
+    return _heuristic_comment_leq(
+        start, end,
+        lhs_label, lhs_leq, lhs_tot, lhs_pct,
+        rhs_label, rhs_leq, rhs_tot, rhs_pct,
+        threshold, cut_n, max_words=max_words
+    )
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Import helpers (usa parse_durations do módulo que funcionou)
@@ -346,7 +497,7 @@ def export_org(path_png: Optional[str],
     return out_path
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Comentário (.org) — integra utils/comentarios (se existir) + fallback local
+# Comentário (.org) — novo fluxo por VALORES + compat utils.comentarios
 # ────────────────────────────────────────────────────────────────────────────────
 def _md_table_leq(lhs_label: str, rhs_label: str,
                   lhs_leq: int, lhs_tot: int, lhs_pct: float,
@@ -374,112 +525,10 @@ def _build_ascii_for_comment(lhs_label: str, rhs_label: str, lhs_pct: float, rhs
     except Exception:
         return ""
 
-def _strip_markers(text: str) -> str:
-    if not text:
-        return ""
-    text = re.sub(r"^```.*?$", "", text, flags=re.M)
-    text = re.sub(r"^~~~.*?$", "", text, flags=re.M)
-    kept = []
-    for ln in text.splitlines():
-        t = ln.strip()
-        if not t:
-            continue
-        if t.startswith("[") and t.endswith("]"):
-            continue
-        if t.startswith("|"):
-            continue
-        if t.startswith("#+"):
-            continue
-        kept.append(ln)
-    return "\n".join(kept).strip()
-
-def _to_one_paragraph(text: str) -> str:
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\s*\n\s*", " ", text)
-    return re.sub(r"\s{2,}", " ", text).strip()
-
-def _cap_words(text: str, max_words: int = 180) -> str:
-    ws = text.split()
-    return " ".join(ws[:max_words]).rstrip() + ("…" if len(ws) > max_words else "")
-
-def _fallback_prompt_le15s(start: str, end: str,
-                           lhs_label: str, lhs_leq: int, lhs_tot: int, lhs_pct: float,
-                           rhs_label: str, rhs_leq: int, rhs_tot: int, rhs_pct: float,
-                           threshold: int, cut_n: int) -> str:
-    dpp = lhs_pct - rhs_pct
-    alert_l = (lhs_tot < 50)
-    alert_r = (rhs_tot < 50)
-    alert_txt = []
-    if alert_l: alert_txt.append(f"{lhs_label.lower()} com amostra reduzida")
-    if alert_r: alert_txt.append(f"{rhs_label.lower()} com amostra reduzida")
-    alerta = f" Atenção: {', '.join(alert_txt)}." if alert_txt else ""
-    return (
-        f"No período {start} a {end}, considerando o limiar de ≤{threshold}s e o corte por perito "
-        f"(apenas profissionais com ≥{cut_n} tarefas ≤{threshold}s entram no numerador), "
-        f"{lhs_label} registrou {lhs_pct:.1f}% ({lhs_leq}/{lhs_tot}), enquanto {rhs_label} apresentou "
-        f"{rhs_pct:.1f}% ({rhs_leq}/{rhs_tot}), diferença de {abs(dpp):.1f} p.p. "
-        f"Os percentuais refletem a participação relativa de tarefas muito curtas entre os elegíveis e podem "
-        f"variar com o mix de casos e horários de pico; recomenda-se revisar a distribuição de durações e a "
-        f"consistência de registros.{alerta}"
-    )
-
-def _generate_comment_text(md_table: str, ascii_chart: str, start: str, end: str,
-                           threshold: int, cut_n: int, call_api: bool) -> str:
-    """
-    Tenta usar utils.comentarios.comentar_le15s em diferentes assinaturas; se não der, gera texto local.
-    """
-    for fn in _COMENT_FUNCS:
-        # Assinatura preferida
-        try:
-            out = fn(md_table, ascii_chart, start, end, threshold, cut_n, call_api=call_api)  # type: ignore
-            if isinstance(out, dict):
-                text = (out.get("comment") or out.get("prompt") or "").strip()
-            else:
-                text = str(out or "").strip()
-            if text:
-                return _cap_words(_to_one_paragraph(_strip_markers(text)))
-        except TypeError:
-            # Assinatura antiga (por .org inteiro ou sem threshold/cut_n)
-            try:
-                out = fn(md_table, ascii_chart, start, end, call_api=call_api)  # type: ignore
-                text = (out.get("comment") if isinstance(out, dict) else str(out)).strip()
-                if text:
-                    return _cap_words(_to_one_paragraph(_strip_markers(text)))
-            except Exception:
-                try:
-                    out = fn(md_table, call_api=call_api)  # type: ignore
-                    text = (out.get("comment") if isinstance(out, dict) else str(out)).strip()
-                    if text:
-                        return _cap_words(_to_one_paragraph(_strip_markers(text)))
-                except Exception:
-                    pass
-        except Exception:
-            continue
-
-    # Fallback local (texto final, não apenas prompt)
-    try:
-        lines = [ln for ln in md_table.splitlines() if ln.strip().startswith("|")]
-        def parse_row(s: str):
-            c = [x.strip() for x in s.strip("|").split("|")]
-            return c[0], int(float(c[1])), int(float(c[2])), float(c[3].replace("%","").strip())
-        left_label, left_leq, left_tot, left_pct = parse_row(lines[2])
-        right_label, right_leq, right_tot, right_pct = parse_row(lines[3])
-        return _cap_words(_to_one_paragraph(_fallback_prompt_le15s(
-            start, end, left_label, left_leq, left_tot, left_pct,
-            right_label, right_leq, right_tot, right_pct,
-            threshold, cut_n
-        )))
-    except Exception:
-        # fallback mínimo
-        return _cap_words(_to_one_paragraph(
-            f"No período {start} a {end}, compara-se o % de perícias ≤{threshold}s com corte por perito (≥{cut_n})."
-        ))
-
 def _export_comment_org(title: str, start: str, end: str,
                         md_table: str, ascii_chart: str,
                         threshold: int, cut_n: int,
-                        stem: str, call_api: bool) -> str:
-    comment_text = _generate_comment_text(md_table, ascii_chart, start, end, threshold, cut_n, call_api)
+                        stem: str, comment_text: str) -> str:
     out = os.path.join(EXPORT_DIR, f"{stem}_comment.org")
     lines = []
     lines.append(f"* Comentário – {title}")
@@ -501,7 +550,7 @@ def _export_comment_org(title: str, start: str, end: str,
         lines.append("#+END_EXAMPLE\n")
 
     lines.append("** Texto")
-    lines.append(comment_text.strip() or "(sem comentário)")
+    lines.append((comment_text or "(sem comentário)").strip())
 
     with open(out, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -515,7 +564,8 @@ def run_perito(start: str, end: str, perito: str,
                threshold: int, cut_n: int,
                export_png_flag: bool, export_org_flag: bool,
                export_comment_flag: bool, export_comment_org_flag: bool,
-               call_api: bool, chart: bool) -> None:
+               call_api: bool, chart: bool,
+               model: str, max_words: int, temperature: float) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, _ = _detect_tables(conn)
         df_raw = _load_period_df(conn, tbl, start, end)
@@ -556,26 +606,45 @@ def run_perito(start: str, end: str, perito: str,
                               right_tot, right_leq, right_pct,
                               threshold, cut_n, org_name)
 
-    # Preparar insumos de comentário (uma vez só)
+    # Preparar insumos e gerar comentário **por valores**
+    comment_text = ""
     if export_comment_flag or export_comment_org_flag:
+        # Preferência: API direta (valores) → heurístico
+        _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
+        comment_text = _comment_from_values_leq(
+            start, end,
+            left_label, left_leq, left_tot, left_pct,
+            right_label, right_leq, right_tot, right_pct,
+            threshold, cut_n,
+            call_api=call_api and bool(os.getenv("OPENAI_API_KEY")),
+            model=model, max_words=max_words, temperature=temperature
+        )
+        # Fallback extra: utils.comentarios (se existir) — apenas se vazio por algum motivo
+        if not comment_text.strip() and _COMENT_FUNCS:
+            md_tbl = _md_table_leq(left_label, right_label,
+                                   left_leq, left_tot, left_pct,
+                                   right_leq, right_tot, right_pct, threshold)
+            ascii_chart = _build_ascii_for_comment(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
+            try:
+                out = _COMENT_FUNCS[0](md_tbl, ascii_chart, start, end, threshold, cut_n, call_api=call_api)  # type: ignore
+                comment_text = (out.get("comment") if isinstance(out, dict) else str(out)).strip()
+            except Exception:
+                pass
+
+    # Exportações de comentário
+    if export_comment_flag:
         md_tbl = _md_table_leq(left_label, right_label,
                                left_leq, left_tot, left_pct,
-                               right_leq, right_tot, right_pct,
-                               threshold)
-        ascii_chart = _build_ascii_for_comment(left_label, right_label, left_pct, right_pct,
-                                               threshold, cut_n, title)
+                               right_leq, right_tot, right_pct, threshold)
+        ascii_chart = _build_ascii_for_comment(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
         stem = f"compare_{threshold}s_{safe}"
-        comment_text = _generate_comment_text(md_tbl, ascii_chart, start, end, threshold, cut_n, call_api)
+        _export_comment_org(title, start, end, md_tbl, ascii_chart, threshold, cut_n, stem, comment_text)
 
-        if export_comment_flag:
-            _export_comment_org(title, start, end, md_tbl, ascii_chart, threshold, cut_n, stem,
-                                call_api=call_api)
-
-        if export_comment_org_flag:
-            with open(org_path, "a", encoding="utf-8") as f:
-                f.write("\n** Comentário\n")
-                f.write(comment_text.strip() + "\n")
-            print(f"✅ Comentário incorporado ao ORG: {org_path}")
+    if export_comment_org_flag:
+        with open(org_path, "a", encoding="utf-8") as f:
+            f.write("\n** Comentário\n")
+            f.write((comment_text or "(sem comentário)").strip() + "\n")
+        print(f"✅ Comentário incorporado ao ORG: {org_path}")
 
     if chart:
         render_ascii(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
@@ -584,7 +653,8 @@ def run_top10(start: str, end: str, min_analises: int,
               threshold: int, cut_n: int,
               export_png_flag: bool, export_org_flag: bool,
               export_comment_flag: bool, export_comment_org_flag: bool,
-              call_api: bool, chart: bool) -> None:
+              call_api: bool, chart: bool,
+              model: str, max_words: int, temperature: float) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, has_ind = _detect_tables(conn)
         if not has_ind:
@@ -630,25 +700,44 @@ def run_top10(start: str, end: str, min_analises: int,
                               right_tot, right_leq, right_pct,
                               threshold, cut_n, org_name)
 
+    # Comentário por VALORES (preferido)
+    comment_text = ""
     if export_comment_flag or export_comment_org_flag:
+        _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
+        comment_text = _comment_from_values_leq(
+            start, end,
+            left_label, left_leq, left_tot, left_pct,
+            right_label, right_leq, right_tot, right_pct,
+            threshold, cut_n,
+            call_api=call_api and bool(os.getenv("OPENAI_API_KEY")),
+            model=model, max_words=max_words, temperature=temperature
+        )
+        # Fallback extra: utils.comentarios (se vazio)
+        if not comment_text.strip() and _COMENT_FUNCS:
+            md_tbl = _md_table_leq(left_label, right_label,
+                                   left_leq, left_tot, left_pct,
+                                   right_leq, right_tot, right_pct, threshold)
+            ascii_chart = _build_ascii_for_comment(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
+            try:
+                out = _COMENT_FUNCS[0](md_tbl, ascii_chart, start, end, threshold, cut_n, call_api=call_api)  # type: ignore
+                comment_text = (out.get("comment") if isinstance(out, dict) else str(out)).strip()
+            except Exception:
+                pass
+
+    if export_comment_flag:
         md_tbl = _md_table_leq(left_label, right_label,
                                left_leq, left_tot, left_pct,
-                               right_leq, right_tot, right_pct,
-                               threshold)
+                               right_leq, right_tot, right_pct, threshold)
         ascii_chart = _build_ascii_for_comment(left_label, right_label, left_pct, right_pct,
                                                threshold, cut_n, title)
         stem = f"compare_{threshold}s_top10"
-        comment_text = _generate_comment_text(md_tbl, ascii_chart, start, end, threshold, cut_n, call_api)
+        _export_comment_org(title, start, end, md_tbl, ascii_chart, threshold, cut_n, stem, comment_text)
 
-        if export_comment_flag:
-            _export_comment_org(title, start, end, md_tbl, ascii_chart, threshold, cut_n, stem,
-                                call_api=call_api)
-
-        if export_comment_org_flag:
-            with open(org_path, "a", encoding="utf-8") as f:
-                f.write("\n** Comentário\n")
-                f.write(comment_text.strip() + "\n")
-            print(f"✅ Comentário incorporado ao ORG: {org_path}")
+    if export_comment_org_flag:
+        with open(org_path, "a", encoding="utf-8") as f:
+            f.write("\n** Comentário\n")
+            f.write((comment_text or "(sem comentário)").strip() + "\n")
+        print(f"✅ Comentário incorporado ao ORG: {org_path}")
 
     if chart:
         render_ascii(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
@@ -676,8 +765,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--export-org',           action='store_true')
     ap.add_argument('--export-comment',       action='store_true', help='Gera *_comment.org com texto corrido (IA ou fallback local)')
     ap.add_argument('--export-comment-org',   action='store_true', help='Incorpora o comentário automaticamente no arquivo .org principal')
-    ap.add_argument('--call-api',             action='store_true', help='Chama a API (utils.comentarios) para obter o texto final do comentário (requer OPENAI_API_KEY)')
+    ap.add_argument('--call-api',             action='store_true', help='Chama a API (utils.comentarios / OpenAI) para obter o texto final do comentário (requer OPENAI_API_KEY)')
     ap.add_argument('--chart',                action='store_true', help='Gráfico ASCII no terminal')
+
+    # GPT (opcionais, com defaults sensatos)
+    ap.add_argument('--model',       default='gpt-4o-mini', help='Modelo ChatGPT (padrão: gpt-4o-mini)')
+    ap.add_argument('--max-words',   type=int, default=180, help='Máx. de palavras do comentário (padrão: 180)')
+    ap.add_argument('--temperature', type=float, default=0.2, help='Temperatura da geração (padrão: 0.2)')
 
     return ap.parse_args()
 
@@ -692,13 +786,15 @@ def main() -> None:
                   args.threshold, args.cut_n,
                   args.export_png, args.export_org,
                   args.export_comment, args.export_comment_org,
-                  call_api, args.chart)
+                  call_api, args.chart,
+                  args.model, args.max_words, args.temperature)
     else:
         run_perito(args.start, args.end, args.perito,
                    args.threshold, args.cut_n,
                    args.export_png, args.export_org,
                    args.export_comment, args.export_comment_org,
-                   call_api, args.chart)
+                   call_api, args.chart,
+                   args.model, args.max_words, args.temperature)
 
 if __name__ == "__main__":
     main()

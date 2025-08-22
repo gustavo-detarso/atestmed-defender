@@ -1642,11 +1642,6 @@ def gerar_org_perito(perito, start, end, add_comments, imgs_dir, comments_dir, o
 
         lines.append("\n#+LATEX: \\newpage\n")
 
-    # Protocolos transferidos: este perito
-    _append_protocol_transfers_perito_block_if_any(
-        lines, perito, start, end, relatorio_dir=output_dir, heading_level="***"
-    )
-
     # Apêndice: Protocolos NC por motivo
     apdf = gerar_apendice_nc(perito, start, end)
     if not apdf.empty:
@@ -2018,171 +2013,6 @@ def _mover_markdowns_de_exports(markdown_dir: str) -> int:
         print(f"[INFO] Markdowns movidos para '{markdown_dir}': {moved} arquivo(s).")
     return moved
 
-
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Protocolos transferidos (mesmo protocolo analisado por >1 perito)
-# ────────────────────────────────────────────────────────────────────────────────
-
-_PROTO_TRANSFER_CACHE = {}
-
-def _find_protocol_transfers(start: str, end: str) -> "pd.DataFrame":
-    """
-    Retorna um DataFrame com protocolos analisados por >1 perito no período.
-    Colunas: protocolo, perito, ini, fim
-    """
-    key = (start, end)
-    if key in _PROTO_TRANSFER_CACHE:
-        # retorna uma cópia defensiva
-        return _PROTO_TRANSFER_CACHE[key].copy()
-
-    import pandas as pd  # já importado globalmente, mas garante no escopo
-
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        end_col = _detect_end_datetime_column(conn)
-        fim_expr = f"a.{end_col}" if end_col else "NULL"
-        sql = f"""
-            WITH per_protocol AS (
-               SELECT a.protocolo      AS protocolo,
-                      p.nomePerito     AS perito,
-                      a.dataHoraIniPericia AS ini,
-                      {fim_expr}       AS fim
-                 FROM analises a
-                 JOIN peritos p ON p.siapePerito = a.siapePerito
-                WHERE date(a.dataHoraIniPericia) BETWEEN ? AND ?
-            ),
-            prot_multi AS (
-               SELECT protocolo
-                 FROM per_protocol
-             GROUP BY protocolo
-               HAVING COUNT(DISTINCT perito) > 1
-            )
-            SELECT pp.protocolo, pp.perito, pp.ini, pp.fim
-              FROM per_protocol pp
-              JOIN prot_multi m USING (protocolo)
-             ORDER BY pp.protocolo, pp.ini
-        """
-        df = pd.read_sql(sql, conn, params=(start, end))
-    finally:
-        conn.close()
-
-    # normalização de tipos (para ordenação e resumo)
-    if not df.empty:
-        df["ini"] = pd.to_datetime(df["ini"], errors="coerce")
-        if "fim" in df.columns:
-            df["fim"] = pd.to_datetime(df["fim"], errors="coerce")
-
-    _PROTO_TRANSFER_CACHE[key] = df.copy()
-    return df
-
-def _summarize_protocol_transfers(df: "pd.DataFrame") -> "pd.DataFrame":
-    """
-    Resume por protocolo: cadeia de peritos (ordem cronológica), nº de trocas,
-    primeiro início e último fim.
-    """
-    import pandas as pd
-    if df.empty:
-        return pd.DataFrame(columns=["protocolo","peritos_env","trocas","primeiro_ini","ultimo_fim"])
-
-    df = df.sort_values(["protocolo","ini"])
-    def chain(series):
-        seen = []
-        for x in series:
-            if len(seen)==0 or seen[-1] != x:
-                seen.append(x)
-        return " → ".join(seen)
-
-    def swaps(series):
-        uniq = []
-        for x in series:
-            if len(uniq)==0 or uniq[-1] != x:
-                uniq.append(x)
-        return max(len(uniq)-1, 1)
-
-    g = df.groupby("protocolo", as_index=False).agg(
-        peritos_env = ("perito", chain),
-        trocas      = ("perito", swaps),
-        primeiro_ini= ("ini", "min"),
-        ultimo_fim  = ("fim", "max"),
-    )
-    # formata datas para string curta
-    g["primeiro_ini"] = g["primeiro_ini"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
-    g["ultimo_fim"]   = g["ultimo_fim"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
-    return g
-
-def _csv_write(df: "pd.DataFrame", path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_csv(path, index=False, encoding="utf-8")
-
-def _df_to_org_table(df: "pd.DataFrame", headers: list[str]) -> str:
-    """Converte DataFrame para tabela Org simples com cabeçalho informado."""
-    lines = []
-    lines.append("| " + " | ".join(headers) + " |")
-    lines.append("|" + "|".join("---" for _ in headers) + "|")
-    for _, row in df.iterrows():
-        vals = [str(row.get(h, "")) for h in headers]
-        lines.append("| " + " | ".join(vals) + " |")
-    return "\n".join(lines)
-
-def _append_protocol_transfers_group_block(lines: list[str], relatorio_dir: str, start: str, end: str, heading_level: str = "**") -> bool:
-    """
-    Acrescenta seção 'Protocolos transferidos' ao relatório (grupo).
-    Salva CSV completo em relatorio_dir.
-    """
-    import pandas as pd
-    df = _find_protocol_transfers(start, end)
-    lines.append("")
-    lines.append(f"{heading_level} Protocolos transferidos (mesmo protocolo analisado por >1 perito)")
-    lines.append("Critério: mesmo identificador de protocolo com participação de dois ou mais peritos distintos. Indicador complementar (não pontuado).")
-
-    if df.empty:
-        lines.append(f"\nNão foram identificados protocolos com troca de perito no período {start} a {end}.\n")
-        return False
-
-    summary = _summarize_protocol_transfers(df)
-    csv_path = os.path.join(relatorio_dir, f"protocolos_transferidos_{start}_a_{end}.csv")
-    _csv_write(summary, csv_path)
-
-    # Tabela enxuta no corpo do relatório
-    headers = ["protocolo","peritos_env","trocas","primeiro_ini","ultimo_fim"]
-    table = _df_to_org_table(summary, headers)
-    lines.append("")
-    lines.append("#+ATTR_LATEX: :environment longtable :align l l c l l")
-    lines.append(table)
-    lines.append("")
-    lines.append(f"Arquivo completo: [[file:{os.path.basename(csv_path)}]]")
-    lines.append("")
-    lines.append("_Nota:_ Transferência pode ocorrer por reanálise, redistribuição de carga ou outros motivos operacionais; não implica, por si só, irregularidade.")
-    lines.append("")
-    return True
-
-def _append_protocol_transfers_perito_block_if_any(lines: list[str], perito: str, start: str, end: str, relatorio_dir: str, heading_level: str = "***") -> bool:
-    """
-    Acrescenta mini-bloco para o perito com a lista de protocolos transferidos em que ele aparece.
-    """
-    df = _find_protocol_transfers(start, end)
-    if df.empty:
-        # Se inexistem no período, opcionalmente diga explicitamente.
-        lines.append(f"{heading_level} Protocolos transferidos (este perito)")
-        lines.append(f"Não foram identificados protocolos transferidos envolvendo este perito no período {start} a {end}.\n")
-        return False
-
-    mask = df["perito"].astype(str).str.strip().str.casefold() == str(perito).strip().casefold()
-    protos = sorted(df.loc[mask, "protocolo"].astype(str).unique().tolist())
-    lines.append(f"{heading_level} Protocolos transferidos (este perito)")
-    if not protos:
-        lines.append(f"**Protocolos transferidos:** este perito não participou de protocolos transferidos no período.")
-        lines.append("")
-        return False
-
-    # menciona também o CSV do grupo, se existir/gerado
-    csv_name = f"protocolos_transferidos_{start}_a_{end}.csv"
-    csv_path = os.path.join(relatorio_dir, csv_name)
-    hint = f"  (ver [[file:{csv_name}]] para detalhes)" if os.path.exists(csv_path) else ""
-    lines.append(f"**Protocolos transferidos que envolvem este perito ({len(protos)}):** {', '.join(protos)}{hint}")
-    lines.append("")
-    return True
 def main():
     """
     Orquestração principal:
@@ -2475,13 +2305,7 @@ def main():
                             lines.append(content)
                             lines.append("#+LATEX: \\newpage\n")
 
-            # Protocolos transferidos (grupo)
-            _append_protocol_transfers_group_block(
-                lines, RELATORIO_DIR, args.start, args.end, heading_level="**"
-            )
-
             # Panorama global (W→WE) AO FINAL do Top10
-
             _append_weekday2weekend_panorama_block(
                 lines, IMGS_DIR, COMMENTS_DIR,
                 start=args.start, end=args.end,

@@ -19,6 +19,151 @@ suppressPackageStartupMessages({
   library(ggplot2); library(scales); library(stringr)
 })
 
+# ==== ATESTMED PROLOGO (INICIO) ====
+local({
+  .am_loaded <- FALSE
+  for (pp in c("r_checks/_common.R","./_common.R","../r_checks/_common.R")) {
+    if (file.exists(pp)) { source(pp, local=TRUE); .am_loaded <- TRUE; break }
+  }
+  if (!.am_loaded) message("[prolog] _common.R não encontrado — usando fallbacks internos.")
+
+  `%||%` <- function(a,b) if (is.null(a)) b else a
+
+  # ---- Fallbacks essenciais (se _common.R não definiu) ----
+  if (!exists("am_normalize_cli", mode="function", inherits=TRUE)) {
+    am_normalize_cli <<- function(x) as.character(x)
+  }
+  if (!exists("am_parse_args", mode="function", inherits=TRUE)) {
+    am_parse_args <<- function() {
+      a <- am_normalize_cli(commandArgs(trailingOnly=TRUE))
+      kv <- list(); i <- 1L; n <- length(a)
+      while (i <= n) {
+        k <- a[[i]]
+        if (startsWith(k, "--")) {
+          v <- if (i+1L <= n && !startsWith(a[[i+1L]], "--")) a[[i+1L]] else TRUE
+          kv[[sub("^--","",k)]] <- v
+          i <- i + (if (identical(v, TRUE)) 1L else 2L)
+        } else i <- i + 1L
+      }
+      kv
+    }
+  }
+  if (!exists("am_open_db", mode="function", inherits=TRUE)) {
+    am_open_db <<- function(path) {
+      p <- normalizePath(path, mustWork=TRUE)
+      DBI::dbConnect(RSQLite::SQLite(), dbname=p)
+    }
+  }
+  if (!exists("am_resolve_export_dir", mode="function", inherits=TRUE)) {
+    am_resolve_export_dir <<- function(out_dir=NULL) {
+      if (!is.null(out_dir) && nzchar(out_dir)) {
+        od <- normalizePath(out_dir, mustWork=FALSE)
+      } else {
+        dbp <- am_args[["db"]] %||% ""
+        base_dir <- if (nzchar(dbp)) normalizePath(file.path(dirname(dbp), ".."), mustWork=FALSE) else getwd()
+        od <- file.path(base_dir, "graphs_and_tables", "exports")
+      }
+      if (!dir.exists(od)) dir.create(od, recursive=TRUE, showWarnings=FALSE)
+      od
+    }
+  }
+  if (!exists("am_detect_analises_table", mode="function", inherits=TRUE)) {
+    am_detect_analises_table <<- function(con) {
+      has <- function(nm) {
+        nrow(am_dbGetQuery(con,
+          "SELECT 1 FROM sqlite_master WHERE type in ('table','view') AND name=? LIMIT 1",
+          params=list(nm))) > 0
+      }
+      for (t in c("analises","analises_atestmed")) if (has(t)) return(t)
+      stop("Não encontrei 'analises' nem 'analises_atestmed'.")
+    }
+  }
+  if (!exists("am_detect_columns", mode="function", inherits=TRUE)) {
+    am_detect_columns <<- function(con, tbl) {
+      if (is.na(tbl) || !nzchar(tbl)) return(character(0))
+      am_dbGetQuery(con, sprintf("PRAGMA table_info(%s)", tbl))$name
+    }
+  }
+
+  # 1) args → lista nomeada (sem rebind de objetos bloqueados)
+  .raw <- NULL
+  if (exists("args", inherits=TRUE)) {
+    .cand <- get("args", inherits=TRUE)
+    if (!is.function(.cand)) .raw <- .cand
+  }
+  .kv <- tryCatch(am_parse_args(), error=function(e) list())
+  if (is.character(.raw)) {
+    .kv2 <- list(); i <- 1L; n <- length(.raw)
+    while (i <= n) {
+      k <- .raw[[i]]
+      if (startsWith(k, "--")) {
+        v <- if (i+1L <= n && !startsWith(.raw[[i+1L]], "--")) .raw[[i+1L]] else TRUE
+        .kv2[[sub("^--","",k)]] <- v
+        i <- i + (if (identical(v, TRUE)) 1L else 2L)
+      } else i <- i + 1L
+    }
+    if (length(.kv2)) .kv <- utils::modifyList(.kv, .kv2)
+  } else if (is.environment(.raw)) {
+    .kv <- utils::modifyList(.kv, as.list(.raw))
+  } else if (is.list(.raw)) {
+    .kv <- utils::modifyList(.kv, .raw)
+  }
+  am_args <<- .kv
+
+  # 2) Conexão ao DB
+  db_path <- am_args[["db"]]
+  if (is.null(db_path) || !nzchar(db_path)) stop("Faltou --db <path>")
+  con <<- am_open_db(db_path)
+
+  # Fecha TODAS as conexões SQLite ao sair (remove avisos)
+  on.exit({
+    try({
+      if (exists("con", inherits=TRUE)) try(DBI::dbDisconnect(con), silent=TRUE)
+      conns <- try(DBI::dbListConnections(RSQLite::SQLite()), silent=TRUE)
+      if (!inherits(conns, "try-error")) for (cc in conns) try(DBI::dbDisconnect(cc), silent=TRUE)
+    }, silent=TRUE)
+  }, add=TRUE)
+
+  # 3) Paths e schema
+  export_dir <<- am_resolve_export_dir(am_args[["out-dir"]])
+  a_tbl <<- tryCatch(am_detect_analises_table(con), error=function(e) NA_character_)
+  cols  <<- tryCatch(am_detect_columns(con, a_tbl), error=function(e) character(0))
+
+  # 4) Args derivados
+  start_d   <<- am_args[["start"]]
+  end_d     <<- am_args[["end"]]
+  min_n     <<- suppressWarnings(as.integer(am_args[["min-analises"]]))
+  threshold <<- suppressWarnings(as.numeric(am_args[["threshold"]]))
+  measure   <<- as.character(am_args[["measure"]] %||% NA_character_); if (!is.na(measure)) measure <<- measure[[1L]]
+  top10     <<- isTRUE(am_args[["top10"]])
+  perito    <<- as.character(am_args[["perito"]] %||% NA_character_); if (!is.na(perito)) perito <<- perito[[1L]]
+
+  # 5) Wrapper seguro para consultas (evita "Expected string vector of length 1")
+  am_dbGetQuery <<- (function(.f) {
+    force(.f)
+    function(con, statement, ...) {
+      st <- statement
+      if (length(st) != 1L) st <- paste(st, collapse=" ")
+      .f(con, st, ...)
+    }
+  })(DBI::dbGetQuery)
+})
+# ==== ATESTMED PROLOGO (FIM) ====
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ────────────────────────────────────────────────────────────────────────────────
 # CLI
 # ────────────────────────────────────────────────────────────────────────────────
@@ -73,9 +218,9 @@ pick_col <- function(cols, candidates) {
 # Conexão e detecção de colunas
 # ────────────────────────────────────────────────────────────────────────────────
 con <- dbConnect(RSQLite::SQLite(), opt$db)
-on.exit(try(dbDisconnect(con), silent = TRUE))
+# (patched) # (patched) on.exit(try(dbDisconnect(con), silent = TRUE))
 
-cols_ind <- dbGetQuery(con, "PRAGMA table_info(indicadores)")$name
+cols_ind <- am_dbGetQuery(con, "PRAGMA table_info(indicadores)")$name
 png_base <- file.path(export_dir, sprintf("rcheck_kpi_icra_iatd_score_%s.png", safe))
 org_main <- file.path(export_dir, sprintf("rcheck_kpi_icra_iatd_score_%s.org", safe))
 org_comm <- file.path(export_dir, sprintf("rcheck_kpi_icra_iatd_score_%s_comment.org", safe))
@@ -137,7 +282,7 @@ FROM indicadores i
 JOIN peritos p ON i.perito = p.siapePerito
 JOIN ativos  s ON s.siape = i.perito
 "
-resto_df <- dbGetQuery(con, sprintf(sql_ativos, col_icra, col_iatd, col_score),
+resto_df <- am_dbGetQuery(con, sprintf(sql_ativos, col_icra, col_iatd, col_score),
                        params = list(opt$start, opt$end)) %>%
   mutate(across(c(icra,iatd,score), as.numeric))
 
@@ -257,4 +402,3 @@ sum_md <- sprintf(
 )
 writeLines(sum_md, md_out, useBytes = TRUE)
 message(sprintf("📝 Markdown salvo: %s", md_out))
-

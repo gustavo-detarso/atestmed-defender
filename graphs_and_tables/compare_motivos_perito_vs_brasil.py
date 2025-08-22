@@ -47,6 +47,8 @@ python3 graphs_and_tables/compare_nc_rate.py \
 
 import os
 import sys
+import re
+import json
 from typing import Dict, Any, Tuple, Optional, List
 
 # permitir imports de utils/*
@@ -93,18 +95,161 @@ DB_PATH    = os.path.join(BASE_DIR, 'db', 'atestmed.db')
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# Integração com comentários (GPT)
+# Integração com comentários (GPT) — compat legado
 _COMENT_FUNC = None
 try:
-    # novo nome (preferido)
-    from utils.comentarios import comentar_motivos as _COMENT_FUNC  # type: ignore
+    from utils.comentarios import comentar_motivos as _COMENT_FUNC  # preferido
 except Exception:
     try:
-        # compat antigo
-        from utils.comentarios import comentar_motivos_perito_vs_brasil as _COMENT_FUNC  # type: ignore
+        from utils.comentarios import comentar_motivos_perito_vs_brasil as _COMENT_FUNC  # compat antigo
     except Exception:
         _COMENT_FUNC = None
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Helpers OpenAI (API direta, sem parse de tabela)
+# ────────────────────────────────────────────────────────────────────────────────
+def _load_openai_key_from_dotenv(env_path: str) -> Optional[str]:
+    if not os.path.exists(env_path):
+        return os.getenv("OPENAI_API_KEY")
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv(env_path, override=False)
+        if os.getenv("OPENAI_API_KEY"):
+            return os.getenv("OPENAI_API_KEY")
+    except Exception:
+        pass
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == "OPENAI_API_KEY":
+                    v = v.strip().strip('"').strip("'")
+                    if v:
+                        os.environ.setdefault("OPENAI_API_KEY", v)
+                        return v
+    except Exception:
+        pass
+    return os.getenv("OPENAI_API_KEY")
+
+def _call_openai_chat(messages: List[Dict[str, str]], model: str, temperature: float) -> Optional[str]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    # SDK novo
+    try:
+        from openai import OpenAI  # type: ignore
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
+        txt = (resp.choices[0].message.content or "").strip()
+        if txt:
+            return txt
+    except Exception:
+        pass
+    # SDK legado
+    try:
+        import openai  # type: ignore
+        openai.api_key = api_key
+        resp = openai.ChatCompletion.create(model=model, messages=messages, temperature=temperature)
+        txt = resp["choices"][0]["message"]["content"]
+        if txt:
+            return txt.strip()
+    except Exception:
+        pass
+    return None
+
+def _sanitize_paragraph(text: str, max_words: int = 180) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"^```.*?$", "", text, flags=re.M)
+    text = re.sub(r"^~~~.*?$", "", text, flags=re.M)
+    kept = []
+    for ln in text.splitlines():
+        t = ln.strip()
+        if not t: continue
+        if t.startswith("[") and t.endswith("]"): continue
+        if t.startswith("|"): continue
+        if t.startswith("#+"): continue
+        kept.append(ln)
+    text = " ".join(" ".join(kept).split())
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[:max_words]).rstrip() + "…"
+    return text
+
+def _build_motivos_messages(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any],
+                            max_words: int) -> List[Dict[str, str]]:
+    rows = [
+        {
+            "descricao": str(r["descricao"]),
+            "pct_lhs": float(r["pct_perito"]),
+            "pct_rhs": float(r["pct_brasil"]),
+            "n_lhs": int(r["n_perito"]),
+            "n_rhs": int(r["n_brasil"]),
+            "diff_pp": float(r["pct_perito"] - r["pct_brasil"]),
+        }
+        for _, r in df.iterrows()
+    ]
+    payload = {
+        "periodo": {"inicio": meta["start"], "fim": meta["end"]},
+        "lhs_label": meta["label_lhs"],
+        "rhs_label": meta["label_rhs"],
+        "totais_nc": {"lhs": int(meta["total_p"]), "rhs": int(meta["total_b"])},
+        "taxas_nc": {"lhs": float(meta["nc_rate_p"]), "rhs": float(meta["nc_rate_b"])},
+        "cuts": {k: v for k, v in (cuts or {}).items() if v is not None},
+        "rows": rows,
+        "mode": meta.get("mode", "single"),
+    }
+    system = "Você é um analista de dados do ATESTMED. Escreva comentários claros, objetivos e tecnicamente corretos."
+    user = (
+        "Escreva um único parágrafo (máx. {mw} palavras) interpretando a comparação de motivos de NC "
+        "entre dois grupos. Inclua: (1) leitura direta; (2) 2–3 maiores diferenças em pontos percentuais; "
+        "(3) referência aos denominadores (n) e às taxas de NC gerais; (4) ressalva de que a análise é descritiva. "
+        "Evite jargões e causalidade. Dados em JSON:\n\n{json}"
+    ).format(mw=max_words, json=json.dumps(payload, ensure_ascii=False))
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+def _heuristic_comment_motivos(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any], max_words: int = 180) -> str:
+    if df.empty:
+        return "Sem dados suficientes para um comentário interpretativo."
+    lhs = meta["label_lhs"]; rhs = meta["label_rhs"]
+    ini, fim = meta["start"], meta["end"]
+    # top diferenças absolutas
+    m = df.copy()
+    m["diff"] = (m["pct_perito"] - m["pct_brasil"]).astype(float)
+    m = m.sort_values("diff", key=lambda s: s.abs(), ascending=False)
+    top_pos = m[m["diff"] > 0].head(2)
+    top_neg = m[m["diff"] < 0].head(2)
+    pos_txt = ", ".join(f"{r['descricao']} (+{r['diff']:.1f} p.p.)" for _, r in top_pos.iterrows()) or "—"
+    neg_txt = ", ".join(f"{r['descricao']} ({r['diff']:.1f} p.p.)" for _, r in top_neg.iterrows()) or "—"
+    txt = (
+        f"No período {ini} a {fim}, entre os registros não conformes, {lhs} apresentou distribuição por motivos "
+        f"com destaque (vs {rhs}) para: {pos_txt}; por outro lado, motivos com menor participação foram: {neg_txt}. "
+        f"No total de NC, {lhs} = {int(meta['total_p'])} (taxa {meta['nc_rate_p']:.1f}%), "
+        f"{rhs} = {int(meta['total_b'])} (taxa {meta['nc_rate_b']:.1f}%). "
+        "Os resultados são descritivos e podem refletir o mix de casos e volume amostral; diferenças não implicam causalidade."
+    )
+    return _sanitize_paragraph(txt, max_words=max_words)
+
+def _comment_from_values_motivos(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any],
+                                 *, call_api: bool, model: str = "gpt-4o-mini",
+                                 max_words: int = 180, temperature: float = 0.2) -> str:
+    """Gera comentário exclusivamente a partir dos VALORES (API direta → heurístico)."""
+    if df.empty:
+        return "Sem dados suficientes para um comentário interpretativo."
+    if call_api:
+        try:
+            _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
+            messages = _build_motivos_messages(df, meta, cuts or {}, max_words)
+            api_txt = _call_openai_chat(messages, model=model, temperature=temperature)
+            if api_txt:
+                return _sanitize_paragraph(api_txt, max_words=max_words)
+        except Exception:
+            pass
+    # fallback heurístico
+    return _heuristic_comment_motivos(df, meta, cuts or {}, max_words=max_words)
 
 # ============================
 # Helpers de schema
@@ -162,7 +307,6 @@ def _detect_schema(conn: sqlite3.Connection) -> Dict[str, Any]:
         'has_indicadores': has_indicadores,
     }
 
-
 # ============================
 # Núcleo (queries e cálculos)
 # ============================
@@ -187,11 +331,9 @@ def _get_counts_single(conn: sqlite3.Connection, start: str, end: str, perito: s
 
     join_prot = "LEFT JOIN protocolos pr ON pr.protocolo = a.protocolo" if (has_protcol and has_prot) else ""
 
-    # texto para fallback do rótulo
     cast_target = f"a.{motivo_col}" if motivo_col else "NULL"
     desc_expr = f"COALESCE(NULLIF(TRIM(pr.motivo), ''), CAST({cast_target} AS TEXT)) AS descricao"
 
-    # regra robusta de NC
     if has_conf and motivo_col:
         cond_nc_total = (
             " (CAST(COALESCE(NULLIF(TRIM(a.conformado),''),'1') AS INTEGER) = 0) "
@@ -206,7 +348,6 @@ def _get_counts_single(conn: sqlite3.Connection, start: str, end: str, perito: s
             "  AND CAST(COALESCE(NULLIF(TRIM(a.motivoNaoConformado),''),'0') AS INTEGER) <> 0) "
         )
     else:
-        # pior caso: não há nenhuma coluna — não conseguimos medir NC
         cond_nc_total = " 0 "
 
     base_select = f"""
@@ -300,11 +441,6 @@ def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: L
     return df_g, df_b
 
 def _get_nc_rates_single(conn: sqlite3.Connection, start: str, end: str, perito: str, schema: Dict[str, Any]) -> Tuple[float, float]:
-    """
-    Retorna (taxa NC perito %, taxa NC Brasil excl. %) para um perito.
-    Regra robusta de NC:
-      conformado = 0  OR  (motivoNaoConformado texto != '' E CAST(...) != 0)
-    """
     t            = schema['table']
     date_col     = schema['date_col']
     motivo_col   = schema['motivo_col']
@@ -312,7 +448,6 @@ def _get_nc_rates_single(conn: sqlite3.Connection, start: str, end: str, perito:
     has_protcol  = schema['has_protocolo']
     has_prot     = schema['has_protocolos_table']
 
-    # join com protocolos apenas para motivos (não entra na regra de NC)
     join_prot = "LEFT JOIN protocolos pr ON pr.protocolo = a.protocolo" if (has_protcol and has_prot) else ""
 
     if has_conf and motivo_col:
@@ -350,11 +485,6 @@ def _get_nc_rates_single(conn: sqlite3.Connection, start: str, end: str, perito:
     return rate_p, rate_b
 
 def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos: List[str], schema: Dict[str, Any]) -> Tuple[float, float]:
-    """
-    Retorna (taxa NC grupo %, taxa NC Brasil-excl-grupo %) para lista de peritos.
-    Regra robusta de NC:
-      conformado = 0  OR  (motivoNaoConformado texto != '' E CAST(...) != 0)
-    """
     if not peritos:
         return 0.0, 0.0
 
@@ -417,10 +547,6 @@ def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos:
     return rate_g, rate_b
 
 def _get_top10_peritos(conn: sqlite3.Connection, start: str, end: str, min_analises: int, schema: Dict[str, Any]) -> List[str]:
-    """
-    Retorna lista de nomes dos 10 piores peritos por scoreFinal (maior = pior),
-    considerando apenas quem tem pelo menos `min_analises` no período.
-    """
     if not schema.get('has_indicadores', False):
         raise RuntimeError("Tabela 'indicadores' não encontrada — calcule indicadores antes de usar --top10.")
 
@@ -552,7 +678,6 @@ def aplicar_cuts_e_topn(df: pd.DataFrame,
     if min_n_brasil is not None:
         m = m[m['n_brasil'] >= int(min_n_brasil)]
 
-    # mantém a mesma ordenação base (pct_brasil desc, n_brasil desc), depois aplica head(topn)
     m = m.sort_values(['pct_brasil', 'n_brasil'], ascending=[False, False]).head(topn).reset_index(drop=True)
     return m
 
@@ -594,10 +719,25 @@ def _build_motivos_payload(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[st
     }
 
 def gerar_comentario(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict[str, Any]], call_api: bool) -> str:
-    if _COMENT_FUNC is None or df.empty:
-        # fallback curto
-        return ("Sem dados suficientes para um comentário interpretativo." if df.empty
-                else "Comparativo dos motivos de NC entre os grupos, considerando percentuais dentro do conjunto de NC.")
+    """
+    Novo fluxo preferencial: gera comentário a partir dos VALORES (API direta → heurístico).
+    Mantém compatibilidade com utils.comentarios como fallback.
+    """
+    if df.empty:
+        return "Sem dados suficientes para um comentário interpretativo."
+    # 1) Caminho novo (valores)
+    txt = _comment_from_values_motivos(
+        df, meta, cuts or {},
+        call_api=call_api,
+        model="gpt-4o-mini",
+        max_words=180,
+        temperature=0.2
+    )
+    if txt:
+        return txt
+    # 2) Fallback compat
+    if _COMENT_FUNC is None:
+        return "Comentário não disponível no momento."
     payload = _build_motivos_payload(df, meta, cuts or {})
     try:
         out = _COMENT_FUNC(payload, call_api=call_api)
@@ -606,18 +746,6 @@ def gerar_comentario(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict
         if isinstance(out, str):
             return out.strip()
         return str(out).strip()
-    except TypeError:
-        # compat assinatura antiga
-        try:
-            tabela_md = "| Motivo | % A | % B | n A | n B |\n" + "\n".join(
-                f"| {r['descricao']} | {r['pct_perito']:.2f}% | {r['pct_brasil']:.2f}% | {int(r['n_perito'])} | {int(r['n_brasil'])} |"
-                for _, r in df.iterrows()
-            )
-            out = _COMENT_FUNC(tabela_md=tabela_md, chart_ascii="", start=meta['start'], end=meta['end'],
-                               perito=meta.get('label_lhs', 'Grupo'))
-            return out.strip() if isinstance(out, str) else str(out).strip()
-        except Exception:
-            return "Comentário não disponível no momento."
     except Exception:
         return "Comentário não disponível no momento."
 
@@ -691,12 +819,10 @@ def exportar_org(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any], p
         lines.append(f":TOP10: {', '.join(meta['peritos_lista'])}")
     lines.append(f":NC_{meta['label_lhs']}: {meta['nc_rate_p']:.1f}%")
     lines.append(f":NC_{meta['label_rhs']}: {meta['nc_rate_b']:.1f}%")
-    # cortes
     cuts_str = ", ".join([f"{k}={v}" for k, v in cuts.items() if v is not None]) or "nenhum"
     lines.append(f":CUTS: {cuts_str}")
     lines.append(":END:\n")
 
-    # Tabela
     lines.append("| Motivo (descrição) | % " + meta['label_lhs'] + " | % " + meta['label_rhs'] +
                  " | n " + meta['label_lhs'] + " | n " + meta['label_rhs'] + " |")
     lines.append("|-")
@@ -706,16 +832,13 @@ def exportar_org(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any], p
     else:
         lines.append("| — | — | — | — | — |")
 
-    # Imagem (se existir)
     if png_path and os.path.exists(png_path):
         rel_png = os.path.basename(png_path)
         lines.append("\n#+CAPTION: Distribuição percentual dos motivos (barras lado a lado).")
         lines.append(f"[[file:{rel_png}]]")
 
-    # Comentário (opcional)
     if comment_text:
         lines.append("\n** Comentário")
-        # texto corrido (um parágrafo)
         lines.append(comment_text.strip())
 
     with open(path, "w", encoding="utf-8") as f:
@@ -744,7 +867,6 @@ def exportar_png(df: pd.DataFrame, meta: Dict[str, Any],
     x = range(len(motivos))
     width = 0.4
 
-    # Legenda com taxa de NC
     label_lhs = f"{meta['label_lhs']} (NC {meta.get('nc_rate_p', 0.0):.1f}%)"
     label_rhs = f"{meta['label_rhs']} (NC {meta.get('nc_rate_b', 0.0):.1f}%)"
 
@@ -798,7 +920,8 @@ def exibir_chart_ascii(df: pd.DataFrame, meta: Dict[str, Any], label_maxlen: int
 
 def exportar_comment(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict[str, Any]] = None, call_api: bool = False) -> str:
     """
-    Gera e salva comentário (ou prompt) sobre os motivos **em .md** (compat legado).
+    Gera e salva comentário (ou prompt) sobre os motivos **em .md**.
+    Agora usa preferencialmente a rota por VALORES (API direta → heurístico).
     """
     safe = _safe_name(meta['safe_stub'])
     fname = "motivos_top10_vs_brasil_comment.md" if meta['mode']=='top10' else f"motivos_perito_vs_brasil_{safe}_comment.md"
@@ -806,7 +929,6 @@ def exportar_comment(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict
 
     comment_text = gerar_comentario(df, meta, cuts, call_api=call_api)
 
-    # tabela MD para rastreabilidade no arquivo de comentário
     header_tbl = [
         "| Motivo (descrição) | % " + meta['label_lhs'] + " | % " + meta['label_rhs'] + " | n " + meta['label_lhs'] + " | n " + meta['label_rhs'] + " |",
         "|--------------------|---------:|---------:|---------:|---------:|"
@@ -829,7 +951,6 @@ def exportar_comment(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict
         f.write("\n".join(md_out))
     print(f"✅ Comentário salvo em: {path}")
     return path
-
 
 # ============================
 # CLI
@@ -892,7 +1013,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    # liga API automaticamente se existir OPENAI_API_KEY no ambiente
     call_api = bool(args.call_api or os.getenv("OPENAI_API_KEY"))
 
     # monta DF base (sem filtros)
@@ -932,13 +1052,12 @@ def main() -> None:
     # Exports
     png_path = None
     if args.export_png or args.export_org or args.export_comment_org:
-        # garanta PNG para figlink no .org quando necessário
         png_path = exportar_png(df, meta, label_maxlen=args.label_maxlen, label_fontsize=args.label_fontsize)
 
     if args.export_md:
         exportar_md(df, meta, cuts_info)
 
-    # Comentário (string) — usado tanto no .md legado quanto no .org novo
+    # Comentário (string) — usado tanto no .md quanto no .org
     comment_for_org = None
     if args.export_comment:
         exportar_comment(df, meta, cuts_info, call_api=call_api)

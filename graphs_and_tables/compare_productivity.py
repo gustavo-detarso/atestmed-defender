@@ -356,7 +356,7 @@ def _export_org(title: str, start: str, end: str,
     lines.append(f"| Categoria | {a_name} | {b_name} | % |")
     lines.append("|-")
     if mode == "time-share":
-        lines.append(f"| {left_label}  | {left_num:.0f} | {left_den:.0f} | {left_pct:.2f}% |")
+        lines.append(f"| {left_label}  | {left_num:.0f} | {right_den:.0f} | {left_pct:.2f}% |")
         lines.append(f"| {right_label} | {right_num:.0f} | {right_den:.0f} | {right_pct:.2f}% |\n")
     else:
         lines.append(f"| {left_label}  | {int(left_num)} | {int(left_den)} | {left_pct:.2f}% |")
@@ -388,6 +388,74 @@ def _render_ascii(title: str, y_label: str, left_label: str, right_label: str, l
     p.ylabel(y_label)
     p.plotsize(80, 18)
     p.show()
+
+def _export_comment_sidecar(stem: str, comment_text: Optional[str]) -> Optional[str]:
+    """Grava graphs_and_tables/exports/<stem>_comment.org com o parágrafo interpretativo."""
+    if not comment_text:
+        return None
+    path = os.path.join(EXPORT_DIR, f"{stem}_comment.org")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(comment_text.strip() + "\n")
+    print(f"📝 Comment(org) salvo em {path}")
+    return path
+
+def _build_parsed_from_values(mode: str,
+                              a_name: str, b_name: str,
+                              left_label: str, right_label: str,
+                              left_num: float, left_den: float, left_pct: float,
+                              right_num: float, right_den: float, right_pct: float) -> Dict[str, Any]:
+    return {
+        "a_label": a_name,
+        "b_label": b_name,
+        "mode": mode,
+        "left":  {"label": left_label,  "num": float(left_num),  "den": float(left_den),  "pct": float(left_pct)},
+        "right": {"label": right_label, "num": float(right_num), "den": float(right_den), "pct": float(right_pct)},
+    }
+
+def _comment_from_values(start: str, end: str, threshold: float, mode: str,
+                         a_name: str, b_name: str,
+                         left_label: str, right_label: str,
+                         left_num: float, left_den: float, left_pct: float,
+                         right_num: float, right_den: float, right_pct: float,
+                         ascii_chart: str,
+                         *, call_api: bool, debug: bool,
+                         model: str, max_words: int, temperature: float) -> str:
+    """Gera o comentário usando diretamente os números já calculados (sem parse de Markdown)."""
+    parsed = _build_parsed_from_values(mode, a_name, b_name,
+                                       left_label, right_label,
+                                       left_num, left_den, left_pct,
+                                       right_num, right_den, right_pct)
+
+    # 1) Tenta API (se habilitada)
+    if call_api:
+        try:
+            msgs = _build_messages_produtividade(start, end, threshold, mode, parsed, ascii_chart, max_words)
+            api_txt = _call_openai_chat(msgs, model=model, temperature=temperature)
+            if api_txt:
+                if debug:
+                    print("ℹ️ comentários: usando API com valores diretos (sem parse).")
+                return _sanitize_org_text(api_txt, max_words)
+        except Exception:
+            if debug:
+                print("⚠️ comentários: falha API; usando heurística.")
+
+    # 2) Fallback heurístico com os valores diretos
+    if mode == "time-share":
+        esq = f"{left_pct:.1f}% (n={left_num:.0f}/{left_den:.0f} s)"
+        dir = f"{right_pct:.1f}% (n={right_num:.0f}/{right_den:.0f} s)"
+    else:
+        esq = f"{left_pct:.1f}% (n={int(left_num)}/{int(left_den)})"
+        dir = f"{right_pct:.1f}% (n={int(right_num)}/{int(right_den)})"
+
+    diff = left_pct - right_pct
+    txt = (
+        f"No período {start} a {end}, considerando o limiar de {threshold}/h, "
+        f"{left_label} registrou {esq}, enquanto {right_label} apresentou {dir}. "
+        f"A diferença é de {abs(diff):.1f} p.p., "
+        f"{'acima' if diff > 0 else 'abaixo' if diff < 0 else 'em linha'} do comparativo. "
+        "Os percentuais refletem a participação relativa dos profissionais que atingem o limiar e podem variar conforme o mix de casos e janelas de pico."
+    )
+    return _sanitize_org_text(txt, max_words)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Comentários (integra utils/comentarios + API direta + fallback) → texto para .org
@@ -693,12 +761,17 @@ def run_perito(start: str, end: str, perito: str, threshold: float, mode: str,
                 ascii_chart = _px_build()
             except Exception:
                 ascii_chart = ""
-        # gera texto do comentário (ou None)
+        # gera texto do comentário com os VALORES (sem parse de tabela)
         comment_text = None
         if want_comment:
             _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
-            comment_text = _generate_comment_text(
-                md_tbl, ascii_chart, start, end, threshold, mode,
+            comment_text = _comment_from_values(
+                start, end, threshold, mode,
+                a_name, b_name,
+                left_label=perito, right_label="Demais",
+                left_num=left_num, left_den=left_den, left_pct=left_pct,
+                right_num=right_num, right_den=right_den, right_pct=right_pct,
+                ascii_chart=ascii_chart,
                 call_api=call_api and bool(os.getenv("OPENAI_API_KEY")),
                 debug=debug_comments, model=model, max_words=max_words, temperature=temperature
             )
@@ -713,6 +786,7 @@ def run_perito(start: str, end: str, perito: str, threshold: float, mode: str,
         print(f"   n={left_num:.0f}/{left_den:.0f} (esq.)  |  n={right_num:.0f}/{right_den:.0f} (dir.)\n")
     else:
         print(f"   n={int(left_num)}/{int(left_den)} (esq.)  |  n={int(right_num)}/{int(right_den)} (dir.)\n")
+
 
 def run_top10(start: str, end: str, min_analises: int, threshold: float, mode: str,
               export_md: bool, export_png: bool, export_org: bool,
@@ -744,6 +818,7 @@ def run_top10(start: str, end: str, min_analises: int, threshold: float, mode: s
     png   = os.path.join(EXPORT_DIR, f"{stem}.png")
     org   = f"{stem}.org"
 
+    # tabela MD (para .md e documentação)
     if mode == "time-share":
         md_tbl = (
             f"| Categoria | {a_name} | {b_name} | % |\n"
@@ -784,14 +859,23 @@ def run_top10(start: str, end: str, min_analises: int, threshold: float, mode: s
                 ascii_chart = _px_build()
             except Exception:
                 ascii_chart = ""
+
+        # [FIX] Comentário gerado diretamente dos VALORES (sem parse de tabela),
+        # garantindo que os rótulos e denominadores corretos sejam usados.
         comment_text = None
         if want_comment:
             _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
-            comment_text = _generate_comment_text(
-                md_tbl, ascii_chart, start, end, threshold, mode,
+            comment_text = _comment_from_values(
+                start, end, threshold, mode,
+                a_name, b_name,
+                left_label="Top 10 piores", right_label="Brasil (excl.)",
+                left_num=left_num, left_den=left_den, left_pct=left_pct,
+                right_num=right_num, right_den=right_den, right_pct=right_pct,
+                ascii_chart=ascii_chart,
                 call_api=call_api and bool(os.getenv("OPENAI_API_KEY")),
                 debug=debug_comments, model=model, max_words=max_words, temperature=temperature
             )
+            _export_comment_sidecar(stem, comment_text)
 
         _export_org(title, start, end, "Top 10 piores", "Brasil (excl.)",
                     left_num, left_den, left_pct, right_num, right_den, right_pct,
@@ -803,6 +887,7 @@ def run_top10(start: str, end: str, min_analises: int, threshold: float, mode: s
         print(f"   n={left_num:.0f}/{left_den:.0f} (grupo)  |  n={right_num:.0f}/{right_den:.0f} (Brasil excl.)\n")
     else:
         print(f"   n={int(left_num)}/{int(left_den)} (grupo)  |  n={int(right_num)}/{int(right_den)} (Brasil excl.)\n")
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Main

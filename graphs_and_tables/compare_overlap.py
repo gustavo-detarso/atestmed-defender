@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 
 import os
 import sys
@@ -29,9 +30,9 @@ def _px_build():
     b = getattr(p, "build", None)
     return b() if callable(b) else ""
 
-# Integração GPT (robusta: funciona mesmo que o módulo não exista)
+# Integração GPT (opcional; não é mais necessária para gerar comentário)
 try:
-    # utils.comentarios.comentar_overlap(md_table, chart_ascii, start, end, *, call_api=False, model=None) -> str
+    # (mantido apenas por compat; não é mais obrigatório)
     from utils.comentarios import comentar_overlap as _GPT_COMMENTER  # type: ignore
 except Exception:
     _GPT_COMMENTER = None
@@ -197,37 +198,17 @@ def _heuristic_overlap_comment(start: str, end: str, mode: str,
         "Os percentuais representam a composição relativa dentro de cada grupo; não indicam, por si só, causa ou desempenho clínico."
     )
 
-def _generate_comment_text_overlap(start: str, end: str, mode: str,
-                                   left_label: str, right_label: str,
-                                   left_pct: float, right_pct: float,
-                                   left_num, left_den, right_num, right_den,
-                                   md_table: str, ascii_chart: str,
-                                   *, call_api: bool, model: str, max_words: int, temperature: float) -> str:
+def _comment_from_values_overlap(start: str, end: str, mode: str,
+                                 left_label: str, right_label: str,
+                                 left_pct: float, right_pct: float,
+                                 left_num, left_den, right_num, right_den,
+                                 ascii_chart: str,
+                                 *, call_api: bool, model: str, max_words: int, temperature: float) -> str:
     """
-    Tenta: (1) utils.comentarios; (2) API direta; (3) fallback heurístico.
-    Retorna texto limpo para inserir no .org.
+    Gera o comentário usando EXCLUSIVAMENTE os valores calculados.
+    Tenta API (com payload estruturado) e cai no heurístico.
     """
-    # (1) utils.comentarios
-    if callable(_GPT_COMMENTER):
-        try:
-            bruto = _GPT_COMMENTER(md_table, ascii_chart, start, end, call_api=call_api, model=model)  # type: ignore
-            if isinstance(bruto, dict):
-                bruto = bruto.get("comment") or bruto.get("prompt") or ""
-            if isinstance(bruto, str) and bruto.strip():
-                return _sanitize_org_text(bruto, max_words=max_words)
-        except TypeError:
-            try:
-                bruto = _GPT_COMMENTER(md_table=md_table, chart_ascii=ascii_chart, start=start, end=end, call_api=call_api, model=model)  # type: ignore
-                if isinstance(bruto, dict):
-                    bruto = bruto.get("comment") or bruto.get("prompt") or ""
-                if isinstance(bruto, str) and bruto.strip():
-                    return _sanitize_org_text(bruto, max_words=max_words)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    # (2) API direta
+    # 1) API direta (payload estruturado; md_table não é necessário)
     if call_api:
         try:
             _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -236,15 +217,14 @@ def _generate_comment_text_overlap(start: str, end: str, mode: str,
                 left_label, right_label,
                 left_pct, right_pct,
                 left_num, left_den, right_num, right_den,
-                md_table, ascii_chart, max_words=max_words
+                md_table="", ascii_chart=ascii_chart, max_words=max_words
             )
             api_txt = _call_openai_chat(messages, model=model, temperature=temperature)
             if api_txt:
                 return _sanitize_org_text(api_txt, max_words=max_words)
         except Exception:
             pass
-
-    # (3) Heurístico
+    # 2) Fallback heurístico
     return _sanitize_org_text(
         _heuristic_overlap_comment(start, end, mode, left_label, right_label,
                                    left_pct, right_pct, left_num, left_den, right_num, right_den),
@@ -272,20 +252,20 @@ def parse_args():
                     help=("Métrica de comparação: "
                           "'perito-share' = proporção de peritos com overlap; "
                           "'task-share' = proporção de tarefas sobrepostas; "
-                          "'time-share' = proporção do tempo total em sobreposição."))
+                          "'time-share' = proporporção do tempo total em sobreposição."))
 
     # Exportações
     ap.add_argument('--chart',              action='store_true', help='Exibe gráfico ASCII no terminal')
     ap.add_argument('--export-md',          action='store_true', help='Exporta tabela em Markdown')
     ap.add_argument('--export-png',         action='store_true', help='Exporta gráfico em PNG')
     ap.add_argument('--export-org',         action='store_true', help='Exporta resumo em Org-mode (.org) com a imagem e, se solicitado, o comentário')
-    ap.add_argument('--export-comment',     action='store_true', help='Exporta comentário (Markdown, compatibilidade)')
+    ap.add_argument('--export-comment',     action='store_true', help='Exporta comentário interpretativo (Markdown)')
     ap.add_argument('--export-comment-org', action='store_true', help='Insere comentário interpretativo diretamente no .org')
     ap.add_argument('--add-comments',       action='store_true', help='Sinônimo de --export-comment-org')
 
     # GPT
-    ap.add_argument('--call-api',   action='store_true', help='Usa OPENAI_API_KEY para gerar comentário via utils.comentarios/ChatGPT')
-    ap.add_argument('--model',      default='gpt-4o-mini', help='Modelo ChatGPT (padrão: gpt-4o-mini)')
+    ap.add_argument('--call-api',   action='store_true', help='Usa OPENAI_API_KEY para gerar comentário via ChatGPT')
+    ap.add_argument('--model',      default='gpt-4o-mini', help='Modelo (padrão: gpt-4o-mini)')
     ap.add_argument('--max-words',  type=int, default=180, help='Tamanho máximo do comentário (palavras)')
     ap.add_argument('--temperature',type=float, default=0.2, help='Temperatura da geração')
 
@@ -470,7 +450,7 @@ def _aggregate_group(stats: pd.DataFrame, names_set: set[str] | None, mode: str)
     return num, den, pct, detail
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Exportações (gráfico/markdown/org)
+# Exportações (gráfico/markdown/org/comentário)
 # ────────────────────────────────────────────────────────────────────────────────
 def _unit_labels(mode: str) -> tuple[str, str]:
     if mode == "perito-share":
@@ -491,9 +471,7 @@ def _render_png(title: str, left_label: str, right_label: str,
                 left_pct: float, right_pct: float,
                 left_num, left_den, right_num, right_den,
                 mode: str, outfile: str) -> str:
-    # cores padrão
     colors = ["#1f77b4", "#ff7f0e"]
-
     fig, ax = plt.subplots(figsize=(10, 6), dpi=400)
     cats = [left_label, right_label]
     vals = [left_pct, right_pct]
@@ -501,26 +479,19 @@ def _render_png(title: str, left_label: str, right_label: str,
     ax.set_title(title, pad=15)
     ax.set_ylabel(_yaxis_label(mode))
     ax.grid(axis='y', linestyle='--', alpha=0.6)
-
-    # evitar rótulo “vazar” do gráfico
     ymax = max(10.0, min(100.0, max(vals) * 1.15)) if any(vals) else 10.0
     ax.set_ylim(0, ymax)
-
     pairs = [(left_num, left_den), (right_num, right_den)]
     for bar, pct, (n, tot) in zip(bars, vals, pairs):
-        if mode == "time-share":
-            line2 = f"(n={n:.0f}s/{tot:.0f}s)"
-        else:
-            line2 = f"(n={int(n)}/{int(tot)})"
+        line2 = f"(n={n:.0f}/{tot:.0f} s)" if mode == "time-share" else f"(n={int(n)}/{int(tot)})"
         txt = f"{pct:.1f}%\n{line2}"
         x = bar.get_x() + bar.get_width()/2
         off = ymax * 0.02
-        if pct + off * 3 <= ymax:  # cabe em cima
+        if pct + off * 3 <= ymax:
             y, va, color = pct + off, "bottom", "black"
-        else:                      # escreve dentro
+        else:
             y, va, color = max(pct - off * 1.5, off * 1.2), "top", "white"
         ax.text(x, y, txt, ha='center', va=va, fontsize=9, color=color)
-
     plt.tight_layout()
     fig.savefig(outfile, bbox_inches='tight')
     plt.close(fig)
@@ -607,39 +578,20 @@ def _render_ascii(title: str, left_label: str, right_label: str, left_pct: float
     p.plotsize(80, 18)
     p.show()
 
-def _export_comment(md_table: str, ascii_chart: str, start: str, end: str, stem: str, *, call_api: bool) -> str:
-    """
-    Gera o comentário usando utils.comentarios.comentar_overlap, se disponível.
-    Aceita retorno str (preferido). No fallback, salva a tabela + gráfico ASCII.
-    """
-    out_text = ""
-    if callable(_GPT_COMMENTER):
-        try:
-            # assinatura moderna
-            out_text = _GPT_COMMENTER(md_table, ascii_chart, start, end, call_api=call_api)
-            if isinstance(out_text, dict):  # por segurança (versões antigas)
-                out_text = out_text.get("comment") or out_text.get("prompt") or ""
-        except TypeError:
-            try:
-                # compat: assinatura nomeada
-                out_text = _GPT_COMMENTER(md_table=md_table, chart_ascii=ascii_chart, start=start, end=end, call_api=call_api)
-                if isinstance(out_text, dict):
-                    out_text = out_text.get("comment") or out_text.get("prompt") or ""
-            except Exception as e:
-                out_text = f"(falha ao gerar comentário automático: {e})\n\n{md_table}\n\n{ascii_chart}"
-        except Exception as e:
-            out_text = f"(falha ao gerar comentário automático: {e})\n\n{md_table}\n\n{ascii_chart}"
-    else:
-        out_text = (
-            f"**Período:** {start} a {end}\n\n"
-            f"_Observação:_ módulo de comentários não encontrado; abaixo segue a tabela-base.\n\n"
-            f"{md_table}\n\n{ascii_chart}"
-        )
-
+def _write_comment_md(stem: str, text: str) -> str:
+    """Salva o comentário em Markdown simples."""
     path = os.path.join(EXPORT_DIR, f"{stem}_comment.md")
     with open(path, "w", encoding="utf-8") as f:
-        f.write((out_text or "").strip() + "\n")
+        f.write(text.strip() + "\n")
     print("🗒️ Comentário salvo em", path)
+    return path
+
+def _write_comment_org(stem: str, text: str) -> str:
+    """Salva o comentário em Org-mode como sidecar: <stem>_comment.org."""
+    path = os.path.join(EXPORT_DIR, f"{stem}_comment.org")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.strip() + "\n")
+    print("📝 Comentário(ORG) salvo em", path)
     return path
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -650,7 +602,7 @@ def _safe(name: str) -> str:
 
 def run_perito(start: str, end: str, perito: str, mode: str,
                export_md: bool, export_png: bool, export_org: bool,
-               chart: bool, want_comment: bool, call_api: bool,
+               chart: bool, want_comment: bool, save_comment_md: bool, call_api: bool,
                model: str, max_words: int, temperature: float) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, _ = _detect_tables(conn)
@@ -675,11 +627,12 @@ def run_perito(start: str, end: str, perito: str, mode: str,
     left_num, left_den, left_pct, _    = _aggregate_group(stats, left_set, mode)
     right_num, right_den, right_pct, _ = _aggregate_group(stats, right_set, mode)
 
-    left_label, right_label = perito, "Brasil (excl.)"
+    # Rótulo correto no comparativo individual
+    left_label, right_label = perito, "Demais"
     title = {
-        "perito-share": f"Sobreposição — percentual de peritos com overlap — {perito} vs Brasil (excl.)",
-        "task-share":   f"Sobreposição — percentual de tarefas sobrepostas — {perito} vs Brasil (excl.)",
-        "time-share":   f"Sobreposição — percentual do tempo em overlap — {perito} vs Brasil (excl.)",
+        "perito-share": f"Sobreposição — percentual de peritos com overlap — {perito} vs Demais",
+        "task-share":   f"Sobreposição — percentual de tarefas sobrepostas — {perito} vs Demais",
+        "time-share":   f"Sobreposição — percentual do tempo em overlap — {perito} vs Demais",
     }[mode]
 
     safe  = _safe(perito)
@@ -687,37 +640,25 @@ def run_perito(start: str, end: str, perito: str, mode: str,
     png   = os.path.join(EXPORT_DIR, f"{stem}.png")
     org   = f"{stem}.org"
 
-    # MD (também para comentário .md)
+    # MD (tabela)
     a_label, b_label = _unit_labels(mode)
-    if mode == "time-share":
-        md_tbl = (
-            f"| Categoria | {a_label} | {b_label} | % |\n"
-            f"|-----------|------------------:|------------------:|---:|\n"
-            f"| {left_label}  | {left_num:.0f} | {left_den:.0f} | {left_pct:.1f}% |\n"
-            f"| {right_label} | {right_num:.0f} | {right_den:.0f} | {right_pct:.1f}% |\n"
-        )
-    else:
-        md_tbl = (
-            f"| Categoria | {a_label} | {b_label} | % |\n"
-            f"|-----------|------------------:|------------------:|---:|\n"
-            f"| {left_label}  | {int(left_num)} | {int(left_den)} | {left_pct:.1f}% |\n"
-            f"| {right_label} | {int(right_num)} | {int(right_den)} | {right_pct:.1f}% |\n"
-        )
     if export_md or want_comment:
         _export_md(title, start, end, left_label, right_label,
                    left_num, left_den, left_pct, right_num, right_den, right_pct, mode, stem)
 
-    if export_png or export_org or want_comment:
+    # PNG
+    if export_png or export_org or want_comment or save_comment_md:
         if not os.path.exists(png):
             _render_png(title, left_label, right_label,
                         left_pct, right_pct, left_num, left_den, right_num, right_den, mode, png)
 
+    # ASCII
     if chart:
         _render_ascii(title, left_label, right_label, left_pct, right_pct, mode)
 
-    # Gera comentário (se solicitado) e escreve .org principal
+    # Comentário (um único texto para .org e/ou .md)
     comment_text: Optional[str] = None
-    if want_comment:
+    if want_comment or save_comment_md:
         ascii_chart = ""
         if p is not None:
             try:
@@ -729,20 +670,27 @@ def run_perito(start: str, end: str, perito: str, mode: str,
             except Exception:
                 ascii_chart = ""
         _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
-        comment_text = _generate_comment_text_overlap(
+        comment_text = _comment_from_values_overlap(
             start, end, mode,
             left_label, right_label,
             left_pct, right_pct,
             left_num, left_den, right_num, right_den,
-            md_tbl, ascii_chart,
+            ascii_chart,
             call_api=call_api and bool(os.getenv("OPENAI_API_KEY")),
             model=model, max_words=max_words, temperature=temperature
         )
 
+    # .org
     if export_org or want_comment:
         _export_org(title, start, end, left_label, right_label,
                     left_num, left_den, left_pct, right_num, right_den, right_pct,
                     mode, png, org, comment_text=comment_text)
+
+    # sidecars de comentário (ORG sempre; MD se explicitado)
+    if comment_text:
+        _write_comment_org(stem, comment_text)
+        if save_comment_md:
+            _write_comment_md(stem, comment_text)
 
     # Log
     print(f"\n📊 {left_label}: {left_pct:.1f}%  |  {right_label}: {right_pct:.1f}%")
@@ -753,7 +701,7 @@ def run_perito(start: str, end: str, perito: str, mode: str,
 
 def run_top10(start: str, end: str, min_analises: int, mode: str,
               export_md: bool, export_png: bool, export_org: bool,
-              chart: bool, want_comment: bool, call_api: bool,
+              chart: bool, want_comment: bool, save_comment_md: bool, call_api: bool,
               model: str, max_words: int, temperature: float) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, has_ind = _detect_tables(conn)
@@ -788,27 +736,11 @@ def run_top10(start: str, end: str, min_analises: int, mode: str,
     png   = os.path.join(EXPORT_DIR, f"{stem}.png")
     org   = f"{stem}.org"
 
-    a_label, b_label = _unit_labels(mode)
-    if mode == "time-share":
-        md_tbl = (
-            f"| Categoria | {a_label} | {b_label} | % |\n"
-            f"|-----------|------------------:|------------------:|---:|\n"
-            f"| {left_label}  | {left_num:.0f} | {left_den:.0f} | {left_pct:.1f}% |\n"
-            f"| {right_label} | {right_num:.0f} | {right_den:.0f} | {right_pct:.1f}% |\n"
-        )
-    else:
-        md_tbl = (
-            f"| Categoria | {a_label} | {b_label} | % |\n"
-            f"|-----------|------------------:|------------------:|---:|\n"
-            f"| {left_label}  | {int(left_num)} | {int(left_den)} | {left_pct:.1f}% |\n"
-            f"| {right_label} | {int(right_num)} | {int(right_den)} | {right_pct:.1f}% |\n"
-        )
-
     if export_md or want_comment:
         _export_md(title, start, end, left_label, right_label,
                    left_num, left_den, left_pct, right_num, right_den, right_pct, mode, stem)
 
-    if export_png or export_org or want_comment:
+    if export_png or export_org or want_comment or save_comment_md:
         if not os.path.exists(png):
             _render_png(title, left_label, right_label,
                         left_pct, right_pct, left_num, left_den, right_num, right_den, mode, png)
@@ -817,7 +749,7 @@ def run_top10(start: str, end: str, min_analises: int, mode: str,
         _render_ascii(title, left_label, right_label, left_pct, right_pct, mode)
 
     comment_text: Optional[str] = None
-    if want_comment:
+    if want_comment or save_comment_md:
         ascii_chart = ""
         if p is not None:
             try:
@@ -829,12 +761,12 @@ def run_top10(start: str, end: str, min_analises: int, mode: str,
             except Exception:
                 ascii_chart = ""
         _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
-        comment_text = _generate_comment_text_overlap(
+        comment_text = _comment_from_values_overlap(
             start, end, mode,
             left_label, right_label,
             left_pct, right_pct,
             left_num, left_den, right_num, right_den,
-            md_tbl, ascii_chart,
+            ascii_chart,
             call_api=call_api and bool(os.getenv("OPENAI_API_KEY")),
             model=model, max_words=max_words, temperature=temperature
         )
@@ -843,6 +775,11 @@ def run_top10(start: str, end: str, min_analises: int, mode: str,
         _export_org(title, start, end, left_label, right_label,
                     left_num, left_den, left_pct, right_num, right_den, right_pct,
                     mode, png, org, top_names=names, comment_text=comment_text)
+
+    if comment_text:
+        _write_comment_org(stem, comment_text)
+        if save_comment_md:
+            _write_comment_md(stem, comment_text)
 
     print(f"\n📊 {left_label}: {left_pct:.1f}%  |  {right_label}: {right_pct:.1f}%")
     if mode == "time-share":
@@ -855,17 +792,21 @@ def run_top10(start: str, end: str, min_analises: int, mode: str,
 # ────────────────────────────────────────────────────────────────────────────────
 def main():
     args = parse_args()
-    want_comment = args.export_comment or args.add_comments or args.export_comment_org
+    # Liga API automaticamente se existir OPENAI_API_KEY no ambiente
+    auto_call_api = bool(args.call_api or os.getenv("OPENAI_API_KEY"))
+    want_comment   = args.export_comment or args.add_comments or args.export_comment_org
+    save_comment_md = args.export_comment  # gerar arquivo *_comment.md
+
     if args.top10:
         run_top10(args.start, args.end, args.min_analises, args.mode,
                   args.export_md, args.export_png, args.export_org,
-                  args.chart, want_comment, args.call_api,
+                  args.chart, want_comment, save_comment_md, auto_call_api,
                   args.model, args.max_words, args.temperature)
     else:
         perito = args.perito or args.nome
         run_perito(args.start, args.end, perito, args.mode,
                    args.export_md, args.export_png, args.export_org,
-                   args.chart, want_comment, args.call_api,
+                   args.chart, want_comment, save_comment_md, auto_call_api,
                    args.model, args.max_words, args.temperature)
 
 if __name__ == "__main__":

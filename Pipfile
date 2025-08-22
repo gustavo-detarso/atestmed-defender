@@ -23,6 +23,7 @@ pypdf2 = "*"
 fpdf = "*"
 pandas = "*"
 python-dotenv = {extras = ["cli"], version = "*"}
+requests = "*"
 
 [dev-packages]
 plotext = "*"
