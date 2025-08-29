@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# run_make_report.sh — executa make_report.py para Top10 com opções padrão
+# run_make_report.sh — Gerador (Top10 KPI) com layout do impacto
 set -euo pipefail
 
-# ── Python (prioriza venv local) ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+# Python (prioriza venv local)
+# ──────────────────────────────────────────────────────────────────────
 if [[ -x "./.venv/bin/python" ]]; then
   PYTHON="./.venv/bin/python"
 elif compgen -G "${HOME}/.local/share/virtualenvs/atestmed-defender-*/bin/python3" >/dev/null; then
@@ -15,81 +17,107 @@ if [[ -z "${PYTHON}" ]]; then
   exit 1
 fi
 
-# ── Caminhos ──────────────────────────────────────────────────────────────────
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# tenta na raiz e em reports/
+# ──────────────────────────────────────────────────────────────────────
+# Helpers (date compat: gdate no macOS, date no Linux)
+# ──────────────────────────────────────────────────────────────────────
+date_bin() {
+  if command -v gdate >/dev/null 2>&1; then echo "gdate"; else echo "date"; fi
+}
+DBIN="$(date_bin)"
+
+is_ym()  { [[ "$1" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]; }
+is_ymd() { [[ "$1" =~ ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$ ]]; }
+
+ym_first_day() { echo "$1-01"; }
+ym_last_day()  { $DBIN -d "$1-01 +1 month -1 day" +%Y-%m-%d; }
+
+# ──────────────────────────────────────────────────────────────────────
+# Raiz do projeto e alvo (make_kpi_report.py)
+# ──────────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJ_ROOT="$(cd "$SCRIPT_DIR/" && pwd)"
+
 TARGET=""
-for CAND in "${ROOT}/make_report.py" "${ROOT}/reports/make_report.py"; do
+for CAND in \
+  "${PROJ_ROOT}/reports/make_kpi_report.py" \
+  "${PROJ_ROOT}/make_kpi_report.py"
+do
   if [[ -f "${CAND}" ]]; then TARGET="${CAND}"; break; fi
 done
 if [[ -z "${TARGET}" ]]; then
-  echo "❌ Não encontrei make_report.py na raiz nem em reports/."
+  echo "❌ Não encontrei make_kpi_report.py em '${PROJ_ROOT}' ou em 'reports/'."
   exit 1
 fi
 
-# ── Utilitário para ler datas ────────────────────────────────────────────────
-read_date() {
-  local __outvar="$1"
-  local __prompt="$2"
-  local __in="" __norm=""
-  while true; do
-    read -rp "${__prompt}" __in
-    if [[ ! "${__in}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-      echo "Formato inválido. Use YYYY-MM-DD."
-      continue
-    fi
-    if ! __norm="$(date -d "${__in}" +%F 2>/dev/null)"; then
-      echo "Data inválida. Tente novamente."
-      continue
-    fi
-    printf -v "${__outvar}" '%s' "${__norm}"
-    break
-  done
-}
+# ──────────────────────────────────────────────────────────────────────
+# Menu de período (mesmo layout do impacto)
+# ──────────────────────────────────────────────────────────────────────
+echo "===== Relatório KPI — Gerador (Top10) ====="
+echo
+echo "Escolha o período:"
+echo "  1) Mês atual"
+echo "  2) Mês anterior"
+echo "  3) Escolher um dos últimos 6 meses"
+echo "  4) Intervalo personalizado (YYYY-MM-DD a YYYY-MM-DD)"
+echo
 
-# ── Entrada do usuário ───────────────────────────────────────────────────────
+read -rp "Opção [1-4]: " OPT
+echo
+
 START=""; END=""
-read_date START "Informe --start (YYYY-MM-DD): "
-read_date END   "Informe --end   (YYYY-MM-DD): "
+case "${OPT:-}" in
+  1)
+    YM="$($DBIN +%Y-%m)"
+    START="$(ym_first_day "$YM")"
+    END="$($DBIN -d "$START +1 month -1 day" +%Y-%m-%d)"
+    ;;
+  2)
+    YM="$($DBIN -d "$($DBIN +%Y-%m-01) -1 month" +%Y-%m)"
+    START="$(ym_first_day "$YM")"
+    END="$(ym_last_day "$YM")"
+    ;;
+  3)
+    echo "Selecione o mês:"
+    declare -a LIST=()
+    for i in {0..5}; do
+      LIST+=("$($DBIN -d "$($DBIN +%Y-%m-01) -${i} month" +%Y-%m)")
+    done
+    idx=1
+    for ym in "${LIST[@]}"; do
+      echo "  $idx) $ym"
+      idx=$((idx+1))
+    done
+    echo
+    read -rp "Mês [1-${#LIST[@]}]: " MIDX
+    if ! [[ "$MIDX" =~ ^[1-9][0-9]*$ ]] || (( MIDX < 1 || MIDX > ${#LIST[@]} )); then
+      echo "❌ Opção inválida."; exit 1
+    fi
+    YM="${LIST[$((MIDX-1))]}"
+    START="$(ym_first_day "$YM")"
+    END="$(ym_last_day "$YM")"
+    ;;
+  4)
+    read -rp "Data inicial (YYYY-MM-DD): " START
+    read -rp "Data final   (YYYY-MM-DD): " END
+    if ! is_ymd "$START" || ! is_ymd "$END"; then
+      echo "❌ Datas inválidas. Use YYYY-MM-DD."; exit 1
+    fi
+    if [[ "$($DBIN -d "$START" +%s)" -gt "$($DBIN -d "$END" +%s)" ]]; then
+      echo "❌ Data inicial > final."; exit 1
+    fi
+    ;;
+  *)
+    echo "❌ Opção inválida."; exit 1
+    ;;
+esac
 
-# valida ordem
-s_epoch="$(date -d "${START}" +%s)"
-e_epoch="$(date -d "${END}" +%s)"
-if (( s_epoch > e_epoch )); then
-  echo "❌ --start (${START}) não pode ser depois de --end (${END})."
-  exit 1
-fi
+PERIODO="${START}_a_${END}"
+echo "Período selecionado: $START a $END"
+echo
 
-# padrão para min_analises (permite override via env)
-MIN_ANALISES="${MIN_ANALISES:-50}"
-
-# ── Monta comando base (aceita flags extras via "$@") ────────────────────────
-cmd=(
-  "${PYTHON}" "${TARGET}"
-  --top10
-  --start "${START}" --end "${END}"
-  --min-analises "${MIN_ANALISES}"
-  --add-comments
-  --export-org
-  --export-pdf
-  --r-appendix
-  "$@"
-)
-
-echo "▶ Executando: ${cmd[*]}"
-
-# Se foi pedido --plan-only, salvamos o plano em log
-PLAN_ONLY=0
-for arg in "$@"; do
-  [[ "${arg}" == "--plan-only" ]] && PLAN_ONLY=1
-done
-
-if (( PLAN_ONLY == 1 )); then
-  LOG="${ROOT}/plan_top10_${START}_${END}.log"
-  # pipefail já está ativo; preserva exit code do make_report
-  "${cmd[@]}" | tee "${LOG}"
-  exit "${PIPESTATUS[0]}"
-else
-  exec "${cmd[@]}"
-fi
+# ──────────────────────────────────────────────────────────────────────
+# Parâmetros (com defaults e possibilidade de Enter para manter)
+# ──────────────────────────────────────────────────────────────────────
+DEF_TOPN="${TOPN:-10}"
+DEF_MIN_ANALISES="${MIN_ANALIS_
 

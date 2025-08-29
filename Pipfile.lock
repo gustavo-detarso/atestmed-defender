@@ -1,7 +1,7 @@
 {
     "_meta": {
         "hash": {
-            "sha256": "bb31acf3542e286234dd51022dccb39e8224cb0d8447ef781b6016f670eb25b9"
+            "sha256": "5b4382773790d2e6241581764b07572eb9a5c4af3d48669fe3c24c43f64f3e73"
         },
         "pipfile-spec": 6,
         "requires": {
@@ -1057,6 +1057,15 @@
             "markers": "python_version >= '3.9'",
             "version": "==3.2.3"
         },
+        "pypdf": {
+            "hashes": [
+                "sha256:282a99d2cc94a84a3a3159f0d9358c0af53f85b4d28d76ea38b96e9e5ac2a08d",
+                "sha256:56ea60100ce9f11fc3eec4f359da15e9aec3821b036c1f06d2b660d35683abb8"
+            ],
+            "index": "pypi",
+            "markers": "python_version >= '3.9'",
+            "version": "==6.0.0"
+        },
         "pypdf2": {
             "hashes": [
                 "sha256:a74408f69ba6271f71b9352ef4ed03dc53a31aa404d29b5d31f53bfecfee1440",
@@ -1108,6 +1117,15 @@
             ],
             "markers": "python_version >= '3.8'",
             "version": "==4.2.1"
+        },
+        "reportlab": {
+            "hashes": [
+                "sha256:073b0975dab69536acd3251858e6b0524ed3e087e71f1d0d1895acb50acf9c7b",
+                "sha256:df905dc5ec5ddaae91fc9cb3371af863311271d555236410954961c5ee6ee1b5"
+            ],
+            "index": "pypi",
+            "markers": "python_version >= '3.7' and python_version < '4'",
+            "version": "==4.4.3"
         },
         "requests": {
             "hashes": [

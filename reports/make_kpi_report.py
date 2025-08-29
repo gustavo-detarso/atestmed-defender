@@ -193,38 +193,39 @@ ASSUME_FLAGS = {
 # CLI
 # ────────────────────────────────────────────────────────────────────────────────
 def parse_args():
-    """Parser de argumentos de linha de comando."""
     import argparse
-    p = argparse.ArgumentParser(
-        description=("Relatório ATESTMED — Individual ou Top 10 "
-                     "(executa gráficos e R checks; monta Org/PDF; "
-                     "inclui panorama weekday→weekend).")
-    )
-    p.add_argument('--start', required=True, help='Data inicial YYYY-MM-DD')
-    p.add_argument('--end',   required=True, help='Data final   YYYY-MM-DD')
+    p = argparse.ArgumentParser(description="Relatório KPI + Impacto na Fila (wrapper).")
+    p.add_argument('--start', required=True)
+    p.add_argument('--end',   required=True)
 
     who = p.add_mutually_exclusive_group(required=True)
-    who.add_argument('--perito', help='Nome do perito (relatório individual)')
-    who.add_argument('--top10', action='store_true', help='Gera relatório para os 10 piores peritos do período')
+    who.add_argument('--perito')
+    who.add_argument('--top10', action='store_true')
 
-    p.add_argument('--min-analises', type=int, default=50, help='Mínimo de análises para elegibilidade do Top 10')
+    p.add_argument('--min-analises', type=int, default=50)
 
-    p.add_argument('--include-high-nc', dest='include_high_nc', action='store_true', default=True,
-                   help='(default) Incluir coorte extra de %NC alta no relatório Top 10')
-    p.add_argument('--no-high-nc', dest='include_high_nc', action='store_false',
-                   help='Não incluir a coorte extra de %NC alta')
-    p.add_argument('--high-nc-threshold', type=float, default=90.0, help='Limiar de %NC para a coorte extra (padrão: 90)')
-    p.add_argument('--high-nc-min-tasks', type=int, default=50, help='Mínimo de tarefas para a coorte extra (padrão: 50)')
+    # flags do KPI base
+    p.add_argument('--export-org', action='store_true')
+    p.add_argument('--export-pdf', action='store_true')
+    p.add_argument('--add-comments', action='store_true')
+    p.add_argument('--r-appendix', dest='r_appendix', action='store_true', default=True)
+    p.add_argument('--no-r-appendix', dest='r_appendix', action='store_false')
+    p.add_argument('--include-high-nc', dest='include_high_nc', action='store_true', default=True)
+    p.add_argument('--no-high-nc', dest='include_high_nc', action='store_false')
+    p.add_argument('--high-nc-threshold', type=float, default=90.0)
+    p.add_argument('--high-nc-min-tasks', type=int, default=50)
+    p.add_argument('--r-bin', default='Rscript')
+    p.add_argument('--plan-only', action='store_true', help='Apenas listar o plano de execução (dry-run) e sair.')
 
-    p.add_argument('--export-org', action='store_true', help='Exporta relatório consolidado em Org-mode')
-    p.add_argument('--export-pdf', action='store_true', help='Exporta relatório consolidado em PDF (via Pandoc)')
-    p.add_argument('--add-comments', action='store_true', help='Inclui comentários GPT (quando suportado pelos scripts)')
+    # impacto
+    p.add_argument('--with-impact', action='store_true')
+    p.add_argument('--impact-all-tests', action='store_true')
 
-    p.add_argument('--plan-only', action='store_true', help='Somente imprime os comandos planejados (dry-run)')
-
-    p.add_argument('--r-appendix', action='store_true', default=True, help='(default) Executa os R checks e inclui no apêndice')
-    p.add_argument('--no-r-appendix', dest='r_appendix', action='store_false', help='Não executar os R checks')
-    p.add_argument('--r-bin', default='Rscript', help='Binário do Rscript (padrão: Rscript)')
+    # NOVO: reutilizar saídas já geradas pelo make_kpi_report.py
+    p.add_argument('--reuse-kpi', action='store_true',
+                   help='Não reexecuta o KPI base; usa o .org/imgs já existentes para montar e exportar.')
+    p.add_argument('--assemble-only', dest='reuse_kpi', action='store_true',
+                   help='Atalho para --reuse-kpi.')
     return p.parse_args()
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -355,6 +356,132 @@ def _inject_comment_for_stem(stem, comments_dir, output_dir, imgs_dir=None):
     print(f"[comments] comentário não encontrado para stem='{stem}'")
     return []
 
+def _find_impacto_dir_for_perito(periodo_dir: str, perito: str) -> str | None:
+    """
+    Procura .../outputs/<periodo>/impacto_fila/<PERITO>/ e retorna esse caminho.
+    Usa o mesmo sanitizador _safe() para casar o nome da pasta.
+    """
+    root = os.path.join(periodo_dir, "impacto_fila")
+    if not os.path.isdir(root):
+        return None
+    safe = _safe(perito)
+    # tentativa direta
+    cand = os.path.join(root, safe)
+    if os.path.isdir(cand):
+        return cand
+    # varre subpastas e compara pelo _safe
+    for d in glob(os.path.join(root, "*")):
+        if os.path.isdir(d) and _safe(os.path.basename(d)).lower() == safe.lower():
+            return d
+    return None
+
+def _copy_impacto_imgs_to_relatorio(impacto_dir: str, imgs_dir_dest: str) -> int:
+    """
+    Copia PNGs de .../impacto_fila/<PERITO>/exports para imgs/ do relatório.
+    """
+    os.makedirs(imgs_dir_dest, exist_ok=True)
+    src_dir = os.path.join(impacto_dir, "exports")
+    moved = 0
+    if os.path.isdir(src_dir):
+        for src in glob(os.path.join(src_dir, "*.png")):
+            shutil.copy2(src, os.path.join(imgs_dir_dest, os.path.basename(src)))
+            moved += 1
+    return moved
+
+def _append_impacto_fila_perito(lines, periodo_dir, perito, start, end, heading_level="**"):
+    safe = _safe(perito)
+    org_dir = os.path.join(periodo_dir, "impacto_fila", safe, "org")
+    candidates = [
+        os.path.join(org_dir, f"impacto_fila_{safe}_{start}_a_{end}.org"),
+        os.path.join(org_dir, f"impacto_fila_{start}_a_{end}.org"),
+    ]
+    # fallback: qualquer arquivo de impacto desse perito no período
+    if not any(os.path.exists(p) for p in candidates):
+        candidates = sorted(glob(os.path.join(org_dir, f"impacto_fila*{start}_a_{end}.org")))
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    lines.append(f"{heading_level} Impacto na fila — {perito}")
+                    content = shift_org_headings(content, delta=1)
+                    content = _protect_org_text_for_pandoc(content)
+                    lines.append(content)
+                    lines.append("\n#+LATEX: \\newpage\n")
+                    return True
+            except Exception as e:
+                print(f"[AVISO] Falha lendo impacto_fila para {perito}: {e}")
+            break
+    return False
+
+def _append_impacto_fila_grupo(lines, periodo_dir, start, end, heading_level="**"):
+    # procura um único arquivo “impacto_fila_<start>_a_<end>.org” (sem nome de perito)
+    pattern = os.path.join(periodo_dir, "impacto_fila", "**", "org", f"impacto_fila_{start}_a_{end}.org")
+    matches = sorted(glob(pattern, recursive=True))
+    if not matches:
+        return False
+    path = matches[0]  # inclui só uma vez
+    try:
+        with open(path, encoding="utf-8") as f:
+            content = f.read().strip()
+        if content:
+            lines.append(f"{heading_level} Impacto na fila — Grupo")
+            content = shift_org_headings(content, delta=1)
+            content = _protect_org_text_for_pandoc(content)
+            lines.append(content)
+            lines.append("\n#+LATEX: \\newpage\n")
+            return True
+    except Exception as e:
+        print(f"[AVISO] Falha lendo impacto_fila (grupo): {e}")
+    return False
+
+# --- FUNÇÃO CORRIGIDA ---
+def coletar_orgs_impacto(out_root: str, start: str, end: str,
+                         perito: str | None = None,
+                         group: str = "impacto_fila") -> list[str]:
+    """
+    Retorna os .org de 'Impacto na Fila' para o grupo (Top10) OU para um perito específico.
+
+    - Se perito is None: procura apenas o impacto do GRUPO:
+        {out_root}/top10/{group}/org/{group}_{start}_a_{end}.org  (exato)
+        fallback: {out_root}/top10/{group}/org/{group}_*_{start}_a_{end}.org
+
+    - Se perito for dado: procura o impacto DO PERITO:
+        {out_root}/individual/{_safe(perito)}/{group}/org/{group}_{start}_a_{end}.org  (exato)
+        fallback: {out_root}/individual/{_safe(perito)}/{group}/org/{group}_*_{start}_a_{end}.org
+
+    Usa import local 'from glob import glob as _glob' para evitar conflitos
+    com qualquer 'import glob' em outro ponto do arquivo.
+    """
+    from glob import glob as _glob
+    import os
+
+    hits: list[str] = []
+
+    def _collect(patterns: list[str]) -> None:
+        for pat in patterns:
+            for p in _glob(pat):
+                if os.path.isfile(p):
+                    hits.append(p)
+
+    if perito:
+        safe = _safe(perito)
+        base_dir = os.path.join(out_root, "individual", safe, group, "org")
+        patterns = [
+            os.path.join(base_dir, f"{group}_{start}_a_{end}.org"),
+            os.path.join(base_dir, f"{group}_*_{start}_a_{end}.org"),
+        ]
+        _collect(patterns)
+    else:
+        base_dir = os.path.join(out_root, "top10", group, "org")
+        patterns = [
+            os.path.join(base_dir, f"{group}_{start}_a_{end}.org"),
+            os.path.join(base_dir, f"{group}_*_{start}_a_{end}.org"),
+        ]
+        _collect(patterns)
+
+    return sorted(set(hits))
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Weekday→Weekend: consultas e inserções em Org
@@ -2183,6 +2310,8 @@ def _append_protocol_transfers_perito_block_if_any(lines: list[str], perito: str
     lines.append(f"**Protocolos transferidos que envolvem este perito ({len(protos)}):** {', '.join(protos)}{hint}")
     lines.append("")
     return True
+
+# --- MAIN ATUALIZADO ---
 def main():
     """
     Orquestração principal:
@@ -2453,18 +2582,35 @@ def main():
             org_final = os.path.join(RELATORIO_DIR, f"relatorio_dez_piores_{args.start}_a_{args.end}.org")
             lines = [f"* Relatório dos 10 piores peritos ({args.start} a {args.end})", ""]
 
+            # Grupo (Top10)
             if org_grupo_top10 and os.path.exists(org_grupo_top10):
                 with open(org_grupo_top10, encoding="utf-8") as f:
                     lines.append(f.read().strip())
                     lines.append("#+LATEX: \\newpage\n")
 
+            # Cada perito + Impacto na Fila (perito)
             for org_path in org_paths:
                 with open(org_path, encoding="utf-8") as f:
                     content = f.read().strip()
-                    if content:
-                        lines.append(content)
-                        lines.append("#+LATEX: \\newpage\n")
+                if content:
+                    lines.append(content)
+                    lines.append("#+LATEX: \\newpage\n")
 
+                # ← NOVO: inserir Impacto na Fila do PERITO (se existir)
+                perito_safe = os.path.splitext(os.path.basename(org_path))[0]
+                per_impacts = coletar_orgs_impacto(PERIODO_DIR, args.start, args.end, perito=perito_safe)
+                for imp_path in per_impacts:
+                    try:
+                        with open(imp_path, encoding="utf-8") as fi:
+                            imp_txt = fi.read().strip()
+                        if imp_txt:
+                            imp_txt = shift_org_headings(_protect_org_text_for_pandoc(imp_txt), delta=1)
+                            lines.append(imp_txt)
+                            lines.append("#+LATEX: \\newpage\n")
+                    except Exception as e:
+                        print(f"[AVISO] Falha ao anexar impacto do perito ({imp_path}): {e}")
+
+            # Extras (coorte de %NC altíssima)
             if extras_org_paths:
                 lines.append(f"** Peritos com %NC ≥ {args.high_nc_threshold:.0f}% e ≥ {args.high_nc_min_tasks} tarefas\n")
                 for org_path in extras_org_paths:
@@ -2475,13 +2621,25 @@ def main():
                             lines.append(content)
                             lines.append("#+LATEX: \\newpage\n")
 
+            # ← NOVO: Impacto na Fila do GRUPO (Top10)
+            grp_impacts = coletar_orgs_impacto(PERIODO_DIR, args.start, args.end, perito=None)
+            for path in grp_impacts:
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        content = f.read().strip()
+                    if content:
+                        content = shift_org_headings(_protect_org_text_for_pandoc(content), delta=1)
+                        lines.append(content)
+                        lines.append("#+LATEX: \\newpage\n")
+                except Exception as e:
+                    print(f"[AVISO] Falha ao anexar impacto do grupo ({path}): {e}")
+
             # Protocolos transferidos (grupo)
             _append_protocol_transfers_group_block(
                 lines, RELATORIO_DIR, args.start, args.end, heading_level="**"
             )
 
             # Panorama global (W→WE) AO FINAL do Top10
-
             _append_weekday2weekend_panorama_block(
                 lines, IMGS_DIR, COMMENTS_DIR,
                 start=args.start, end=args.end,
@@ -2492,7 +2650,7 @@ def main():
                 f.write("\n".join(lines).strip() + "\n")
             print(f"✅ Org consolidado salvo em: {org_final}")
 
-            # Reincidentes (≥2 meses no Top 10) — agora via DB Jan→end e com min_analises do CLI
+            # Reincidentes (≥2 meses no Top 10) — DB Jan→end e min_analises do CLI
             reinc_csv = os.path.join(ORGS_DIR, "top10_reincidentes.csv")
             _run_reincidentes_scan(
                 reinc_csv,
@@ -2574,3 +2732,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

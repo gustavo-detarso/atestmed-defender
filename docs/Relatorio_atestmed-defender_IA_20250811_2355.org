@@ -1,3 +1,8 @@
+#+LATEX_HEADER: \usepackage{etoolbox}
+#+LATEX_HEADER: \AtBeginEnvironment{tabular}{\scriptsize}
+#+LATEX_HEADER: \AtBeginEnvironment{tabularx}{\scriptsize}
+#+LATEX_HEADER: \AtBeginEnvironment{longtable}{\scriptsize}
+#+LATEX_HEADER: \AtBeginEnvironment{threeparttable}{\scriptsize}
 #+INCLUDE: "/home/gustavodetarso/Documentos/.share/header_mps_org/header_mps.org"
 
 *RELATÓRIO INSTITUCIONAL – SISTEMA atestmed-defender*
