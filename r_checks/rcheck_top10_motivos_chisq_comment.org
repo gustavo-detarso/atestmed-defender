@@ -1,6 +1,0 @@
-*Método.* Identificamos os *Top 10 piores* por *scoreFinal* (mín. 50 análises). Construímos uma tabela motivo × grupo (*Top10* vs *Resto*), agregando motivos raros (< 10) em 'OUTROS' para estabilidade. Aplicamos o teste *qui-quadrado* global (χ²) e, por motivo, comparamos as *proporções* do Top10 (n=764) e do Resto (n=69349). No gráfico, exibimos os 7 motivos com maior |diferença| (Top10 − Resto).
-
-*Interpretação.* O teste global indica diferenças *estatisticamente significativas* (p = 0.0000000000000000000000000148). Barras *positivas* indicam motivos relativamente mais comuns no Top10; *negativas*, menos comuns. Use como *pistas* para auditoria qualitativa, considerando volume e contexto.
-- Mais frequentes no Top10: Não foi apresentado documento médico/odontológico (+8.4% p.p.), A documentação está ilegível (+8.3% p.p.), Não há identificação do requerente (+1.7% p.p.) .
-- Menos frequentes no Top10: Há rasura ou erro grosseiro que impede a conformação (-10.9% p.p.), Não há diagnóstico por extenso ou código CID (-5.4% p.p.), Não há data de emissão (-1.7% p.p.) .
-
