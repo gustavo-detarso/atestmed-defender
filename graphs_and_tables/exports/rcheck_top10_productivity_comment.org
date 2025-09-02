@@ -1,0 +1,6 @@
+*Método.* Selecionamos os *10 piores* peritos no período (2025-06-01 a 2025-06-30) pelo *ScoreFinal* em `indicadores`, exigindo ao menos *50* análises. Para cada um, calculamos a *produtividade* como *total de perícias válidas* (0<dur≤3600) dividido pelo *tempo total válido* (soma das durações) em horas. Quando não há coluna de duração em 'analises', usa-se (julianday(fim)−julianday(início))*86400.
+
+*Interpretação.* Entre os Top 10, a produtividade variou de 32.0 a 90.6 análises/h; média=59.0, mediana=58.7.
+- Maiores produtividades: EDUARDO DE CARVALHO: 90.6/h (n=115); VANIA CRISTINA CAMPELO BARROSO CARNEIRO: 80.1/h (n=413); DAVID MEREU MORENO: 64.2/h (n=301).
+Valores muito altos podem sinalizar *execuções excessivamente rápidas* e merecem auditoria; sempre considere o volume (n) e o contexto das tarefas.
+

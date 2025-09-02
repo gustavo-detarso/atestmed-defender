@@ -1,0 +1,3 @@
+*Método.* Intervalo 2025-06-01 a 2025-06-30. Selecionamos tarefas com *início* em dia útil (seg–sex) e *término* no *fim de semana* (sáb/dom). Quando não há coluna de término, usamos *início + duração* (numérica ou HH:MM:SS) de forma vetorizada.
+
+*Interpretação.* A contagem por perito e por CR pode indicar encerramentos deslocados para o fim de semana—observe volumes e contexto antes de qualquer inferência causal.

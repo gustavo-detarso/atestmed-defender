@@ -1,0 +1,17 @@
+* Produtividade — Percentual do tempo de peritos ≥ 50/h (Top 10 vs Brasil (excl.))
+:PROPERTIES:
+:PERIODO: 2025-06-01 a 2025-06-30
+:METRICA: time-share
+:TOP10: EDUARDO DE CARVALHO, GIDEAO CABRAL DA SILVA, GEZIO SOARES DE SOUZA JUNIOR, RICARDO PREDEBON VANZO, ALEXANDRE NUNES MEDEIROS, RONI MOTIZUKI, JOSE RICARDO GOMES DE ALCANTARA, RODRIGO LIMA MEDEIROS BARBOSA, DAVID MEREU MORENO, VANIA CRISTINA CAMPELO BARROSO CARNEIRO
+:END:
+
+| Categoria | Tempo (s) peritos acima do limiar | Tempo (s) total | % |
+|-
+| Top 10 piores  | 138668 | 41769215 | 78.53% |
+| Brasil (excl.) | 1814023 | 41769215 | 4.34% |
+
+#+CAPTION: Produtividade — Percentual do tempo de peritos ≥ 50/h (Top 10 vs Brasil (excl.))
+[[file:produtividade_time-share_50h_top10.png]]
+
+** Comentário
+No período de junho de 2025, a comparação entre a produtividade dos 10 piores peritos e a média do Brasil (excluindo esses peritos) revela uma diferença significativa. A proporção de tempo em que os peritos dos 10 piores se mantiveram acima do limiar de 50 horas foi de aproximadamente 78,5%, enquanto a média nacional foi de apenas 4,3%. Essa diferença é de cerca de 74,2 pontos percentuais, evidenciando uma discrepância notável na produtividade. Os dados indicam que, dos 176.587 registros dos 10 piores, 138.668 se enquadraram na categoria de produtividade superior ao limiar, enquanto no Brasil, com um total de 41.769.215 registros, apenas 1.814.023 atingiram essa marca. Essa análise sugere que, apesar da alta proporção de produtividade entre os 10 piores, a média nacional é drasticamente inferior, o que pode refletir variações nas condições de trabalho ou na eficiência dos peritos em diferentes contextos.

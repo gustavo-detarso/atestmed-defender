@@ -1,0 +1,9 @@
+#+CAPTION: Motivos de NC (robusto) — Diferença de proporções (Top10 − Resto)
+[[file:rcheck_top10_motivos_chisq.png]]
+
+*Método.* Identificamos os *Top 10 piores* por *scoreFinal* (mín. 50 análises). Construímos uma tabela motivo × grupo (*Top10* vs *Resto*), agregando motivos raros (< 10) em 'OUTROS' para estabilidade. Aplicamos o teste *qui-quadrado* global (χ²) e, por motivo, comparamos as *proporções* do Top10 (n=1189) e do Resto (n=50245). No gráfico, exibimos os 7 motivos com maior |diferença| (Top10 − Resto).
+
+*Interpretação.* O teste global indica diferenças *estatisticamente significativas* (p = 0.000000000000000000000000000000000000000000000000000000000000000000206). Barras *positivas* indicam motivos relativamente mais comuns no Top10; *negativas*, menos comuns. Use como *pistas* para auditoria qualitativa, considerando volume e contexto.
+- Mais frequentes no Top10: A documentação está ilegível (+15.4% p.p.), Não foi apresentado documento médico/odontológico (+10.3% p.p.), Não há identificação do requerente (+0.3% p.p.) .
+- Menos frequentes no Top10: Há rasura ou erro grosseiro que impede a conformação (-12.1% p.p.), Não há diagnóstico por extenso ou código CID (-5.8% p.p.), Não há identificação do emissor (-5.0% p.p.) .
+

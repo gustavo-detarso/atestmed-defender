@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # ==========================================
-# Helper para perguntar com default
+# Helpers (ask, confirm, datas, meses)
 # ==========================================
 ask() {
-  local prompt="$1"; shift
-  local default="${1:-}"; shift || true
+  local prompt="$1"; shift || true
+  local default="${1:-}"
   local var
   if [[ -n "${default}" ]]; then
     read -r -p "${prompt} [${default}]: " var || true
@@ -18,7 +18,7 @@ ask() {
 }
 
 confirm() {
-  local prompt="$1"; shift
+  local prompt="$1"; shift || true
   local default="${1:-y}"
   local ans; ans=$(ask "${prompt}" "${default}")
   case "${ans,,}" in
@@ -27,7 +27,6 @@ confirm() {
   esac
 }
 
-# Validação simples de data (YYYY-MM-DD) usando `date -d`
 ask_date() {
   local prompt="$1"; shift || true
   local default="${1:-}"
@@ -52,21 +51,22 @@ ask_date() {
   done
 }
 
-# ==========================================
-# Defaults = o SEU comando atual + apêndice %NC
-# (Datas removidas: serão sempre inseridas pelo usuário)
-# ==========================================
-START=""  # sempre solicitado ao usuário
-END=""    # sempre solicitado ao usuário
+date_bin() { if command -v gdate >/dev/null 2>&1; then echo "gdate"; else echo "date"; fi; }
+DBIN="$(date_bin)"
+ym_first_day() { echo "$1-01"; }
+ym_last_day()  { $DBIN -d "$1-01 +1 month -1 day" +%Y-%m-%d; }
 
+# ==========================================
+# Defaults (podem ser alterados na personalização)
+# ==========================================
+START=""; END=""
 MODE="top10"                # top10 | perito
 PERITO_NAME=""
 
 MIN_ANALISES="50"
-TOPN="10"                   # default do programa
-
+TOPN="10"
 ALPHA="0.8"
-PBR=""                      # vazio = calcular do período automaticamente
+PBR=""                      # vazio = auto
 
 SELECT_SRC="both"           # impact | kpi | both
 KPI_MIN="50"
@@ -79,7 +79,7 @@ NC_OUTLIER_THRESH="0.90"           # usado apenas se fixed
 NC_OUTLIER_MIN_N="50"
 NC_OUTLIER_FDR="0.05"
 NC_OUTLIER_GRID="0.60,0.70,0.80,0.85,0.90,0.95"
-NC_OUTLIER_ADD_TO="both"           # usado quando NÃO houver apêndice
+NC_OUTLIER_ADD_TO="both"           # quando NÃO houver apêndice
 
 # Testes / Sensibilidade / Estratos
 ALL_TESTS="y"
@@ -134,26 +134,79 @@ ATT_BR=""
 GPT_COMMENTS="y"
 
 # ==========================================
-# Coleta OBRIGATÓRIA de datas (sempre antes de tudo)
+# Cabeçalho + Escolha do período (mesma sequência do KPI Wizard)
 # ==========================================
-echo "Relatório 'Impacto na Fila' — launcher interativo"
+echo "===== Impacto na Fila — Wizard (Top10 | Individual) ====="
+echo
+echo "Escolha o período:"
+echo "  1) Mês atual"
+echo "  2) Mês anterior"
+echo "  3) Escolher um dos últimos 6 meses"
+echo "  4) Intervalo personalizado (YYYY-MM-DD a YYYY-MM-DD)"
+echo
 
-START=$(ask_date "Informe a data inicial --start (YYYY-MM-DD)")
-END=$(ask_date "Informe a data final --end (YYYY-MM-DD)")
+read -r -p "Opção [1-4]: " OPT || true
+echo
 
-# Garante que END >= START
+case "${OPT:-}" in
+  1)
+    YM="$($DBIN +%Y-%m)"
+    START="$(ym_first_day "$YM")"
+    END="$(ym_last_day "$YM")"
+    ;;
+  2)
+    YM="$($DBIN -d "$($DBIN +%Y-%m-01) -1 month" +%Y-%m)"
+    START="$(ym_first_day "$YM")"
+    END="$(ym_last_day "$YM")"
+    ;;
+  3)
+    echo "Selecione o mês:"
+    declare -a LIST=()
+    for i in {0..5}; do
+      LIST+=("$($DBIN -d "$($DBIN +%Y-%m-01) -${i} month" +%Y-%m)")
+    done
+    idx=1
+    for ym in "${LIST[@]}"; do
+      echo "  $idx) $ym"
+      idx=$((idx+1))
+    done
+    echo
+    read -r -p "Mês [1-${#LIST[@]}]: " MIDX || true
+    if ! [[ "$MIDX" =~ ^[1-9][0-9]*$ ]] || (( MIDX < 1 || MIDX > ${#LIST[@]} )); then
+      echo "❌ Opção inválida." >&2; exit 1
+    fi
+    YM="${LIST[$((MIDX-1))]}"
+    START="$(ym_first_day "$YM")"
+    END="$(ym_last_day "$YM")"
+    ;;
+  4)
+    START=$(ask_date "Data inicial (YYYY-MM-DD)")
+    END=$(ask_date   "Data final   (YYYY-MM-DD)")
+    ;;
+  *)
+    echo "❌ Opção inválida." >&2; exit 1
+    ;;
+esac
+
+# Garante END >= START
 while true; do
   if (( $(date -d "$END" +%s) < $(date -d "$START" +%s) )); then
     echo "A data final deve ser maior ou igual à data inicial." >&2
-    END=$(ask_date "Informe a data final --end (YYYY-MM-DD)")
+    END=$(ask_date "Data final (YYYY-MM-DD)")
   else
     break
   fi
 done
 
-# ==========================================
-# Escolha rápida: padrão ou personalizar (restante das opções)
-# ==========================================
+echo
+echo "Período escolhido: ${START} a ${END}"
+echo "Padrão: Top 10, --min-analises 50, --alpha 0.8,"
+echo "        --select-src both (--kpi-min-analises 50),"
+echo "        --appendix-nc-outliers --appendix-nc-explain,"
+echo "        --nc-outlier-mode adaptive-fdr (grid e FDR padrão),"
+echo "        --all-tests (inclui permute 5000, CMH by=cr, PSA 10000), --sens-plot,"
+echo "        --by cr, --export-png --export-pdf,"
+echo "        --header-and-text (arquivo padrão), --gpt-comments."
 if confirm "Usar COMANDO PADRÃO agora?" "y"; then
   USE_DEFAULT="y"
 else
@@ -164,7 +217,7 @@ fi
 # Personalização guiada (se escolhida)
 # ==========================================
 if [[ "$USE_DEFAULT" == "n" ]]; then
-  # Você pode reescrever as datas, se quiser
+  # Você pode reescrever as datas
   START=$(ask "Data inicial --start" "$START")
   END=$(ask "Data final --end" "$END")
   while true; do
@@ -313,7 +366,7 @@ fi
 # ==========================================
 # Montagem do comando
 # ==========================================
-CMD=( python3 -m reports.make_impact_report_pdf
+CMD=( python3 -m reports.make_impact_report
   --start "$START" --end "$END"
 )
 

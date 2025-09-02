@@ -1,0 +1,17 @@
+* Sobreposição — percentual de tarefas sobrepostas (Top 10 vs Brasil (excl.))
+:PROPERTIES:
+:PERIODO: 2025-06-01 a 2025-06-30
+:METRICA: task-share
+:TOP10: EDUARDO DE CARVALHO, GIDEAO CABRAL DA SILVA, GEZIO SOARES DE SOUZA JUNIOR, RICARDO PREDEBON VANZO, ALEXANDRE NUNES MEDEIROS, RONI MOTIZUKI, JOSE RICARDO GOMES DE ALCANTARA, RODRIGO LIMA MEDEIROS BARBOSA, DAVID MEREU MORENO, VANIA CRISTINA CAMPELO BARROSO CARNEIRO
+:END:
+
+| Categoria | Tarefas sobrepostas (n) | Total de tarefas | % |
+|-
+| Top 10 piores  | 464 | 2796 | 16.60% |
+| Brasil (excl.) | 45844 | 302626 | 15.15% |
+
+#+CAPTION: Comparação do percentual de tarefas sobrepostas.
+[[file:sobreposicao_task-share_top10.png]]
+
+** Comentário
+No período de junho de 2025, a proporção de tarefas sobrepostas entre os "Top 10 piores" foi de 16,6%, enquanto a média para o Brasil (excluindo os piores) foi de 15,15%. Essa diferença de 1,45 pontos percentuais indica que os "Top 10 piores" apresentaram uma sobreposição de tarefas maior em comparação ao restante do Brasil. Os dados mostram que, entre os 464 casos analisados nos "Top 10 piores", a proporção de sobreposição é notavelmente superior à média observada nos 45.844 casos do Brasil excluindo esses grupos. Essa análise sugere que, embora a diferença percentual não seja extremamente alta, ela pode refletir variações significativas na gestão de tarefas e na eficiência operacional entre os grupos analisados. A comparação entre esses dois conjuntos de dados pode ser útil para identificar áreas de melhoria e otimização nas práticas de trabalho.

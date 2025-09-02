@@ -1,0 +1,17 @@
+* Sobreposição — percentual do tempo em overlap (Top 10 vs Brasil (excl.))
+:PROPERTIES:
+:PERIODO: 2025-06-01 a 2025-06-30
+:METRICA: time-share
+:TOP10: EDUARDO DE CARVALHO, GIDEAO CABRAL DA SILVA, GEZIO SOARES DE SOUZA JUNIOR, RICARDO PREDEBON VANZO, ALEXANDRE NUNES MEDEIROS, RONI MOTIZUKI, JOSE RICARDO GOMES DE ALCANTARA, RODRIGO LIMA MEDEIROS BARBOSA, DAVID MEREU MORENO, VANIA CRISTINA CAMPELO BARROSO CARNEIRO
+:END:
+
+| Categoria | Tempo sobreposto (s) | Tempo total (s) | % |
+|-
+| Top 10 piores  | 346359 | 2590269 | 13.37% |
+| Brasil (excl.) | 64466134 | 551467804 | 11.69% |
+
+#+CAPTION: Comparação do percentual do tempo em sobreposição.
+[[file:sobreposicao_time-share_top10.png]]
+
+** Comentário
+No período de junho de 2025, a comparação entre os grupos "Top 10 piores" e "Brasil (excl.)" revela que a proporção do tempo em sobreposição (time-share) é de 13,37% para o primeiro grupo, enquanto para o segundo grupo é de 11,69%. Essa diferença de 1,68 pontos percentuais indica que os "Top 10 piores" apresentam uma maior sobreposição em relação ao tempo analisado. O grupo "Top 10 piores" é representado por 346.359 casos, o que corresponde a um total de 2.590.269, enquanto o grupo "Brasil (excl.)" tem 64.466.134 casos em um total de 551.467.804. Esses números sugerem que, apesar da diferença percentual, a magnitude dos denominadores é significativamente maior no grupo "Brasil (excl.)", o que pode influenciar a interpretação dos dados. Assim, a análise do time-share entre esses grupos pode fornecer insights sobre o comportamento de uso do tempo em contextos distintos.

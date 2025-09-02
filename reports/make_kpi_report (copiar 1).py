@@ -533,9 +533,11 @@ def _append_weekday2weekend_panorama_block(
     comments_dir: str,
     start: str = None,
     end: str = None,
-    heading_level: str = "**",
-    imgs_prefix: str = "imgs/",
+    heading_level: str = "**"
 ) -> bool:
+    """
+    Acrescenta panorama global (gráfico por CR, tabela org e protocolos por perito), se existirem.
+    """
     orgs_dir   = os.path.join(os.path.dirname(imgs_dir), "orgs")
     png_path   = os.path.join(imgs_dir, "rcheck_weekday_to_weekend_by_cr.png")
     table_org  = os.path.join(orgs_dir, "rcheck_weekday_to_weekend_table.org")
@@ -548,6 +550,7 @@ def _append_weekday2weekend_panorama_block(
 
     lines.append(f"{heading_level} Panorama global — Início em dia útil → conclusão no fim de semana (por CR)")
 
+    # Comentário (se existir)
     if os.path.exists(comment_org):
         try:
             with open(comment_org, encoding="utf-8") as f:
@@ -557,6 +560,7 @@ def _append_weekday2weekend_panorama_block(
         except Exception as e:
             print(f"[AVISO] Falha ao anexar comentário do panorama: {e}")
 
+    # Tabela (+ possível figura embutida)
     table_content = ""
     has_png_inside_table = False
     if os.path.exists(table_org):
@@ -567,7 +571,6 @@ def _append_weekday2weekend_panorama_block(
                 ln for ln in table_content.splitlines()
                 if not ln.strip().lower().startswith("#+title")
             ).strip()
-            table_content = table_content.replace("[[file:imgs/", f"[[file:{imgs_prefix}")
             has_png_inside_table = "rcheck_weekday_to_weekend_by_cr.png" in table_content
             table_content = _ensure_blank_lines_around_tables(table_content)
         except Exception as e:
@@ -580,12 +583,13 @@ def _append_weekday2weekend_panorama_block(
             "",
             "#+ATTR_LATEX: :placement [H] :width \\linewidth",
             "#+CAPTION: Tarefas iniciadas em dia útil e concluídas no fim de semana — por CR (ordenado)",
-            f"[[file:{imgs_prefix}{base}]]",
+            f"[[file:imgs/{base}]]",
         ])
 
     if table_content:
         lines.extend(["", table_content])
 
+    # Protocolos: .org pronto ou fallback dinâmico
     appended_protocols = False
     if os.path.exists(protos_org):
         try:
@@ -595,7 +599,6 @@ def _append_weekday2weekend_panorama_block(
                 ln for ln in protos_content.splitlines()
                 if not ln.strip().lower().startswith("#+title")
             ).strip()
-            protos_content = protos_content.replace("[[file:imgs/", f"[[file:{imgs_prefix}")
             protos_content = re.sub(
                 r'^\s*\*+\s+Protocolos envolvidos\s*\(por perito\)\s*\n',
                 '',
@@ -628,7 +631,6 @@ def _append_weekday2weekend_panorama_block(
 
     lines.append("\n#+LATEX: \\newpage\n")
     return True
-
 
 def _append_weekday2weekend_perito_block_if_any(
     lines: list,
@@ -1732,28 +1734,23 @@ def gerar_r_apendice_group_comments_if_possible(imgs_dir: str, comments_dir: str
 # ────────────────────────────────────────────────────────────────────────────────
 # Montagem dos .org (perito e grupo)
 # ────────────────────────────────────────────────────────────────────────────────
-def gerar_org_perito(
-    perito: str,
-    start: str,
-    end: str,
-    add_comments: bool,
-    imgs_dir: str,
-    comments_dir: str,
-    output_dir: str,
-    orgs_dir: str | None = None,
-):
+def gerar_org_perito(perito, start, end, add_comments, imgs_dir, comments_dir, output_dir):
+    """
+    Monta o arquivo {perito}.org com:
+      - cabeçalho de métricas
+      - gráficos (ordenados)
+      - comentários (quando existirem)
+      - apêndice de protocolos NC
+      - apêndice de R checks
+    """
     safe = _safe(perito)
-    out_dir = orgs_dir or output_dir
-    os.makedirs(out_dir, exist_ok=True)
-    org_path = os.path.join(out_dir, f"{safe}.org")
-
-    # prefixo correto de imagens conforme destino
-    imgs_prefix = "../imgs/" if orgs_dir else "imgs/"
+    org_path = os.path.join(output_dir, f"{safe}.org")
 
     lines = [f"** {perito}"]
     total, pct_nc, cr, dr = get_summary_stats(perito, start, end)
     lines += [f"- Tarefas: {total}", f"- % NC: {pct_nc:.1f}", f"- CR: {cr} | DR: {dr}", ""]
 
+    # Gráficos principais (Python) — ORDEM CONTROLADA
     all_pngs = glob(os.path.join(imgs_dir, f"*{safe}.png"))
     main_pngs = [p for p in all_pngs if not os.path.basename(p).lower().startswith("rcheck_")]
     main_pngs.sort(key=_png_rank_main)
@@ -1763,18 +1760,21 @@ def gerar_org_perito(
         lines += [
             "#+ATTR_LATEX: :placement [H] :width \\linewidth",
             f"#+CAPTION: {_nice_caption(base)}",
-            f"[[file:{imgs_prefix}{base}]]",
+            f"[[file:imgs/{base}]]",
         ]
         if add_comments:
             stem = os.path.splitext(base)[0]
             quote_lines = _inject_comment_for_stem(stem, comments_dir, output_dir, imgs_dir=imgs_dir)
             lines += quote_lines
+
         lines.append("\n#+LATEX: \\newpage\n")
 
+    # Protocolos transferidos: este perito
     _append_protocol_transfers_perito_block_if_any(
-        lines, perito, start, end, relatorio_dir=output_dir, heading_level="***", link_prefix="../" if orgs_dir else ""
+        lines, perito, start, end, relatorio_dir=output_dir, heading_level="***"
     )
 
+    # Apêndice: Protocolos NC por motivo
     apdf = gerar_apendice_nc(perito, start, end)
     if not apdf.empty:
         lines.append(f"*** Apêndice: Protocolos Não-Conformados por Motivo")
@@ -1783,6 +1783,7 @@ def gerar_org_perito(
             lines.append(f"- *{grp['motivo_text']}*: {grp['protocolo']}")
         lines.append("")
 
+    # Apêndice: R checks (perito) — ORDEM CONTROLADA
     r_pngs = glob(os.path.join(imgs_dir, f"rcheck_*_{safe}.png"))
     r_pngs.sort(key=lambda p: _rcheck_perito_rank(p))
     if r_pngs:
@@ -1792,7 +1793,7 @@ def gerar_org_perito(
             lines += [
                 "#+ATTR_LATEX: :placement [H] :width \\linewidth",
                 f"#+CAPTION: {_nice_caption(base)}",
-                f"[[file:{imgs_prefix}{base}]]",
+                f"[[file:imgs/{base}]]",
             ]
             if add_comments:
                 stem = os.path.splitext(base)[0]
@@ -1806,16 +1807,11 @@ def gerar_org_perito(
     return org_path
 
 
-def gerar_org_top10_grupo(start, end, output_dir, imgs_dir, comments_dir, orgs_dir=None):
+def gerar_org_top10_grupo(start, end, output_dir, imgs_dir, comments_dir):
     """
     Monta o org do grupo Top10 (gráficos + comentários, incluindo R checks do grupo).
-    Agora salva em orgs_dir (se informado) e corrige prefixo de imagens.
     """
-    save_dir = orgs_dir or output_dir
-    os.makedirs(save_dir, exist_ok=True)
-    org_path = os.path.join(save_dir, f"top10_grupo.org")
-    imgs_prefix = "../imgs/" if orgs_dir else "imgs/"
-
+    org_path = os.path.join(output_dir, f"top10_grupo.org")
     lines = [f"** Top 10 — Gráficos do Grupo ({start} a {end})\n"]
 
     all_pngs = sorted(glob(os.path.join(imgs_dir, "*_top10*.png")) + glob(os.path.join(imgs_dir, "*top10*.png")))
@@ -1830,11 +1826,12 @@ def gerar_org_top10_grupo(start, end, output_dir, imgs_dir, comments_dir, orgs_d
         lines += [
             "#+ATTR_LATEX: :placement [H] :width \\linewidth",
             f"#+CAPTION: {_nice_caption(base)}",
-            f"[[file:{imgs_prefix}{base}]]",
+            f"[[file:imgs/{base}]]",
         ]
         stem = os.path.splitext(base)[0]
         quote_lines = _inject_comment_for_stem(stem, comments_dir, output_dir)
         lines += quote_lines
+
         lines.append("\n#+LATEX: \\newpage\n")
 
     with open(org_path, "w", encoding="utf-8") as f:
@@ -1843,97 +1840,46 @@ def gerar_org_top10_grupo(start, end, output_dir, imgs_dir, comments_dir, orgs_d
     return org_path
 
 
-def gerar_org_individual_consolidado(perito: str, start: str, end: str, relatorio_dir: str):
-    import shutil
+def gerar_org_individual_consolidado(perito, start, end, relatorio_dir):
+    """Envolve o {perito}.org em um container 'Relatório individual — ...'."""
     safe = _safe(perito)
-    orgs_dir = os.path.join(relatorio_dir, "orgs")
-    os.makedirs(orgs_dir, exist_ok=True)
-
-    cand_new = os.path.join(orgs_dir, f"{safe}.org")
-    cand_old = os.path.join(relatorio_dir, f"{safe}.org")
-
-    if os.path.exists(cand_new):
-        perito_org = cand_new
-    elif os.path.exists(cand_old):
-        try:
-            shutil.move(cand_old, cand_new)
-            print(f"[MOVE] {cand_old} → {cand_new}")
-            perito_org = cand_new
-        except Exception as e:
-            print(f"[AVISO] Falha ao mover {cand_old} → {cand_new}: {e}. Usando origem antiga.")
-            perito_org = cand_old
-    else:
-        raise FileNotFoundError(f"Org individual não encontrado (new/old): {cand_new} | {cand_old}")
-
-    final_org  = os.path.join(orgs_dir, f"relatorio_{safe}_{start}_a_{end}.org")
+    perito_org = os.path.join(relatorio_dir, f"{safe}.org")
+    final_org  = os.path.join(relatorio_dir, f"relatorio_{safe}_{start}_a_{end}.org")
+    if not os.path.exists(perito_org):
+        raise FileNotFoundError(f"Org individual não encontrado: {perito_org}")
     with open(perito_org, "r", encoding="utf-8") as f:
         content = f.read().strip()
     content = _protect_org_text_for_pandoc(content)
-
     lines = [f"* Relatório individual — {perito} ({start} a {end})", "", content, ""]
     with open(final_org, "w", encoding="utf-8") as g:
         g.write("\n".join(lines))
     print(f"✅ Org consolidado (individual) salvo em: {final_org}")
     return final_org
 
-
-def gerar_org_individual_consolidado_com_panorama(perito: str, start: str, end: str, relatorio_dir: str):
-    """
-    Insere panorama global UMA VEZ antes da seção do perito.
-
-    Ajustes:
-      - Mesmo comportamento de mover {perito}.org para orgs/ se estiver no topo.
-    """
-    import shutil
-
+def gerar_org_individual_consolidado_com_panorama(perito, start, end, relatorio_dir):
+    """(Opcional) Insere panorama global UMA VEZ antes da seção do perito."""
     safe = _safe(perito)
-    orgs_dir = os.path.join(relatorio_dir, "orgs")
-    os.makedirs(orgs_dir, exist_ok=True)
-
-    cand_new = os.path.join(orgs_dir, f"{safe}.org")
-    cand_old = os.path.join(relatorio_dir, f"{safe}.org")
-
-    if os.path.exists(cand_new):
-        perito_org = cand_new
-    elif os.path.exists(cand_old):
-        try:
-            shutil.move(cand_old, cand_new)
-            print(f"[MOVE] {cand_old} → {cand_new}")
-            perito_org = cand_new
-        except Exception as e:
-            print(f"[AVISO] Falha ao mover {cand_old} → {cand_new}: {e}. Usando origem antiga.")
-            perito_org = cand_old
-    else:
-        raise FileNotFoundError(f"Org individual não encontrado (new/old): {cand_new} | {cand_old}")
-
+    perito_org = os.path.join(relatorio_dir, f"{safe}.org")
     final_org  = os.path.join(relatorio_dir, f"relatorio_{safe}_{start}_a_{end}.org")
-
-    lines = []
-    _append_weekday2weekend_panorama_block(
-        lines,
-        os.path.join(relatorio_dir, "imgs"),
-        os.path.join(relatorio_dir, "comments"),
-        heading_level="**"
-    )
-
+    if not os.path.exists(perito_org):
+        raise FileNotFoundError(f"Org individual não encontrado: {perito_org}")
     with open(perito_org, "r", encoding="utf-8") as f:
         content = f.read().strip()
     content = _protect_org_text_for_pandoc(content)
+    lines = []
+    _append_weekday2weekend_panorama_block(lines, os.path.join(relatorio_dir, "imgs"), os.path.join(relatorio_dir, "comments"), heading_level="**")
     lines.extend([content, ""])
-
     with open(final_org, "w", encoding="utf-8") as g:
         g.write("\n".join(lines))
     print(f"✅ Org consolidado (individual) salvo em: {final_org}")
     return final_org
 
-
 def gerar_org_individual_consolidado_com_panorama_depois(perito: str, start: str, end: str, relatorio_dir: str, perito_org_path: str) -> str:
+    """Gera .org individual e coloca o panorama weekday→weekend AO FINAL (se existir)."""
     imgs_dir     = os.path.join(relatorio_dir, "imgs")
     comments_dir = os.path.join(relatorio_dir, "comments")
     safe_perito  = _safe(perito)
-    orgs_dir     = os.path.join(relatorio_dir, "orgs")
-    os.makedirs(orgs_dir, exist_ok=True)
-    org_final    = os.path.join(orgs_dir, f"relatorio_{safe_perito}_{start}_a_{end}.org")
+    org_final    = os.path.join(relatorio_dir, f"relatorio_{safe_perito}_{start}_a_{end}.org")
 
     lines = [f"* Relatório individual — {perito} ({start} a {end})", ""]
     if perito_org_path and os.path.exists(perito_org_path):
@@ -1945,13 +1891,12 @@ def gerar_org_individual_consolidado_com_panorama_depois(perito: str, start: str
     else:
         print(f"[AVISO] Org do perito não encontrado: {perito_org_path}")
 
-    _append_weekday2weekend_panorama_block(lines, imgs_dir, comments_dir, start=start, end=end, heading_level="**", imgs_prefix="../imgs/")
+    _append_weekday2weekend_panorama_block(lines, imgs_dir, comments_dir, start=start, end=end, heading_level="**")
 
     with open(org_final, "w", encoding="utf-8") as f:
         f.write("\n".join(lines).strip() + "\n")
     print(f"✅ Org consolidado (individual) salvo em: {org_final}")
     return org_final
-
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Seleção Top 10 & Coorte Extra (funções auxiliares usadas no main)
@@ -2068,40 +2013,36 @@ LATEX_HEADER_CONTENT = r"""
 """
 
 
-def exportar_org_para_pdf(org_path: str, font: str = "DejaVu Sans", pdf_dir: str | None = None) -> str | None:
+def exportar_org_para_pdf(org_path: str, font: str = "DejaVu Sans") -> str | None:
     """
-    Converte .org -> PDF via Pandoc + xelatex.
-    Agora salva o PDF em uma pasta irmã 'pdfs/' da pasta onde está o .org (normalmente 'orgs/').
-    Ex.: .../top10/orgs/relatorio.org  -->  .../top10/pdfs/relatorio.pdf
+    Converte um arquivo .org para PDF via Pandoc + xelatex, aplicando um header LaTeX
+    para 'segurar' as figuras (placement [H]) e garantindo margens.
+
+    Parâmetros
+    ----------
+    org_path : str
+        Caminho absoluto para o arquivo .org a ser exportado.
+    font : str, opcional
+        Fonte principal do PDF (default: 'DejaVu Sans').
+
+    Retorna
+    -------
+    str | None
+        Caminho do PDF gerado, ou None em caso de falha (mensagem de log é impressa).
     """
     import shutil as sh
 
-    # Diretórios básicos
-    output_dir = os.path.dirname(org_path)            # geralmente .../orgs
-    base_root  = os.path.dirname(output_dir)          # pai de orgs/  (ex.: .../top10)
-    pdf_dir    = pdf_dir or os.path.join(base_root, "pdfs")
-    os.makedirs(pdf_dir, exist_ok=True)
-
+    output_dir = os.path.dirname(org_path)
     org_name   = os.path.basename(org_path)
     pdf_name   = org_name.replace('.org', '.pdf')
-    pdf_path   = os.path.join(pdf_dir, pdf_name)
-
-    log_path    = org_path + ".log"
+    log_path   = org_path + ".log"
     header_path = os.path.join(output_dir, "_header_figs.tex")
 
-    # Cabeçalho LaTeX (figuras estáveis) fica ao lado do .org
-    LATEX_HEADER_CONTENT = r"""
-%% Inserido automaticamente pelo make_report.py
-\usepackage{float}
-\usepackage{placeins}
-\floatplacement{figure}{H}
-\usepackage{longtable}
-\usepackage{array}
-"""
+    # Escreve header LaTeX
     with open(header_path, "w", encoding="utf-8") as fh:
         fh.write(LATEX_HEADER_CONTENT)
 
-    # Protege o .org para consumo pelo Pandoc
+    # Protege o .org para consumo do Pandoc (tabelas, ASCII-art, etc.)
     with open(org_path, "r", encoding="utf-8") as f:
         raw = f.read()
     protected = _protect_org_text_for_pandoc(raw)
@@ -2110,17 +2051,15 @@ def exportar_org_para_pdf(org_path: str, font: str = "DejaVu Sans", pdf_dir: str
     with open(prot_path, "w", encoding="utf-8") as fprot:
         fprot.write(protected)
 
-    # Checa pandoc
+    # Checa Pandoc
     pandoc = sh.which("pandoc")
     if not pandoc:
         print("❌ Pandoc não encontrado no PATH. Instale com: sudo apt install pandoc texlive-xetex")
         return None
 
-    # Saída relativa a partir de output_dir (onde vamos rodar o pandoc)
-    pdf_rel = os.path.relpath(pdf_path, start=output_dir)
-
+    # Monta comando Pandoc
     cmd = [
-        "pandoc", prot_name, "-o", pdf_rel,
+        "pandoc", prot_name, "-o", pdf_name,
         "--pdf-engine=xelatex",
         "--include-in-header", os.path.basename(header_path),
         "--variable", f"mainfont={font}",
@@ -2137,6 +2076,7 @@ def exportar_org_para_pdf(org_path: str, font: str = "DejaVu Sans", pdf_dir: str
     finally:
         os.chdir(prev_cwd)
 
+    pdf_path = os.path.join(output_dir, pdf_name)
     if result.returncode == 0 and os.path.exists(pdf_path):
         print(f"✅ PDF gerado: {pdf_path}")
         return pdf_path
@@ -2312,14 +2252,11 @@ def _df_to_org_table(df: "pd.DataFrame", headers: list[str]) -> str:
         lines.append("| " + " | ".join(vals) + " |")
     return "\n".join(lines)
 
-def _append_protocol_transfers_group_block(
-    lines: list[str],
-    relatorio_dir: str,
-    start: str,
-    end: str,
-    heading_level: str = "**",
-    link_prefix: str = "",
-) -> bool:
+def _append_protocol_transfers_group_block(lines: list[str], relatorio_dir: str, start: str, end: str, heading_level: str = "**") -> bool:
+    """
+    Acrescenta seção 'Protocolos transferidos' ao relatório (grupo).
+    Salva CSV completo em relatorio_dir.
+    """
     import pandas as pd
     df = _find_protocol_transfers(start, end)
     lines.append("")
@@ -2334,30 +2271,26 @@ def _append_protocol_transfers_group_block(
     csv_path = os.path.join(relatorio_dir, f"protocolos_transferidos_{start}_a_{end}.csv")
     _csv_write(summary, csv_path)
 
+    # Tabela enxuta no corpo do relatório
     headers = ["protocolo","peritos_env","trocas","primeiro_ini","ultimo_fim"]
     table = _df_to_org_table(summary, headers)
     lines.append("")
     lines.append("#+ATTR_LATEX: :environment longtable :align l l c l l")
     lines.append(table)
     lines.append("")
-    lines.append(f"Arquivo completo: [[file:{link_prefix}{os.path.basename(csv_path)}]]")
+    lines.append(f"Arquivo completo: [[file:{os.path.basename(csv_path)}]]")
     lines.append("")
     lines.append("_Nota:_ Transferência pode ocorrer por reanálise, redistribuição de carga ou outros motivos operacionais; não implica, por si só, irregularidade.")
     lines.append("")
     return True
 
-
-def _append_protocol_transfers_perito_block_if_any(
-    lines: list[str],
-    perito: str,
-    start: str,
-    end: str,
-    relatorio_dir: str,
-    heading_level: str = "***",
-    link_prefix: str = "",
-) -> bool:
+def _append_protocol_transfers_perito_block_if_any(lines: list[str], perito: str, start: str, end: str, relatorio_dir: str, heading_level: str = "***") -> bool:
+    """
+    Acrescenta mini-bloco para o perito com a lista de protocolos transferidos em que ele aparece.
+    """
     df = _find_protocol_transfers(start, end)
     if df.empty:
+        # Se inexistem no período, opcionalmente diga explicitamente.
         lines.append(f"{heading_level} Protocolos transferidos (este perito)")
         lines.append(f"Não foram identificados protocolos transferidos envolvendo este perito no período {start} a {end}.\n")
         return False
@@ -2370,14 +2303,15 @@ def _append_protocol_transfers_perito_block_if_any(
         lines.append("")
         return False
 
+    # menciona também o CSV do grupo, se existir/gerado
     csv_name = f"protocolos_transferidos_{start}_a_{end}.csv"
     csv_path = os.path.join(relatorio_dir, csv_name)
-    hint = f"  (ver [[file:{link_prefix}{csv_name}]] para detalhes)" if os.path.exists(csv_path) else ""
+    hint = f"  (ver [[file:{csv_name}]] para detalhes)" if os.path.exists(csv_path) else ""
     lines.append(f"**Protocolos transferidos que envolvem este perito ({len(protos)}):** {', '.join(protos)}{hint}")
     lines.append("")
     return True
 
-
+# --- MAIN ATUALIZADO ---
 def main():
     """
     Orquestração principal:
@@ -2609,10 +2543,10 @@ def main():
         if args.r_appendix and args.add_comments:
             gerar_r_apendice_group_comments_if_possible(IMGS_DIR, COMMENTS_DIR, args.start, args.end)
 
-        # Org do grupo (salva em orgs/)
-        org_grupo_top10 = gerar_org_top10_grupo(args.start, args.end, RELATORIO_DIR, IMGS_DIR, COMMENTS_DIR, orgs_dir=ORGS_DIR)
+        # Org do grupo
+        org_grupo_top10 = gerar_org_top10_grupo(args.start, args.end, RELATORIO_DIR, IMGS_DIR, COMMENTS_DIR)
 
-        # Peritos do Top10 (salva cada .org em orgs/)
+        # Peritos do Top10
         peritos_df = pegar_10_piores_peritos(args.start, args.end, min_analises=args.min_analises)
         lista_top10 = peritos_df['nomePerito'].tolist()
         for perito in lista_top10:
@@ -2621,7 +2555,7 @@ def main():
             copiar_artefatos_perito(perito, IMGS_DIR, COMMENTS_DIR, ORGS_DIR)
             if args.r_appendix and args.add_comments:
                 gerar_r_apendice_comments_if_possible(perito, IMGS_DIR, COMMENTS_DIR, args.start, args.end)
-            org_path = gerar_org_perito(perito, args.start, args.end, args.add_comments, IMGS_DIR, COMMENTS_DIR, RELATORIO_DIR, orgs_dir=ORGS_DIR)
+            org_path = gerar_org_perito(perito, args.start, args.end, args.add_comments, IMGS_DIR, COMMENTS_DIR, RELATORIO_DIR)
             org_paths.append(org_path)
 
         # Coorte extra
@@ -2637,15 +2571,15 @@ def main():
                 copiar_artefatos_perito(perito, IMGS_DIR, COMMENTS_DIR, ORGS_DIR)
                 if args.r_appendix and args.add_comments:
                     gerar_r_apendice_comments_if_possible(perito, IMGS_DIR, COMMENTS_DIR, args.start, args.end)
-                org_path = gerar_org_perito(perito, args.start, args.end, args.add_comments, IMGS_DIR, COMMENTS_DIR, RELATORIO_DIR, orgs_dir=ORGS_DIR)
+                org_path = gerar_org_perito(perito, args.start, args.end, args.add_comments, IMGS_DIR, COMMENTS_DIR, RELATORIO_DIR)
                 extras_org_paths.append(org_path)
 
         # ← NOVO: mover quaisquer .md remanescentes para 'markdown/'
         _mover_markdowns_de_exports(MARKDOWN_DIR)
 
-        # Org consolidado do Top10 (com panorama global ao final + reincidentes) — salva em orgs/
+        # Org consolidado do Top10 (com panorama global ao final + reincidentes)
         if (args.export_org or args.export_pdf) and (org_paths or org_grupo_top10 or extras_org_paths):
-            org_final = os.path.join(ORGS_DIR, f"relatorio_dez_piores_{args.start}_a_{args.end}.org")
+            org_final = os.path.join(RELATORIO_DIR, f"relatorio_dez_piores_{args.start}_a_{args.end}.org")
             lines = [f"* Relatório dos 10 piores peritos ({args.start} a {args.end})", ""]
 
             # Grupo (Top10)
@@ -2662,7 +2596,7 @@ def main():
                     lines.append(content)
                     lines.append("#+LATEX: \\newpage\n")
 
-                # Impacto na Fila do PERITO (se existir)
+                # ← NOVO: inserir Impacto na Fila do PERITO (se existir)
                 perito_safe = os.path.splitext(os.path.basename(org_path))[0]
                 per_impacts = coletar_orgs_impacto(PERIODO_DIR, args.start, args.end, perito=perito_safe)
                 for imp_path in per_impacts:
@@ -2687,7 +2621,7 @@ def main():
                             lines.append(content)
                             lines.append("#+LATEX: \\newpage\n")
 
-            # Impacto na Fila do GRUPO (Top10)
+            # ← NOVO: Impacto na Fila do GRUPO (Top10)
             grp_impacts = coletar_orgs_impacto(PERIODO_DIR, args.start, args.end, perito=None)
             for path in grp_impacts:
                 try:
@@ -2700,16 +2634,16 @@ def main():
                 except Exception as e:
                     print(f"[AVISO] Falha ao anexar impacto do grupo ({path}): {e}")
 
-            # Protocolos transferidos (grupo) — link relativo ao wrapper em orgs/
+            # Protocolos transferidos (grupo)
             _append_protocol_transfers_group_block(
-                lines, RELATORIO_DIR, args.start, args.end, heading_level="**", link_prefix="../"
+                lines, RELATORIO_DIR, args.start, args.end, heading_level="**"
             )
 
-            # Panorama global (W→WE) AO FINAL do Top10 — imagens com ../imgs/
+            # Panorama global (W→WE) AO FINAL do Top10
             _append_weekday2weekend_panorama_block(
                 lines, IMGS_DIR, COMMENTS_DIR,
                 start=args.start, end=args.end,
-                heading_level="**", imgs_prefix="../imgs/"
+                heading_level="**"
             )
 
             with open(org_final, "w", encoding="utf-8") as f:
@@ -2753,15 +2687,15 @@ def main():
         # ← NOVO: mover quaisquer .md remanescentes para 'markdown/'
         _mover_markdowns_de_exports(MARKDOWN_DIR)
 
-        # Monta org individual base (salva em orgs/)
+        # Monta org individual base (sem panorama no topo)
         perito_org_path = gerar_org_perito(
             perito, args.start, args.end, args.add_comments,
-            imgs_dir_i, comments_dir_i, RELATORIO_DIR, orgs_dir=orgs_dir_i
+            imgs_dir_i, comments_dir_i, RELATORIO_DIR
         )
 
-        # Consolida: relatório do perito + (se houver) bloco W→WE deste perito no FINAL — salva em orgs/
+        # Consolida: relatório do perito + (se houver) bloco W→WE deste perito no FINAL
         org_final = os.path.join(
-            orgs_dir_i, f"relatorio_{_safe(perito)}_{args.start}_a_{args.end}.org"
+            RELATORIO_DIR, f"relatorio_{_safe(perito)}_{args.start}_a_{args.end}.org"
         )
         lines = [f"* Relatório individual — {perito} ({args.start} a {args.end})", ""]
 

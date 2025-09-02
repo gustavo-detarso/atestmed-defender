@@ -1,0 +1,10 @@
+#+CAPTION: Top 10 — Robustez do Composto (z-score médio)
+[[file:rcheck_top10_composite_robustness.png]]
+
+*Método.* Selecionamos os *10 piores* por *ScoreFinal* (mínimo de análises = 50). No período (2025-06-01 a 2025-06-30), calculamos por perito: %NC *robusto*, % de análises ≤ 15s, % de *sobreposição* e *produtividade* (análises/h). Cada métrica foi padronizada via *z-score*; produtividade foi *invertida* (maior = pior). O composto é a *média* dos z-scores (maior = pior). Durações foram calculadas de forma robusta (fim−início; ou colunas numéricas/textuais HH:MM:SS; limite 0–3600s).
+
+*Interpretação.* Barras mais altas indicam pior desempenho composto.
+- *Piores (top 3)*: ALEXANDRE NUNES MEDEIROS (comp=0.73); EDUARDO DE CARVALHO (comp=0.61); GIDEAO CABRAL DA SILVA (comp=0.27).
+- *Melhores (top 3)*: RICARDO PREDEBON VANZO (comp=-0.63); RONI MOTIZUKI (comp=-0.33); DAVID MEREU MORENO (comp=-0.31).
+- Leia os rótulos (z_nc, z_≤15s, z_ov, z_prod) para pistas de quais dimensões puxam o composto.
+

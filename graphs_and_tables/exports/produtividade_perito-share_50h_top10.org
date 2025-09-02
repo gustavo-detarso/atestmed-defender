@@ -1,0 +1,17 @@
+* Produtividade — Percentual de peritos ≥ 50/h (Top 10 vs Brasil (excl.))
+:PROPERTIES:
+:PERIODO: 2025-06-01 a 2025-06-30
+:METRICA: perito-share
+:TOP10: EDUARDO DE CARVALHO, GIDEAO CABRAL DA SILVA, GEZIO SOARES DE SOUZA JUNIOR, RICARDO PREDEBON VANZO, ALEXANDRE NUNES MEDEIROS, RONI MOTIZUKI, JOSE RICARDO GOMES DE ALCANTARA, RODRIGO LIMA MEDEIROS BARBOSA, DAVID MEREU MORENO, VANIA CRISTINA CAMPELO BARROSO CARNEIRO
+:END:
+
+| Categoria | Peritos acima do limiar (n) | Peritos (total) | % |
+|-
+| Top 10 piores  | 8 | 10 | 80.00% |
+| Brasil (excl.) | 157 | 2658 | 5.91% |
+
+#+CAPTION: Produtividade — Percentual de peritos ≥ 50/h (Top 10 vs Brasil (excl.))
+[[file:produtividade_perito-share_50h_top10.png]]
+
+** Comentário
+No período de junho de 2025, a comparação entre a produtividade de peritos com produtividade maior ou igual a 50/h revela uma diferença significativa entre os grupos analisados. No grupo dos "Top 10 piores", 80% dos peritos atingiram ou superaram esse limiar, enquanto no Brasil (excluindo esse grupo), apenas 5,91% dos peritos alcançaram a mesma produtividade. Essa diferença resulta em 74,09 pontos percentuais, evidenciando uma disparidade notável na performance entre os dois conjuntos. O grupo dos "Top 10 piores" é composto por 10 peritos, enquanto o total de peritos no Brasil, excluindo esse grupo, é de 2.658. Essa análise destaca a variação na produtividade, sugerindo que, mesmo entre os menos produtivos, há uma concentração significativa de peritos que conseguem alcançar níveis elevados de produtividade, em contraste com a média geral do país.

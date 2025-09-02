@@ -1,0 +1,7 @@
+*Método.* Selecionamos os *Top 10 piores* por *scoreFinal* em `indicadores`, exigindo ao menos *50* análises no período (2025-06-01 a 2025-06-30). Definimos o grupo *Resto* como peritos *ativos* no período (possuem alguma análise em 'analises'). Comparamos *ICRA*, *IATD* e *Score Final* entre *Top10* e *Resto* usando o teste *Mann-Whitney* (não-paramétrico).
+
+*Interpretação.* As medianas e p-valores resumem diferenças entre grupos por KPI. Leve em conta o tamanho amostral de cada grupo e a direção esperada de cada métrica no seu contexto.
+- IATD: med Top10=0.826 vs med Resto=0.967 (p=0.000000115; nTop10=10, nResto=2662)
+- ICRA: med Top10=8.500 vs med Resto=2.500 (p=0.0000000000468; nTop10=10, nResto=2662)
+- Score Final: med Top10=8.674 vs med Resto=2.529 (p=0.0000000482; nTop10=10, nResto=2662)
+

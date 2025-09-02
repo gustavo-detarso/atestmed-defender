@@ -1,1 +1,0 @@
-python3 -m reports.make_impact_report_pdf --start 2025-07-01 --end 2025-07-31 --top10 --select-src both --min-analises 50 --topn 10 --alpha 0.8 --tmea-br 60 --sens-plot --sens-alpha-frac 0.10 --sens-pbr-pp 0.02 --by cr --all-tests --fig-scale 0.65 --fig-dpi 300 --pdf-img-frac 0.65 --table-font-size 7 --table-header-font-size 7 --export-png --export-pdf --header-and-text 

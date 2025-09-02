@@ -1,0 +1,36 @@
+* Indicadores (composto) – Top 10 piores vs Brasil (excl.)
+:PROPERTIES:
+:PERIODO: 2025-06-01 a 2025-06-30
+:ALVO_PROD: 50.0/h
+:CUTS: cut_prod_pct=100.0
+:END:
+
+| Indicador | Top 10 piores | Brasil (excl.) |
+|-
+| % NC | 42.37% | 16.59% |
+| Prod (% alvo) | 112.78% | 51.31% |
+| ≤ 15s (%) | 8.24% | 0.39% |
+| Sobreposição (%) | 11.50% | 3.84% |
+
+** Estatísticas BR-excl. (linhas)
+| Indicador | Média | Mediana | Média+DP |
+|-
+| % NC | 17.88% | 13.72% | 32.74% |
+| Prod (% alvo) | 56.47% | 52.01% | 85.11% |
+| ≤ 15s (%) | 0.31% | 0.00% | 2.84% |
+| Sobreposição (%) | 2.36% | 0.00% | 11.78% |
+
+** Cortes atingidos
+Grupo com 10 peritos.
+| Corte | Atingiram |
+|-
+| % NC | — |
+| Prod (% alvo) | 8/10 |
+| ≤ 15s | — |
+| Sobreposição | — |
+
+#+CAPTION: Indicadores compostos (barras) e estatísticas do BR-excl. (linhas).
+[[file:indicadores_composto_top10.png]]
+
+** Comentário
+O gráfico apresenta uma comparação entre os indicadores compostos do grupo "Top 10 piores" e a média do Brasil excluindo esse grupo, destacando quatro métricas: % NC, Prod (% do alvo), ≤15s (%) e Sobreposição (%). Observa-se que o grupo "Top 10 piores" apresenta um percentual de não conformidade (% NC) de 42,37%, significativamente superior à média de 17,88% do Brasil excluindo esse grupo, enquanto a produtividade (% Prod) é de 112,78%, bem acima da média de 56,47%. Os indicadores de tempo ≤15s e sobreposição também mostram discrepâncias, com o grupo "Top 10 piores" apresentando 8,24% e 11,50%, respectivamente, em comparação com valores muito inferiores no Brasil excluindo esse grupo. É importante considerar que a análise pode ser afetada por amostras pequenas, dispersão dos dados e a presença de outliers. Recomenda-se uma verificação detalhada dos dados para entender melhor as causas dessas discrepâncias e identificar possíveis intervenções.

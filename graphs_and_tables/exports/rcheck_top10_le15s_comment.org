@@ -1,0 +1,6 @@
+*Método.* Selecionamos os *10 piores* peritos no período (2025-06-01 a 2025-06-30) pelo *ScoreFinal* em `indicadores`, exigindo ao menos *50* análises. Para cada um deles, calculamos a *proporção de perícias com duração ≤ 15s* entre *durações válidas* (0<dur≤3600). Quando não há coluna explícita de duração em 'analises', usa-se (julianday(fim)−julianday(início))*86400.
+
+*Interpretação.* Entre os Top 10, a fração ≤ 15s variou de 0.0% a 40.9%; média=9.5%, mediana=8.9%.
+- Maiores %≤15s: EDUARDO DE CARVALHO: 40.9% (n=47/115); ALEXANDRE NUNES MEDEIROS: 12.6% (n=67/530); GEZIO SOARES DE SOUZA JUNIOR: 11.3% (n=16/142).
+Valores muito altos podem indicar *execuções excessivamente rápidas* e merecem auditoria; sempre considere o volume (n) e o contexto das tarefas.
+

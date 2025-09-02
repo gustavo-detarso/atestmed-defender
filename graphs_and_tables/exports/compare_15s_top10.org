@@ -1,0 +1,17 @@
+* Perícias ≤ 15s – Top 10 piores vs Brasil (excl.)
+:PROPERTIES:
+:PERIODO: 2025-06-01 a 2025-06-30
+:THRESHOLD: 15s
+:CUT_N: 10
+:END:
+
+| Grupo | ≤15s | Total | % |
+|-
+| Top 10 piores | 220 | 2766 | 7.95% |
+| Brasil (excl.) | 737 | 297669 | 0.25% |
+
+#+CAPTION: Comparação do % de perícias ≤ 15s (com corte por perito).
+[[file:compare_15s_top10.png]]
+
+** Comentário
+No período 2025-06-01 a 2025-06-30, considerando o limiar de ≤15s e o corte por perito (apenas profissionais com ≥10 tarefas ≤15s entram no numerador), Top 10 piores registrou 8.0% (220/2766), enquanto Brasil (excl.) apresentou 0.2% (737/297669), diferença de 7.7 p.p. Os percentuais refletem a participação relativa de tarefas muito curtas entre os elegíveis e podem variar com o mix de casos e horários de pico; resultados são descritivos e não implicam causalidade.

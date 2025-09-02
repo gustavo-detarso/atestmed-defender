@@ -2,281 +2,122 @@
 # -*- coding: utf-8 -*-
 
 """
-Relatório ATESTMED — KPI (NG, PDF direto, sem ORG)
-- Mantém a lógica do make_kpi_report.py (seleção Top10 via import dinâmico).
-- Gera PDF direto (ReportLab) com gráficos e comentários .md.
-- Detecção de flags suportadas pelos compare_*.
-- Limpeza automática de quaisquer .org gerados por scripts legados.
-- Tolerância a PNGs truncados/corrompidos (PIL + re-encode; skip com aviso).
+Relatório ATESTMED — Individual ou Top 10
+Executa a geração de gráficos (Python), análises (R), junta comentários e
+monta relatórios em Org/PDF. Inclui panorama weekday→weekend e apêndices.
 """
 
-import os, sys, re, csv, json, math, shutil, zipfile, sqlite3, argparse, subprocess, unicodedata
-from datetime import datetime
-from typing import Optional, Tuple, Dict, Any, List
-from pathlib import Path
+# ────────────────────────────────────────────────────────────────────────────────
+# Imports (todos consolidados no início)
+# ────────────────────────────────────────────────────────────────────────────────
+import os
+import sys
+import re
+import csv
+import shutil
+import sqlite3
+import subprocess
+import tempfile
+import time
+import calendar
+import hashlib
+from glob import glob
+from datetime import datetime, date
+from collections import defaultdict
 
 import pandas as pd
+from PyPDF2 import PdfMerger
 
-# Evitar backends GUI
-import matplotlib
-matplotlib.use("Agg")
+# ────────────────────────────────────────────────────────────────────────────────
+# Paths e diretórios
+# ────────────────────────────────────────────────────────────────────────────────
+BASE_DIR    = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+DB_PATH     = os.path.join(BASE_DIR, 'db', 'atestmed.db')
+GRAPHS_DIR  = os.path.join(BASE_DIR, 'graphs_and_tables')
+SCRIPTS_DIR = GRAPHS_DIR  # alias
+EXPORT_DIR  = os.path.join(GRAPHS_DIR, 'exports')
+OUTPUTS_DIR = os.path.join(BASE_DIR, 'reports', 'outputs')
+MISC_DIR    = os.path.join(BASE_DIR, 'misc')
+RCHECK_DIR  = os.path.join(BASE_DIR, 'r_checks')  # onde ficam os .R
 
-# PIL robusto para imagens truncadas
-from PIL import Image, ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+os.makedirs(EXPORT_DIR, exist_ok=True)
+os.makedirs(OUTPUTS_DIR, exist_ok=True)
 
-# PDF utils
-try:
-    from pypdf import PdfMerger
-except Exception:
+# ────────────────────────────────────────────────────────────────────────────────
+# Carregamento de .env na raiz (se existir)
+# ────────────────────────────────────────────────────────────────────────────────
+def _load_env_from_root():
+    """Carrega variáveis do arquivo .env na raiz do projeto (sem sobrescrever o ambiente)."""
+    env_path = os.path.join(BASE_DIR, ".env")
     try:
-        from PyPDF2 import PdfMerger
-    except Exception:
-        PdfMerger = None
-
-# ReportLab
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import cm
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from xml.sax.saxutils import escape as xml_escape
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Paths e Constantes
-# ────────────────────────────────────────────────────────────────────────────────
-_THIS_FILE = Path(__file__).resolve()
-BASE_DIR    = str(_THIS_FILE.parent.parent if _THIS_FILE.parent.name == "reports" else _THIS_FILE.parent)
-DB_PATH     = os.path.join(BASE_DIR, "db", "atestmed.db")
-GRAPHS_DIR  = os.path.join(BASE_DIR, "graphs_and_tables")
-EXPORT_DIR  = os.path.join(GRAPHS_DIR, "exports")
-OUTPUTS_DIR = os.path.join(BASE_DIR, "reports", "outputs")
-RCHECK_DIR  = os.path.join(BASE_DIR, "r_checks")
-
-for d in (EXPORT_DIR, OUTPUTS_DIR):
-    os.makedirs(d, exist_ok=True)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Limpeza de .org (scripts legados)
-# ────────────────────────────────────────────────────────────────────────────────
-def _purge_org_files(dirpath: str, verbose: bool = True) -> int:
-    removed = 0
-    try:
-        base = Path(dirpath)
-        for pat in ("*.org", "*_comment.org"):
-            for p in base.glob(pat):
-                try:
-                    p.unlink()
-                    removed += 1
-                    if verbose:
-                        print(f"[CLEAN] Removido: {p}")
-                except Exception as e:
-                    print(f"[warn] Não foi possível remover {p}: {e}")
-    except Exception as e:
-        print(f"[warn] Falha ao varrer {dirpath} para limpar .org: {e}")
-    return removed
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Seleção Top10 (import original + fallback)
-# ────────────────────────────────────────────────────────────────────────────────
-pegar_10_piores_peritos_original = None
-
-def _try_import_original_selector():
-    global pegar_10_piores_peritos_original
-    for spath, modname, attr in [
-        (str(_THIS_FILE.parent), "make_kpi_report", "pegar_10_piores_peritos"),
-        (str(_THIS_FILE.parent), "reports.make_kpi_report", "pegar_10_piores_peritos"),
-        (str(Path(BASE_DIR)), "make_kpi_report", "pegar_10_piores_peritos"),
-        (str(Path(BASE_DIR) / "reports"), "make_kpi_report", "pegar_10_piores_peritos"),
-        ("", "make_kpi_report", "pegar_10_piores_peritos"),
-    ]:
-        try:
-            if spath and spath not in sys.path:
-                sys.path.insert(0, spath)
-            mod = __import__(modname, fromlist=[attr])
-            func = getattr(mod, attr, None)
-            if callable(func):
-                pegar_10_piores_peritos_original = func
-                print(f"[INFO] Seleção Top10: usando {modname}.{attr}")
-                return
-        except Exception:
-            continue
-    print("[AVISO] Não consegui importar a seleção Top10 do script original. Usarei o fallback interno.")
-
-_try_import_original_selector()
-
-def _fetch_scores(conn) -> pd.DataFrame:
-    try:
-        return pd.read_sql_query("SELECT UPPER(nomePerito) AS nomePerito, score_final FROM ranking_final", conn)
-    except Exception:
-        return pd.DataFrame(columns=["nomePerito","score_final"])
-
-def _fetch_perito_n_nc(conn, start: str, end: str) -> pd.DataFrame:
-    q = """
-        SELECT UPPER(nomePerito) AS nomePerito, COUNT(*) AS N,
-               SUM(CASE WHEN conformado=0 THEN 1 ELSE 0 END) AS NC
-        FROM analises_atestmed
-        WHERE date(dataHoraIniPericia) >= date(?) AND date(dataHoraIniPericia) <= date(?)
-        GROUP BY UPPER(nomePerito)
-    """
-    try:
-        return pd.read_sql_query(q, conn, params=[start, end])
-    except Exception:
-        return pd.DataFrame(columns=["nomePerito","N","NC"])
-
-def pegar_10_piores_peritos_fallback(start: str, end: str, min_analises: int=50) -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as conn:
-        df_n = _fetch_perito_n_nc(conn, start, end)
-        if df_n.empty:
-            return pd.DataFrame(columns=["nomePerito"])
-        df_n = df_n.loc[df_n["N"] >= int(min_analises)].copy()
-        if df_n.empty:
-            return pd.DataFrame(columns=["nomePerito"])
-        df_scores = _fetch_scores(conn)
-        base = df_n.merge(df_scores, on="nomePerito", how="left")
-        base["score_final"] = base["score_final"].fillna(0.0)
-        base = base.sort_values(["score_final","NC","N"], ascending=[False,False,True])
-        return base.head(10)[["nomePerito"]].copy()
-
-def _call_original_top10(start: str, end: str, min_analises: int=50):
-    f = pegar_10_piores_peritos_original
-    if not callable(f):
-        return None
-    try:
-        return f(start, end, min_analises=min_analises)
-    except TypeError:
-        try:
-            return f(start, end, min_analises)
-        except Exception:
-            return None
-    except Exception:
-        return None
-
-def get_top10_dataframe(start: str, end: str, min_analises: int=50) -> pd.DataFrame:
-    df = _call_original_top10(start, end, min_analises)
-    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-        print("[INFO] Usando fallback interno para seleção Top10.")
-        df = pegar_10_piores_peritos_fallback(start, end, min_analises=min_analises)
-    if isinstance(df, list):
-        df = pd.DataFrame({"nomePerito": df})
-    if not isinstance(df, pd.DataFrame):
-        try:
-            df = pd.DataFrame(df)
-        except Exception:
-            df = pd.DataFrame(columns=["nomePerito"])
-    if "nomePerito" not in df.columns:
-        for c in df.columns:
-            if str(c).lower() in ("perito","nomeperito","nome_perito"):
-                df = df.rename(columns={c:"nomePerito"})
-                break
-    if "nomePerito" not in df.columns:
-        df["nomePerito"] = []
-    return df[["nomePerito"]].dropna().drop_duplicates()
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Estilos / helpers PDF
-# ────────────────────────────────────────────────────────────────────────────────
-def _register_fonts():
-    try:
-        dejavu = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-        dejavu_b = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        if os.path.exists(dejavu) and os.path.exists(dejavu_b):
-            pdfmetrics.registerFont(TTFont("DejaVu", dejavu))
-            pdfmetrics.registerFont(TTFont("DejaVu-Bold", dejavu_b))
-            return "DejaVu", "DejaVu-Bold"
+        from dotenv import load_dotenv
+        load_dotenv(env_path, override=False)
+        return
     except Exception:
         pass
-    return "Helvetica", "Helvetica-Bold"
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.strip().strip('"').strip("'")
+                if v:
+                    os.environ.setdefault(k.strip(), v)
 
-FONT_REG, FONT_BOLD = _register_fonts()
-
-def _styles():
-    ss = getSampleStyleSheet()
-    return {
-        "Title":    ParagraphStyle("Title", parent=ss["Title"], fontName=FONT_BOLD, fontSize=16, leading=19, spaceAfter=8),
-        "Heading2": ParagraphStyle("Heading2", parent=ss["Heading2"], fontName=FONT_BOLD, fontSize=12.5, leading=15, spaceBefore=8, spaceAfter=5),
-        "Small":    ParagraphStyle("Small", parent=ss["BodyText"], fontName=FONT_REG, fontSize=9, leading=12, spaceAfter=3),
-    }
-
-STYLES = _styles()
-PDF_MARGIN_LEFT_CM=3; PDF_MARGIN_RIGHT_CM=2; PDF_MARGIN_TOP_CM=3; PDF_MARGIN_BOTTOM_CM=2; PDF_IMG_FRAC=1.0
-TABLE_FONT_SIZE=8.5; TABLE_HEADER_FONT_SIZE=None
-
-def _escape(s: str) -> str:
-    return xml_escape(s or "")
-
-def _header_footer(canvas, doc, meta: Dict[str, Any]):
-    canvas.saveState()
-    canvas.setFont(FONT_REG, 8.5)
-    x_left  = doc.leftMargin
-    x_right = doc.pagesize[0] - doc.rightMargin
-    y = max(0.5*cm, doc.bottomMargin - 0.5*cm)
-    title = meta.get("title", "Relatório KPI")
-    periodo = f"{meta.get('start','')} a {meta.get('end','')}"
-    canvas.drawString(x_left,  y, f"{title} — {periodo}".strip(" —"))
-    canvas.drawRightString(x_right, y, datetime.now().strftime("%d/%m/%Y %H:%M"))
-    canvas.restoreState()
-
-def _df_table(df: pd.DataFrame, headers: List[str], widths: List[float]):
-    data = [headers] + df.values.tolist()
-    tbl = Table(data, colWidths=widths, repeatRows=1)
-    pad=3.0
-    tbl.setStyle(TableStyle([
-        ("FONTNAME",(0,0),(-1,0), FONT_BOLD), ("FONTSIZE",(0,0),(-1,0), 8.5),
-        ("FONTNAME",(0,1),(-1,-1), FONT_REG), ("FONTSIZE",(0,1),(-1,-1), 8.5),
-        ("GRID",(0,0),(-1,-1), 0.25, colors.lightgrey),
-        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-        ("LEFTPADDING",(0,0),(-1,-1),pad), ("RIGHTPADDING",(0,0),(-1,-1),pad),
-        ("TOPPADDING",(0,0),(-1,-1),pad), ("BOTTOMPADDING",(0,0),(-1,-1),pad),
-    ]))
-    return tbl
+_load_env_from_root()
+if not os.getenv("OPENAI_API_KEY"):
+    print("⚠️  OPENAI_API_KEY não encontrado no ambiente (.env na raiz não carregou ou não tem a chave).")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Helpers gerais
+# Ordem padrão dos scripts Python e configurações
 # ────────────────────────────────────────────────────────────────────────────────
-def _safe(name: str) -> str:
-    s = unicodedata.normalize("NFKD", name or "")
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", s.strip())
-    return re.sub(r"_+", "_", s).strip("_").lower() or "perito"
-
-def _run(cmd: List[str], cwd: Optional[str]=None) -> int:
-    print("[CMD]", " ".join(cmd))
-    try:
-        out = subprocess.run(cmd, cwd=cwd, check=False, capture_output=True, text=True)
-        if out.stdout: print(out.stdout.strip())
-        if out.stderr: print(out.stderr.strip())
-        return out.returncode
-    except Exception as e:
-        print(f"[ERRO] Falha ao executar: {e}")
-        return 1
-
-def _read_text(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return ""
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Execução dos compare_* / R com detecção de flags
-# ────────────────────────────────────────────────────────────────────────────────
-GLOBAL_SCRIPTS = ["g_weekday_to_weekend_table.py"]
-
-GRAPH_SCRIPTS  = [
+SCRIPT_ORDER = [
     "compare_nc_rate.py",
-    "compare_fifteen_seconds.py",
-    "compare_productivity.py",
-    "compare_overlap.py",
     "compare_motivos_perito_vs_brasil.py",
+    "compare_productivity.py",
+    "compare_fifteen_seconds.py",
+    "compare_overlap.py",
     "compare_indicadores_composto.py",
 ]
 
-FIFTEEN_THRESHOLD = 15
-PRODUCTIVITY_THRESHOLD = 50
+DEFAULT_MODES = {
+    "compare_productivity.py": ["perito-share", "task-share", "time-share"],
+    "compare_overlap.py":      ["perito-share", "task-share", "time-share"],
+}
 
+EXTRA_ARGS = {
+    "compare_motivos_perito_vs_brasil.py": ["--label-maxlen", "14", "--label-fontsize", "7"],
+}
+
+PRODUCTIVITY_THRESHOLD = "50"  # análises/h
+FIFTEEN_THRESHOLD      = "15"  # segundos
+FIFTEEN_CUT_N          = "10"  # mínimo de análises ≤ threshold
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Scripts globais (por período; independem de perito/top10)
+# ────────────────────────────────────────────────────────────────────────────────
+GLOBAL_SCRIPTS = [
+    "g_weekday_to_weekend_table.py",
+]
+
+def build_commands_for_global(script_file: str, start: str, end: str) -> list:
+    """Monta comando para scripts globais que só precisam de --start/--end."""
+    return [[
+        sys.executable, script_file,
+        "--db", DB_PATH,
+        "--start", start,
+        "--end", end,
+        "--out-dir", EXPORT_DIR,
+        "--export-org",
+        "--export-png",
+        "--export-protocols",
+    ]]
+
+# ────────────────────────────────────────────────────────────────────────────────
+# R checks — individuais e top10
+# ────────────────────────────────────────────────────────────────────────────────
 RCHECK_SCRIPTS = [
     ("01_nc_rate_check.R",          {"need_perito": True}),
     ("02_le15s_check.R",            {"need_perito": True, "defaults": {"--threshold": FIFTEEN_THRESHOLD}}),
@@ -301,336 +142,2962 @@ RCHECK_GROUP_SCRIPTS = [
     ("08_weighted_props.R",              {"pass_top10": True, "defaults": {"--measure": "le", "--threshold": FIFTEEN_THRESHOLD}}),
 ]
 
-def _script_path(dirpath: str, script_name: str) -> str:
-    p = os.path.join(dirpath, script_name)
-    if not os.path.exists(p): raise FileNotFoundError(f"Script ausente: {p}")
-    return p
+# Comentário ChatGPT para apêndice R (opcional)
+try:
+    from utils.comentarios import comentar_r_apendice
+except Exception:
+    comentar_r_apendice = None
 
-def _get_help_text(py_script_path: str) -> str:
+# ────────────────────────────────────────────────────────────────────────────────
+# Conhecimento explícito das flags dos scripts Python
+# ────────────────────────────────────────────────────────────────────────────────
+ASSUME_FLAGS = {
+    "compare_nc_rate.py": {
+        "--perito", "--nome", "--top10", "--min-analises",
+        "--export-md", "--export-png", "--export-org",
+        "--export-comment", "--export-comment-org", "--call-api",
+    },
+    "compare_fifteen_seconds.py": {
+        "--perito", "--nome", "--top10", "--min-analises",
+        "--threshold", "--cut-n",
+        "--export-png", "--export-org",
+        "--export-comment", "--export-comment-org", "--call-api",
+    },
+    "compare_overlap.py": {
+        "--perito", "--nome", "--top10", "--min-analises",
+        "--mode", "--chart",
+        "--export-md", "--export-png", "--export-org",
+        "--export-comment", "--export-comment-org", "--call-api",
+    },
+    "compare_productivity.py": {
+        "--perito", "--nome", "--top10", "--min-analises",
+        "--threshold", "--mode", "--chart",
+        "--export-md", "--export-png", "--export-org",
+        "--export-comment", "--export-comment-org", "--call-api",
+    },
+    "compare_indicadores_composto.py": {
+        "--perito", "--top10", "--min-analises",
+        "--alvo-prod", "--cut-prod-pct", "--cut-nc-pct", "--cut-le15s-pct", "--cut-overlap-pct",
+        "--export-png", "--export-org", "--chart",
+        "--export-comment", "--export-comment-org", "--call-api",
+    },
+    "compare_motivos_perito_vs_brasil.py": {
+        "--perito", "--top10", "--min-analises",
+        "--topn", "--min-pct-perito", "--min-pct-brasil", "--min-n-perito", "--min-n-brasil",
+        "--label-maxlen", "--label-fontsize",
+        "--chart", "--export-md", "--export-org", "--export-png",
+        "--export-comment", "--export-comment-org", "--call-api",
+    },
+}
+
+# ────────────────────────────────────────────────────────────────────────────────
+# CLI
+# ────────────────────────────────────────────────────────────────────────────────
+def parse_args():
+    import argparse
+    p = argparse.ArgumentParser(description="Relatório KPI + Impacto na Fila (wrapper).")
+    p.add_argument('--start', required=True)
+    p.add_argument('--end',   required=True)
+
+    who = p.add_mutually_exclusive_group(required=True)
+    who.add_argument('--perito')
+    who.add_argument('--top10', action='store_true')
+
+    p.add_argument('--min-analises', type=int, default=50)
+
+    # flags do KPI base
+    p.add_argument('--export-org', action='store_true')
+    p.add_argument('--export-pdf', action='store_true')
+    p.add_argument('--add-comments', action='store_true')
+    p.add_argument('--r-appendix', dest='r_appendix', action='store_true', default=True)
+    p.add_argument('--no-r-appendix', dest='r_appendix', action='store_false')
+    p.add_argument('--include-high-nc', dest='include_high_nc', action='store_true', default=True)
+    p.add_argument('--no-high-nc', dest='include_high_nc', action='store_false')
+    p.add_argument('--high-nc-threshold', type=float, default=90.0)
+    p.add_argument('--high-nc-min-tasks', type=int, default=50)
+    p.add_argument('--r-bin', default='Rscript')
+    p.add_argument('--plan-only', action='store_true', help='Apenas listar o plano de execução (dry-run) e sair.')
+
+    # impacto
+    p.add_argument('--with-impact', action='store_true')
+    p.add_argument('--impact-all-tests', action='store_true')
+
+    # NOVO: reutilizar saídas já geradas pelo make_kpi_report.py
+    p.add_argument('--reuse-kpi', action='store_true',
+                   help='Não reexecuta o KPI base; usa o .org/imgs já existentes para montar e exportar.')
+    p.add_argument('--assemble-only', dest='reuse_kpi', action='store_true',
+                   help='Atalho para --reuse-kpi.')
+    return p.parse_args()
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Helpers gerais
+# ────────────────────────────────────────────────────────────────────────────────
+def _safe(name: str) -> str:
+    """Sanitiza nome para uso em arquivos/caminhos."""
+    return "".join(c if c.isalnum() or c in ("-","_") else "_" for c in str(name)).strip("_") or "output"
+
+def _env_with_project_path():
+    """Garante BASE_DIR no PYTHONPATH ao chamar scripts Python filhos."""
+    env = os.environ.copy()
+    py = env.get("PYTHONPATH", "")
+    parts = [BASE_DIR] + ([py] if py else [])
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
+
+def script_path(name: str) -> str:
+    """Resolve caminho absoluto de um script Python do pacote."""
+    path = os.path.join(SCRIPTS_DIR, name)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Script não encontrado: {path}")
+    return path
+
+def rscript_path(name: str) -> str:
+    """Resolve caminho absoluto de um script R do pacote."""
+    path = os.path.join(RCHECK_DIR, name)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"R script não encontrado: {path}")
+    return path
+
+def introspect_script(script_file: str) -> dict:
+    """Executa --help do script para descobrir flags e modos disponíveis."""
+    info = {"flags": set(), "modes": []}
     try:
-        out = subprocess.run([sys.executable, py_script_path, "--help"],
-                             check=False, capture_output=True, text=True, cwd=GRAPHS_DIR)
-        return (out.stdout or "") + "\n" + (out.stderr or "")
+        out = subprocess.run(
+            [sys.executable, script_file, "--help"],
+            capture_output=True, text=True, env=_env_with_project_path(), cwd=SCRIPTS_DIR
+        )
+        text = (out.stdout or "") + "\n" + (out.stderr or "")
+        for m in re.finditer(r"(--[a-zA-Z0-9][a-zA-Z0-9\-]*)", text):
+            info["flags"].add(m.group(1))
+        mm = re.search(r"--mode[^\n]*\{([^}]+)\}", text)
+        if mm:
+            info["modes"] = [x.strip() for x in mm.group(1).split(",") if x.strip()]
     except Exception:
+        pass
+    return info
+
+def detect_modes(script_file: str, help_info: dict) -> list:
+    """Retorna a lista de modos suportados pelo script (via --help ou DEFAULT_MODES)."""
+    name = os.path.basename(script_file)
+    modes = help_info.get("modes") or []
+    return modes if modes else DEFAULT_MODES.get(name, [])
+    
+def _inject_comment_for_stem(stem, comments_dir, output_dir=None, imgs_dir=None, orgs_dir=None):
+    """
+    Ordem de busca:
+      (A) comments_dir → *.org (usa conteúdo inteiro) → *.md (converte p/ org)
+      (B) EXPORT_DIR   → *.org (extrai 1º parágrafo via _extract_comment_from_org)
+      (C) orgs_dir     → *.org (extrai 1º parágrafo)           <-- (ajuste layout novo)
+      (D) output_dir/orgs → *.org (fallback para layout antigo)
+      (E) imgs_dir     → *.org (extrai 1º parágrafo)
+
+    Retorna ['#+BEGIN_QUOTE', ..., '#+END_QUOTE'] ou [].
+    """
+    def _quote_block(txt):
+        return ["", "#+BEGIN_QUOTE", _protect_tables_in_quote(txt.strip()), "#+END_QUOTE"]
+
+    # (A) comments_dir — .org preferencial; depois .md
+    if comments_dir and os.path.isdir(comments_dir):
+        for orgc in (os.path.join(comments_dir, f"{stem}_comment.org"),
+                     os.path.join(comments_dir, f"{stem}.org")):
+            if os.path.exists(orgc):
+                with open(orgc, encoding="utf-8") as f:
+                    comment_org = f.read().strip()
+                print(f"[comments] .org (comments_dir) → {orgc}")
+                return _quote_block(comment_org)
+
+        for md in (os.path.join(comments_dir, f"{stem}_comment.md"),
+                   os.path.join(comments_dir, f"{stem}.md")):
+            if os.path.exists(md):
+                with open(md, encoding="utf-8") as f:
+                    comment_md = f.read().strip()
+                print(f"[comments] .md (comments_dir) → {md}")
+                org_txt = markdown_para_org(comment_md)
+                org_txt = "\n".join(
+                    ln for ln in org_txt.splitlines()
+                    if not ln.strip().lower().startswith('#+title')
+                ).strip()
+                return _quote_block(org_txt)
+
+    # (B) EXPORT_DIR — .org auxiliar
+    if EXPORT_DIR and os.path.isdir(EXPORT_DIR):
+        for orgc in (os.path.join(EXPORT_DIR, f"{stem}.org"),
+                     os.path.join(EXPORT_DIR, f"{stem}_comment.org")):
+            if os.path.exists(orgc):
+                with open(orgc, encoding="utf-8") as f:
+                    aux_org = f.read()
+                extra = _extract_comment_from_org(aux_org)
+                if extra:
+                    print(f"[comments] extraído do EXPORT_DIR → {orgc}")
+                    return _quote_block(extra)
+
+    # (C) orgs_dir — layout novo
+    if orgs_dir:
+        aux_org_path = os.path.join(orgs_dir, f"{stem}.org")
+        if os.path.exists(aux_org_path):
+            with open(aux_org_path, encoding="utf-8") as f:
+                aux_org = f.read()
+            extra = _extract_comment_from_org(aux_org)
+            if extra:
+                print(f"[comments] extraído de orgs_dir → {aux_org_path}")
+                return _quote_block(extra)
+
+    # (D) output_dir/orgs — fallback layout antigo
+    if output_dir:
+        aux_org_path_old = os.path.join(output_dir, "orgs", f"{stem}.org")
+        if os.path.exists(aux_org_path_old):
+            with open(aux_org_path_old, encoding="utf-8") as f:
+                aux_org = f.read()
+            extra = _extract_comment_from_org(aux_org)
+            if extra:
+                print(f"[comments] extraído de output_dir/orgs → {aux_org_path_old}")
+                return _quote_block(extra)
+
+    # (E) imgs_dir — .org ao lado do PNG (caso raro)
+    if imgs_dir and os.path.isdir(imgs_dir):
+        local_org = os.path.join(imgs_dir, f"{stem}.org")
+        if os.path.exists(local_org):
+            with open(local_org, encoding="utf-8") as f:
+                aux_org = f.read()
+            extra = _extract_comment_from_org(aux_org)
+            if extra:
+                print(f"[comments] extraído de imgs_dir → {local_org}")
+                return _quote_block(extra)
+
+    print(f"[comments] comentário não encontrado para stem='{stem}'")
+    return []
+
+
+def _find_impacto_dir_for_perito(periodo_dir: str, perito: str) -> str | None:
+    """
+    Procura .../outputs/<periodo>/impacto_fila/<PERITO>/ e retorna esse caminho.
+    Usa o mesmo sanitizador _safe() para casar o nome da pasta.
+    """
+    root = os.path.join(periodo_dir, "impacto_fila")
+    if not os.path.isdir(root):
+        return None
+    safe = _safe(perito)
+    # tentativa direta
+    cand = os.path.join(root, safe)
+    if os.path.isdir(cand):
+        return cand
+    # varre subpastas e compara pelo _safe
+    for d in glob(os.path.join(root, "*")):
+        if os.path.isdir(d) and _safe(os.path.basename(d)).lower() == safe.lower():
+            return d
+    return None
+
+def _copy_impacto_imgs_to_relatorio(impacto_dir: str, imgs_dir_dest: str) -> int:
+    """
+    Copia PNGs de .../impacto_fila/<PERITO>/exports para imgs/ do relatório.
+    """
+    os.makedirs(imgs_dir_dest, exist_ok=True)
+    src_dir = os.path.join(impacto_dir, "exports")
+    moved = 0
+    if os.path.isdir(src_dir):
+        for src in glob(os.path.join(src_dir, "*.png")):
+            shutil.copy2(src, os.path.join(imgs_dir_dest, os.path.basename(src)))
+            moved += 1
+    return moved
+
+def _append_impacto_fila_perito(lines, periodo_dir, perito, start, end, heading_level="**"):
+    safe = _safe(perito)
+    org_dir = os.path.join(periodo_dir, "impacto_fila", safe, "org")
+    candidates = [
+        os.path.join(org_dir, f"impacto_fila_{safe}_{start}_a_{end}.org"),
+        os.path.join(org_dir, f"impacto_fila_{start}_a_{end}.org"),
+    ]
+    # fallback: qualquer arquivo de impacto desse perito no período
+    if not any(os.path.exists(p) for p in candidates):
+        candidates = sorted(glob(os.path.join(org_dir, f"impacto_fila*{start}_a_{end}.org")))
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    lines.append(f"{heading_level} Impacto na fila — {perito}")
+                    content = shift_org_headings(content, delta=1)
+                    content = _protect_org_text_for_pandoc(content)
+                    lines.append(content)
+                    lines.append("\n#+LATEX: \\newpage\n")
+                    return True
+            except Exception as e:
+                print(f"[AVISO] Falha lendo impacto_fila para {perito}: {e}")
+            break
+    return False
+
+def _append_impacto_fila_grupo(lines, periodo_dir, start, end, heading_level="**"):
+    # procura um único arquivo “impacto_fila_<start>_a_<end>.org” (sem nome de perito)
+    pattern = os.path.join(periodo_dir, "impacto_fila", "**", "org", f"impacto_fila_{start}_a_{end}.org")
+    matches = sorted(glob(pattern, recursive=True))
+    if not matches:
+        return False
+    path = matches[0]  # inclui só uma vez
+    try:
+        with open(path, encoding="utf-8") as f:
+            content = f.read().strip()
+        if content:
+            lines.append(f"{heading_level} Impacto na fila — Grupo")
+            content = shift_org_headings(content, delta=1)
+            content = _protect_org_text_for_pandoc(content)
+            lines.append(content)
+            lines.append("\n#+LATEX: \\newpage\n")
+            return True
+    except Exception as e:
+        print(f"[AVISO] Falha lendo impacto_fila (grupo): {e}")
+    return False
+
+def coletar_orgs_impacto(out_root: str, start: str, end: str,
+                         perito: str | None = None,
+                         group: str = "impacto_fila") -> list[str]:
+    """
+    Retorna caminhos .org de 'Impacto na Fila' para grupo ou perito, cobrindo
+    tanto o layout novo (<out_root>/{top10|individual}/impacto_fila/org)
+    quanto o layout clássico (<out_root>/impacto_fila/<safe>/org).
+    """
+    from glob import glob as _glob
+    import os
+    hits: list[str] = []
+
+    def _collect(patterns: list[str]) -> None:
+        for pat in patterns:
+            for p in _glob(pat, recursive=True):
+                if os.path.isfile(p):
+                    hits.append(p)
+
+    # --- Layout "novo" (aninhado em top10/ ou individual/<safe>/) ---
+    if perito:
+        safe = _safe(perito)
+        base_new = os.path.join(out_root, "individual", safe, group, "org")
+        pats_new = [
+            os.path.join(base_new, f"{group}_{start}_a_{end}.org"),
+            os.path.join(base_new, f"{group}_*_{start}_a_{end}.org"),
+        ]
+        _collect(pats_new)
+    else:
+        base_new = os.path.join(out_root, "top10", group, "org")
+        pats_new = [
+            os.path.join(base_new, f"{group}_{start}_a_{end}.org"),
+            os.path.join(base_new, f"{group}_*_{start}_a_{end}.org"),
+        ]
+        _collect(pats_new)
+
+    # --- Layout "clássico" (impacto_fila/<safe>/org e varredura p/ grupo) ---
+    if perito:
+        safe = _safe(perito)
+        base_old = os.path.join(out_root, group, safe, "org")
+        pats_old = [
+            os.path.join(base_old, f"{group}_{start}_a_{end}.org"),
+            os.path.join(base_old, f"{group}_*_{start}_a_{end}.org"),
+        ]
+        _collect(pats_old)
+    else:
+        # grupo: pega o primeiro org que case o período em qualquer subpasta
+        pats_old = [os.path.join(out_root, group, "**", "org", f"{group}_{start}_a_{end}.org")]
+        _collect(pats_old)
+
+    return sorted(set(hits))
+
+def _safe_move(src: str, dst_dir: str) -> str:
+    os.makedirs(dst_dir, exist_ok=True)
+    base = os.path.basename(src)
+    dst  = os.path.join(dst_dir, base)
+    if os.path.abspath(src) == os.path.abspath(dst):
+        return dst
+    stem, ext = os.path.splitext(base)
+    i = 1
+    while os.path.exists(dst):
+        dst = os.path.join(dst_dir, f"{stem}_{i}{ext}")
+        i += 1
+    shutil.move(src, dst)
+    return dst
+
+def _organize_outputs_kpi(start: str, end: str, generated_paths: list[str]):
+    period_dir = f"{start}_a_{end}"
+    dest_base  = os.path.join(OUTPUTS_DIR, period_dir, "kpi")
+    os.makedirs(dest_base, exist_ok=True)
+
+    ext_map = {'.png': 'imgs', '.pdf': 'pdf', '.org': 'orgs', '.md': 'markdown'}
+    for p in sorted(set(filter(None, generated_paths))):
+        if not os.path.exists(p):
+            continue
+        ext = os.path.splitext(p)[1].lower()
+        sub = ext_map.get(ext, 'misc')
+        _safe_move(p, os.path.join(dest_base, sub))
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Weekday→Weekend: consultas e inserções em Org
+# ────────────────────────────────────────────────────────────────────────────────
+def _detect_end_datetime_column(conn) -> str | None:
+    """Detecta o nome da coluna de término na tabela 'analises'."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(analises)").fetchall()]
+    for cand in ("dataHoraFimPericia", "dataHoraFimAnalise", "dataHoraFim"):
+        if cand in cols:
+            return cand
+    return None
+
+def _weekday2weekend_protocols_by_perito(start: str, end: str):
+    """
+    Retorna (lista_ordenada, total) de protocolos: início em dia útil e conclusão no fim de semana.
+    lista_ordenada = [(perito, [protocolos...]), ...]
+    """
+    conn = sqlite3.connect(DB_PATH)
+    end_col = _detect_end_datetime_column(conn)
+    if not end_col:
+        conn.close()
+        print("[AVISO] Coluna de término não encontrada na tabela 'analises'.")
+        return [], 0
+
+    sql = f"""
+        SELECT p.nomePerito AS perito, a.protocolo AS protocolo
+          FROM analises a
+          JOIN peritos p ON a.siapePerito = p.siapePerito
+         WHERE date(a.dataHoraIniPericia) BETWEEN ? AND ?
+           AND CAST(strftime('%w', date(a.dataHoraIniPericia)) AS INTEGER) BETWEEN 1 AND 5
+           AND a.{end_col} IS NOT NULL
+           AND CAST(strftime('%w', date(a.{end_col})) AS INTEGER) IN (0,6)
+         ORDER BY p.nomePerito, a.protocolo
+    """
+    rows = conn.execute(sql, (start, end)).fetchall()
+    conn.close()
+
+    por_perito = {}
+    for perito, protocolo in rows:
+        por_perito.setdefault(perito, []).append(str(protocolo))
+
+    ordenado = sorted(por_perito.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    total = len(rows)
+    return ordenado, total
+
+def _append_weekday2weekend_panorama_block(
+    lines: list,
+    imgs_dir: str,
+    comments_dir: str,
+    orgs_dir: str,
+    start: str = None,
+    end: str = None,
+    heading_level: str = "**",
+) -> bool:
+    """
+    Acrescenta panorama global (gráfico por CR, tabela org e protocolos por perito), se existirem.
+
+    Parâmetros
+    ----------
+    lines : list
+        Buffer de linhas do .org onde o bloco será inserido.
+    imgs_dir : str
+        Pasta de imagens do relatório (ex.: .../kpi/imgs/<escopo>).
+    comments_dir : str
+        Pasta de comentários do relatório (ex.: .../kpi/orgs/<escopo>/comments).
+    orgs_dir : str
+        Pasta onde ficam os .org do relatório (ex.: .../kpi/orgs/<escopo>).
+        Usado também para calcular o prefixo relativo até a pasta de imagens.
+    start, end : str | None
+        Datas YYYY-MM-DD para fallback dinâmico dos protocolos (se .org de protocolos não existir).
+    heading_level : str
+        Nível do heading Org a ser usado para o bloco inserido.
+
+    Retorna
+    -------
+    bool
+        True se algo foi inserido; False caso contrário.
+    """
+    # Normaliza caminhos absolutos
+    orgs_dir     = os.path.abspath(orgs_dir)
+    imgs_dir     = os.path.abspath(imgs_dir)
+    comments_dir = os.path.abspath(comments_dir)
+
+    # Arquivos esperados (sempre relativos a orgs_dir/comments_dir/imgs_dir informados)
+    table_org   = os.path.join(orgs_dir, "rcheck_weekday_to_weekend_table.org")
+    protos_org  = os.path.join(orgs_dir, "rcheck_weekday_to_weekend_protocols.org")
+    png_path    = os.path.join(imgs_dir, "rcheck_weekday_to_weekend_by_cr.png")
+    comment_org = os.path.join(comments_dir, "rcheck_weekday_to_weekend_table_comment.org")
+
+    # Verifica se existe ao menos um artefato do panorama
+    found_any = any(os.path.exists(p) for p in (png_path, table_org, protos_org, comment_org))
+    if not found_any:
+        return False
+
+    # Prefixo relativo de orgs_dir -> imgs_dir (para links [[file:...]])
+    rel_img_prefix = _rel_prefix(orgs_dir, imgs_dir)
+
+    lines.append(f"{heading_level} Panorama global — Início em dia útil → conclusão no fim de semana (por CR)")
+
+    # Comentário (se existir)
+    if os.path.exists(comment_org):
+        try:
+            with open(comment_org, encoding="utf-8") as f:
+                ctext = f.read().strip()
+            ctext = _protect_tables_in_quote(ctext)
+            lines.extend(["", "#+BEGIN_QUOTE", ctext, "#+END_QUOTE"])
+        except Exception as e:
+            print(f"[AVISO] Falha ao anexar comentário do panorama: {e}")
+
+    # Tabela (+ possível figura embutida)
+    table_content = ""
+    has_png_inside_table = False
+    if os.path.exists(table_org):
+        try:
+            with open(table_org, encoding="utf-8") as f:
+                table_content = f.read().strip()
+            # Remove #+title, se houver, e garante espaçamento seguro para Pandoc
+            table_content = "\n".join(
+                ln for ln in table_content.splitlines()
+                if not ln.strip().lower().startswith("#+title")
+            ).strip()
+            has_png_inside_table = "rcheck_weekday_to_weekend_by_cr.png" in table_content
+            table_content = _ensure_blank_lines_around_tables(table_content)
+        except Exception as e:
+            print(f"[AVISO] Falha ao ler tabela do panorama: {e}")
+            table_content = ""
+
+    # Figura (se existir e não estiver embutida na tabela)
+    if os.path.exists(png_path) and not has_png_inside_table:
+        base = os.path.basename(png_path)
+        lines.extend([
+            "",
+            "#+ATTR_LATEX: :placement [H] :width \\linewidth",
+            "#+CAPTION: Tarefas iniciadas em dia útil e concluídas no fim de semana — por CR (ordenado)",
+            f"[[file:{rel_img_prefix}{base}]]",
+        ])
+
+    # Tabela (se existir)
+    if table_content:
+        lines.extend(["", table_content])
+
+    # Protocolos: .org pronto OU fallback dinâmico via banco
+    appended_protocols = False
+    if os.path.exists(protos_org):
+        try:
+            with open(protos_org, encoding="utf-8") as f:
+                protos_content = f.read().strip()
+            # Remove heading redundante, se vier no arquivo base
+            protos_content = "\n".join(
+                ln for ln in protos_content.splitlines()
+                if not ln.strip().lower().startswith("#+title")
+            ).strip()
+            protos_content = re.sub(
+                r'^\s*\*+\s+Protocolos envolvidos\s*\(por perito\)\s*\n',
+                '',
+                protos_content,
+                count=1,
+                flags=re.IGNORECASE
+            ).lstrip()
+
+            lines.append("")
+            lines.append(f"{heading_level} Protocolos envolvidos (por perito)")
+            # Se o bloco interno tiver headings, rebaixa um nível para encaixar
+            try:
+                protos_content = shift_org_headings(protos_content, delta=1)
+            except NameError:
+                pass
+            lines.append(protos_content)
+            appended_protocols = True
+        except Exception as e:
+            print(f"[AVISO] Falha ao anexar protocolos (.org): {e}")
+
+    if not appended_protocols and start and end:
+        # Fallback: consulta dinâmica ao DB
+        try:
+            lista, total = _weekday2weekend_protocols_by_perito(start, end)
+            if lista:
+                lines.append("")
+                lines.append(f"{heading_level} Protocolos envolvidos (por perito)")
+                for perito, protos in lista:
+                    lines.append(f"- *{perito}* ({len(protos)}): {', '.join(protos)}")
+                lines.append(f"\n- **Total de protocolos:** {total}")
+        except Exception as e:
+            print(f"[AVISO] Falha no fallback dinâmico de protocolos: {e}")
+
+    lines.append("\n#+LATEX: \\newpage\n")
+    return True
+
+
+def _append_weekday2weekend_perito_block_if_any(
+    lines: list,
+    perito: str,
+    imgs_dir: str,
+    comments_dir: str,
+    start: str,
+    end: str,
+    heading_level: str = "**",
+    orgs_dir: str | None = None,
+) -> bool:
+    """
+    Adiciona, AO FINAL do relatório individual, um bloco com os casos weekday→weekend
+    somente se o perito tiver pelo menos 1 protocolo.
+
+    orgs_dir: onde ficam os .org do panorama (default: pai de comments_dir).
+    """
+    if orgs_dir is None:
+        orgs_dir = os.path.dirname(os.path.normpath(comments_dir))
+
+    table_org  = os.path.join(orgs_dir, "rcheck_weekday_to_weekend_table.org")
+    protos_org = os.path.join(orgs_dir, "rcheck_weekday_to_weekend_protocols.org")
+
+    protos = _read_protocols_for_perito_from_org(protos_org, perito) if os.path.exists(protos_org) else []
+    if not protos:
+        try:
+            lst, _total = _weekday2weekend_protocols_by_perito(start, end)
+            perito_lower = perito.strip().lower()
+            for p, pnums in lst:
+                if p.strip().lower() == perito_lower:
+                    protos = list(pnums)
+                    break
+        except Exception as e:
+            print(f"[AVISO] Fallback dinâmico de protocolos falhou: {e}")
+
+    if not protos:
+        return False
+
+    lines.append(f"{heading_level} Início em dia útil → conclusão no fim de semana (este perito)")
+    lines.append(f"Janela: {start} a {end}. Somente tarefas deste perito iniciadas em dia útil e concluídas no fim de semana.\n")
+
+    mini_table = _extract_single_row_from_org_table(table_org, perito) if os.path.exists(table_org) else ""
+    if mini_table:
+        lines.append("#+CAPTION: Resumo (apenas este perito)")
+        lines.append(mini_table)
+        lines.append("")
+
+    lines.append("#+CAPTION: Protocolos deste perito")
+    protos_sorted = sorted(protos)
+    chunk, max_len = [], 25
+    while protos_sorted:
+        chunk, protos_sorted = protos_sorted[:max_len], protos_sorted[max_len:]
+        lines.append(f"- {', '.join(chunk)}")
+    lines.append("\n#+LATEX: \\newpage\n")
+    return True
+
+
+def _read_protocols_for_perito_from_org(path: str, perito: str) -> list:
+    """Extrai lista de protocolos do perito a partir do .org de protocolos."""
+    if not os.path.exists(path):
+        return []
+    perito_low = perito.strip().lower()
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if ":" not in line:
+                    continue
+                l = line.lstrip("-• ").strip()
+                l_norm = l.replace("*", "")
+                if perito_low in l_norm.lower():
+                    after = line.split(":", 1)[1].strip()
+                    if after:
+                        parts = [p.strip() for p in after.split(",") if p.strip()]
+                        out.extend(parts)
+    except Exception as e:
+        print(f"[AVISO] Falha lendo protocolos em {path}: {e}")
+    return out
+
+def _extract_single_row_from_org_table(path: str, perito: str) -> str:
+    """Extrai somente a linha do perito de uma tabela Org que tenha a coluna 'Perito'."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = [ln.rstrip("\n") for ln in f]
+        i = 0
+        while i < len(lines):
+            if lines[i].lstrip().startswith("|"):
+                tbl = []
+                while i < len(lines) and lines[i].lstrip().startswith("|"):
+                    tbl.append(lines[i].strip())
+                    i += 1
+                if not tbl:
+                    continue
+                header = [h.strip() for h in tbl[0].strip("| ").split("|")]
+                if "Perito" not in header:
+                    continue
+                per_idx = header.index("Perito")
+                for row in tbl[2:]:
+                    cols = [c.strip() for c in row.strip("| ").split("|")]
+                    if per_idx < len(cols) and cols[per_idx].strip().lower() == perito.strip().lower():
+                        return "\n".join([
+                            "| " + " | ".join(header) + " |",
+                            "|" + "|".join("---" for _ in header) + "|",
+                            "| " + " | ".join(cols) + " |",
+                        ])
+            else:
+                i += 1
+    except Exception as e:
+        print(f"[AVISO] Falha extraindo linha da tabela {path}: {e}")
+    return ""
+
+# ——— Reincidentes: helpers ————————————————————————————————————————————————
+REINC_SCRIPT = os.path.join(SCRIPTS_DIR, "scan_top10_names_with_months.py")
+
+def _run_reincidentes_scan(out_csv: str, min_months: int, root: str,
+                           start: str = None, end: str = None,
+                           min_analises: int = 50) -> None:
+    """
+    (NOVA) Gera reincidentes consultando o BANCO, sem depender de .org antigos.
+    Jan->end do ano de 'end', mês a mês. Em cada mês, pega o Top 10 (scoreFinal)
+    exigindo 'min_analises' tarefas no próprio mês.
+
+    Parâmetros
+    ----------
+    out_csv : str
+        Caminho do CSV de saída (será criado/reescrito).
+    min_months : int
+        Número mínimo de meses distintos para o perito ser considerado reincidente.
+    root : str
+        Ignorado nesta versão (mantido por compatibilidade da assinatura).
+    start : str | None
+        Data inicial YYYY-MM-DD (usada apenas se 'end' vier vazio; caso contrário ignorada).
+    end : str | None
+        Data final YYYY-MM-DD (define o ano e o último mês da janela Jan->end).
+    min_analises : int
+        Mínimo de análises no mês para que o perito seja elegível naquele mês.
+
+    Saída
+    -----
+    CSV com colunas: nome, matricula, CR, DR, meses (lista 'YYYY-MM' separados por vírgula).
+    """
+    import csv
+
+    # Determina o fim da janela
+    if not end:
+        if not start:
+            print("[AVISO] _run_reincidentes_scan: sem 'end' (nem 'start'). Abortando.")
+            return
+        end_dt = datetime.strptime(start, "%Y-%m-%d").date()
+    else:
+        end_dt = datetime.strptime(end, "%Y-%m-%d").date()
+
+    # Jan/AAAA → end
+    scan_start = date(end_dt.year, 1, 1)
+    scan_end   = end_dt
+
+    # Iterador de meses
+    def _iter_months(dini: date, dfim: date):
+        y, m = dini.year, dini.month
+        while (y < dfim.year) or (y == dfim.year and m <= dfim.month):
+            yield y, m
+            if m == 12:
+                y, m = y + 1, 1
+            else:
+                m += 1
+
+    conn = sqlite3.connect(DB_PATH)
+
+    # siape -> dados agregados
+    seen = {}
+
+    try:
+        for y, m in _iter_months(scan_start, scan_end):
+            m_ini = date(y, m, 1)
+            m_fim = date(y, m, calendar.monthrange(y, m)[1])
+
+            # Top 10 do mês por score, exigindo min_analises no mês
+            query = """
+                SELECT
+                    p.siapePerito AS siape,
+                    p.nomePerito  AS nome,
+                    p.cr          AS CR,
+                    p.dr          AS DR,
+                    MAX(i.scoreFinal) AS score,
+                    COUNT(a.protocolo) AS total_analises
+                FROM indicadores i
+                JOIN analises    a ON a.siapePerito = i.perito
+                JOIN peritos     p ON p.siapePerito = i.perito
+                WHERE date(a.dataHoraIniPericia) BETWEEN ? AND ?
+                GROUP BY p.siapePerito, p.nomePerito, p.cr, p.dr
+                HAVING total_analises >= ?
+                ORDER BY score DESC
+                LIMIT 10
+            """
+            dfm = pd.read_sql(
+                query, conn,
+                params=(m_ini.isoformat(), m_fim.isoformat(), int(min_analises))
+            )
+            if dfm.empty:
+                continue
+
+            month_key = f"{y:04d}-{m:02d}"
+            for _, row in dfm.iterrows():
+                siape = str(row["siape"])
+                entry = seen.setdefault(siape, {
+                    "nome": row["nome"],
+                    "CR":   row.get("CR", "") or "",
+                    "DR":   row.get("DR", "") or "",
+                    "meses": set(),
+                })
+                entry["meses"].add(month_key)
+
+    finally:
+        conn.close()
+
+    # Filtra reincidentes (>= min_months)
+    rows = []
+    for siape, data in seen.items():
+        meses_sorted = sorted(data["meses"])
+        if len(meses_sorted) >= (min_months or 1):
+            rows.append({
+                "nome":      data["nome"],
+                "matricula": siape,
+                "CR":        data["CR"],
+                "DR":        data["DR"],
+                "meses":     ", ".join(meses_sorted),
+            })
+
+    # Dedup (por matrícula; se matrícula vazia, cai para nome)
+    dedup = {}
+    for r in rows:
+        key = r["matricula"] or r["nome"]
+        dedup.setdefault(key, r)
+
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["nome", "matricula", "CR", "DR", "meses"])
+        w.writeheader()
+        for r in sorted(dedup.values(), key=lambda x: (x["nome"], x["matricula"])):
+            w.writerow(r)
+
+    print(f"✅ Reincidentes (DB, Jan→{scan_end:%Y-%m}, min_analises={min_analises}) salvos em: {out_csv}")
+
+def _csv_to_org_table(csv_path: str, headers=("nome","cr","dr","meses")) -> str:
+    """Converte um CSV simples em uma org-table (acesso case-insensitive)."""
+    if not os.path.exists(csv_path):
         return ""
 
-def _supports_flag(help_text: str, flag: str) -> bool:
-    token = flag.strip()
-    if not token.startswith("--"): token = "--" + token
-    return token in help_text
+    rows = []
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        r = csv.DictReader(fh)
+        for row in r:
+            rows.append(row)
+    if not rows:
+        return ""
 
-def _build_global_cmds(start: str, end: str) -> List[List[str]]:
-    cmds = []
-    for s in GLOBAL_SCRIPTS:
-        try:
-            p = _script_path(GRAPHS_DIR, s)
-        except FileNotFoundError as e:
-            print(f"[AVISO] {e}")
+    # Cabeçalhos bonitinhos para a tabela
+    hdr_print = []
+    for h in headers:
+        hl = h.lower()
+        if hl == "meses":      hdr_print.append("Meses")
+        elif hl == "nome":     hdr_print.append("Perito")
+        elif hl == "cr":       hdr_print.append("CR")
+        elif hl == "dr":       hdr_print.append("DR")
+        elif hl == "matricula":hdr_print.append("Matrícula")
+        else:                  hdr_print.append(h)
+
+    lines = []
+    lines.append("| " + " | ".join(hdr_print) + " |")
+    lines.append("|" + "|".join("---" for _ in hdr_print) + "|")
+
+    # Acesso case-insensitive aos campos
+    for row in rows:
+        row_ci = { (k or "").strip().lower(): (v or "") for k, v in row.items() }
+        vals = [ row_ci.get(h.lower(), "") for h in headers ]
+        lines.append("| " + " | ".join(vals) + " |")
+
+    return "\n".join(lines)
+
+
+def _append_reincidentes_to_org(org_path: str, csv_path: str, min_months: int = 2, heading_level: str = "**"):
+    """
+    Acrescenta seção de 'Peritos reincidentes' ao final do .org, em fonte pequena
+    e com quebras automáticas na coluna 'Meses' (p{largura} + longtable).
+    """
+    table = _csv_to_org_table(csv_path)
+    if not table:
+        print("[INFO] Sem reincidentes para anexar (tabela vazia).")
+        return False
+
+    section = []
+    section.append("")
+    section.append(f"{heading_level} Peritos reincidentes no Top 10 (≥ {min_months} meses)")
+    section.append("")
+    # Atributos LaTeX para a tabela: usa longtable e fixa largura da última coluna
+    # Ajuste p{8cm} conforme necessidade (7.5cm, 7cm, etc.)
+    section.append("#+ATTR_LATEX: :environment longtable :align l l l p{8cm}")
+    # Grupo local para reduzir fonte e padding, sem afetar o resto do documento
+    section.append("#+LATEX: \\begingroup\\setlength{\\tabcolsep}{3pt}\\renewcommand{\\arraystretch}{1.0}\\scriptsize")
+    section.append(table)
+    section.append("#+LATEX: \\endgroup")
+    section.append("\n#+LATEX: \\newpage\n")
+
+    with open(org_path, "a", encoding="utf-8") as f:
+        f.write("\n".join(section))
+
+    print(f"✅ Reincidentes anexado ao final de: {org_path}")
+    return True
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Ajustes de Org e utilitários de texto
+# ────────────────────────────────────────────────────────────────────────────────
+_ANSI_RE     = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_BOX_DRAW_RE = re.compile(r"[┌┬┐└┴┘├┼┤│─━┃╭╮╯╰█▓▒░]")
+
+def shift_org_headings(text: str, delta: int = 1) -> str:
+    """Rebaixa/eleva níveis de heading em um texto Org."""
+    lines = []
+    for ln in text.splitlines():
+        if ln.startswith('*'):
+            i = 0
+            while i < len(ln) and ln[i] == '*':
+                i += 1
+            if i > 0 and i + delta < 7 and (i < len(ln) and ln[i] == ' '):
+                ln = ('*' * (i + delta)) + ln[i:]
+        lines.append(ln)
+    return "\n".join(lines)
+
+def _rewrite_org_image_links(org_text: str, imgs_rel_prefix: str = "../imgs/") -> str:
+    """Normaliza links [[file:...]] para apontarem para a pasta imgs/ relativa."""
+    def repl(m):
+        path = m.group(1).strip()
+        if path.startswith(("http://", "https://", "/")):
+            return m.group(0)
+        base = os.path.basename(path)
+        return f"[[file:{imgs_rel_prefix}{base}]]"
+    return re.sub(r"\[\[file:([^\]]+)\]\]", repl, org_text)
+
+def _nice_caption(fname: str) -> str:
+    """Gera uma legenda amigável a partir do nome do arquivo."""
+    base = os.path.splitext(os.path.basename(fname))[0]
+    return base.replace("_", " ").replace("-", " ")
+
+def markdown_para_org(texto_md: str) -> str:
+    """Converte texto Markdown para Org usando Pandoc, retornando o texto Org."""
+    with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False) as fmd:
+        fmd.write(texto_md)
+        fmd.flush()
+        org_path = fmd.name.replace(".md", ".org")
+        subprocess.run(["pandoc", fmd.name, "-t", "org", "-o", org_path])
+        with open(org_path, encoding="utf-8") as forg:
+            org_text = forg.read()
+    return org_text
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
+
+def _wrap_ascii_blocks(text: str) -> str:
+    """Envelopa trechos com pseudografismo/ANSI em #+begin_example/# +end_example."""
+    lines = text.splitlines()
+    out = []
+    in_block = False
+    for ln in lines:
+        has_ansi = bool(_ANSI_RE.search(ln))
+        has_box  = bool(_BOX_DRAW_RE.search(ln))
+        if (has_ansi or has_box) and ln.strip():
+            if not in_block:
+                out.append("#+begin_example")
+                in_block = True
+            out.append(_strip_ansi(ln))
             continue
-        cmds.append([sys.executable, p, "--db", DB_PATH, "--start", start, "--end", end, "--export-png"])
-    return cmds
+        else:
+            if in_block:
+                out.append("#+end_example")
+                in_block = False
+            out.append(ln)
+    if in_block:
+        out.append("#+end_example")
+    return "\n".join(out)
 
-def _build_graph_cmds(top10: bool, perito: Optional[str],
-                      start: str, end: str, min_analises: int,
-                      add_comments: bool, topn: int) -> List[List[str]]:
-    cmds = []
-    for s in GRAPH_SCRIPTS:
-        try:
-            p = _script_path(GRAPHS_DIR, s)
-        except FileNotFoundError as e:
-            print(f"[AVISO] {e}")
+def _ensure_blank_lines_around_tables(text: str) -> str:
+    """Garante linhas em branco ao redor de tabelas Org para não confundir o Pandoc."""
+    text = re.sub(r"(\[Tabela[^\]]*\])\s*(\|)", r"\1\n\2", text, flags=re.I)
+    lines = text.splitlines()
+    out = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if ln.lstrip().startswith("|"):
+            if out and out[-1].strip() != "":
+                out.append("")
+            while i < len(lines) and lines[i].lstrip().startswith("|"):
+                out.append(lines[i])
+                i += 1
+            if i < len(lines) and lines[i].strip() != "":
+                out.append("")
             continue
-        help_txt = _get_help_text(p)
-        c = [sys.executable, p, "--start", start, "--end", end]
-        if _supports_flag(help_txt, "--min-analises"):
-            c += ["--min-analises", str(min_analises)]
-        if top10 and _supports_flag(help_txt, "--top10"):
-            c += ["--top10"]
-            if _supports_flag(help_txt, "--topn"):
-                c += ["--topn", str(topn)]
-        elif perito and _supports_flag(help_txt, "--perito"):
-            c += ["--perito", perito]
-        if _supports_flag(help_txt, "--export-png"):
-            c += ["--export-png"]
-        if add_comments:
-            if _supports_flag(help_txt, "--export-comment"):
-                c += ["--export-comment"]
-            elif _supports_flag(help_txt, "--export-md"):
-                c += ["--export-md"]
-            if _supports_flag(help_txt, "--add-comments"):
-                c += ["--add-comments"]
-            if _supports_flag(help_txt, "--call-api"):
-                c += ["--call-api"]
-        cmds.append(c)
-    return cmds
+        out.append(ln)
+        i += 1
+    return "\n".join(out)
 
-def _detect_r_out_flag(script_path: str) -> Optional[str]:
+def _normalize_org_table_block(block_lines):
+    """Normaliza um bloco de tabela Org (pipes, espaços e bordas)."""
+    fixed = []
+    for ln in block_lines:
+        raw = ln.strip()
+        if raw == "|" or raw == "":
+            continue
+        raw = re.sub(r"\s*\|\s*", " | ", raw)
+        raw = raw.strip()
+        if not raw.startswith("|"):
+            raw = "| " + raw
+        if not raw.endswith("|"):
+            raw = raw + " |"
+        fixed.append(raw)
+    return fixed
+
+def _normalize_all_tables(text: str) -> str:
+    """Varre o texto Org e normaliza todas as tabelas."""
+    lines = text.splitlines()
+    out = []
+    i = 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("|"):
+            block = []
+            while i < len(lines) and lines[i].lstrip().startswith("|"):
+                block.append(lines[i])
+                i += 1
+            fixed = _normalize_org_table_block(block)
+            if fixed:
+                out.extend(fixed)
+            if i < len(lines) and lines[i].strip() != "":
+                out.append("")
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+def _protect_org_text_for_pandoc(text: str) -> str:
+    """Protege e normaliza um texto Org para reduzir erros do Pandoc."""
+    text = _ensure_blank_lines_around_tables(text)
+    text = _normalize_all_tables(text)
+    text = _wrap_ascii_blocks(text)
+    return text
+
+def _protect_tables_in_quote(txt: str) -> str:
+    """Se encontra tabelas dentro de quotes, envolve com example para não quebrar render."""
+    s = re.sub(r'(\S)\n\|', r'\1\n\n|', txt)
+    out_lines = []
+    in_tbl = False
+    for ln in s.splitlines():
+        if ln.lstrip().startswith('|'):
+            if not in_tbl:
+                out_lines.append('#+begin_example')
+                in_tbl = True
+            out_lines.append(ln)
+        else:
+            if in_tbl:
+                out_lines.append('#+end_example')
+                in_tbl = False
+            out_lines.append(ln)
+    if in_tbl:
+        out_lines.append('#+end_example')
+    return "\n".join(out_lines)
+
+def _extract_comment_from_org(org_text: str) -> str:
+    """
+    Extrai comentário de um .org de gráfico:
+    1) bloco QUOTE; 2) seção 'Comentário'; 3) 1º parágrafo após a imagem.
+    """
+    def _strip_drawers(s: str) -> str:
+        return re.sub(r'(?ms)^\s*:PROPERTIES:\s*.*?^\s*:END:\s*$', '', s, flags=re.MULTILINE)
+
+    def _strip_noise_lines(s: str) -> str:
+        out = []
+        for ln in s.splitlines():
+            sl = ln.strip()
+            if not sl:
+                out.append(ln); continue
+            if sl.startswith("#+"):   continue
+            if sl.startswith("|"):    continue
+            if sl.startswith("[[file:"): continue
+            out.append(ln)
+        return "\n".join(out)
+
+    txt = org_text
+    m = re.search(r'(?mis)^\s*#\+BEGIN_QUOTE\s*(.*?)^\s*#\+END_QUOTE', txt)
+    if m:
+        body = _strip_noise_lines(_strip_drawers(m.group(1))).strip()
+        if body:
+            return body
+    m = re.search(r'(?mis)^\*+\s+coment[aá]ri?o[^\n]*\n(.*?)(?=^\*+\s|\Z)', txt)
+    if m:
+        body = _strip_noise_lines(_strip_drawers(m.group(1))).strip()
+        if body:
+            return body
+    after_img = re.split(r'(?mi)^\s*\[\[file:[^\]]+\]\]\s*$', txt, maxsplit=1)
+    if len(after_img) == 2:
+        tail = _strip_noise_lines(_strip_drawers(after_img[1]))
+        para = []
+        started = False
+        for ln in tail.splitlines():
+            s = ln.strip()
+            if not s:
+                if started: break
+                else: continue
+            if s.startswith("*") or s.startswith("#+") or s.startswith("|"):
+                if started: break
+                else: continue
+            para.append(ln)
+            started = True
+        res = " ".join(" ".join(para).split())
+        if res:
+            return res
+    return ""
+
+
+def _rel_prefix(from_dir: str, to_dir: str) -> str:
+    """Prefixo relativo (terminando com '/') de from_dir → to_dir para usar dentro de [[file:...]]."""
+    p = os.path.relpath(to_dir, start=from_dir).replace("\\", "/")
+    return (p + "/") if not p.endswith("/") else p
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Ordenação/Ranking de imagens para montagem do relatório
+# ────────────────────────────────────────────────────────────────────────────────
+def _mode_rank(name: str) -> int:
+    name = name.lower()
+    if "perito-share" in name: return 0
+    if "task-share" in name:   return 1
+    if "time-share" in name:   return 2
+    return 9
+
+def _script_rank(name: str) -> int:
+    n = name.lower()
+    order = [
+        ("nc",           ["nc_rate", "taxa_nc", "nc-rate", "comparenc", "nc_", "rate_nc", "compare_nc_rate", "nao_conformidade"]),
+        ("motivos",      ["motivos_perito_vs_brasil", "motivos_top10_vs_brasil", "motivos_", "motivo_"]),
+        ("produtiv",     ["produtividade_", "prod_", "productivity_"]),
+        ("le15s",        ["le15", "le15s", "compare_15s", "15s"]),
+        ("overlap",      ["sobreposicao_", "overlap", "sobrel"]),
+        ("composto",     ["indicadores_composto", "composto", "composite"]),
+    ]
+    for idx, (_, keys) in enumerate(order):
+        if any(k in n for k in keys):
+            return idx
+    return 99
+
+def _png_rank_main(fname: str) -> tuple:
+    base = os.path.basename(fname).lower()
+    return (_script_rank(base), _mode_rank(base), base)
+
+def _rcheck_perito_rank(fname: str) -> int:
+    n = os.path.basename(fname).lower()
+    order = [
+        "rcheck_nc_rate_", "rcheck_le15", "rcheck_productivity",
+        "rcheck_overlap", "rcheck_motivos_chisq", "rcheck_composite",
+        "rcheck_weighted_props_nc", "rcheck_weighted_props_le", "rcheck_weighted_props_",
+    ]
+    for i, key in enumerate(order):
+        if key in n:
+            return i
+    return 99
+
+def _rcheck_group_rank(fname: str) -> int:
+    n = os.path.basename(fname).lower()
+    order = [
+        "rcheck_top10_nc_rate", "rcheck_top10_le15", "rcheck_top10_productivity",
+        "rcheck_top10_overlap", "rcheck_top10_motivos_chisq", "rcheck_top10_composite"
+    ]
+    for i, key in enumerate(order):
+        if key in n:
+            return i
+    if "rcheck_top10_composite_robustness" in n:
+        return 5
+    return 99
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Pré-flight e planners de execução (R e Python)
+# ────────────────────────────────────────────────────────────────────────────────
+def _preflight_r(r_bin: str):
+    """Valida binário do R, mostra versão e encerra se não encontrado."""
+    r_path = shutil.which(r_bin)
+    if not r_path:
+        print(f"❌ Não encontrei o binário '{r_bin}' no PATH. Instale o R e garanta que Rscript esteja disponível.")
+        print("   Ex.: sudo apt install r-base-core  (ou ajuste --r-bin com o caminho completo)")
+        sys.exit(2)
     try:
-        out = subprocess.run(["Rscript", script_path, "--help"], check=False, capture_output=True, text=True)
-        text = (out.stdout or "") + "\n" + (out.stderr or "")
-        if "--out" in text:
+        out = subprocess.run([r_bin, "--version"], capture_output=True, text=True)
+        ver = (out.stdout or out.stderr or "").splitlines()[0].strip()
+        print(f"[R] Ok: {ver} ({r_path})")
+    except Exception as e:
+        print(f"❌ Falha ao executar '{r_bin} --version': {e}")
+        sys.exit(2)
+
+def _is_r_cmd(cmd: list) -> bool:
+    """Retorna True se o comando parece ser R/Rscript."""
+    if not cmd:
+        return False
+    exe = os.path.basename(str(cmd[0])).lower()
+    return ("rscript" in exe) or exe == "r"
+
+def _detect_r_out_flag(r_file_path: str):
+    """Tenta inferir a flag de saída do script R (--out-dir ou --out)."""
+    try:
+        with open(r_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            txt = f.read().lower()
+        if "--out-dir" in txt or "out-dir" in txt or "out_dir" in txt:
+            return "--out-dir"
+        if "--out" in txt or "make_option(c(\"--out\"" in txt:
             return "--out"
     except Exception:
         pass
     return None
 
-def _build_r_cmds(top10: bool, perito: Optional[str], start: str, end: str, min_analises: int) -> List[List[str]]:
+def _r_deps_bootstrap_cmd(r_bin: str):
+    """Gera script R para checar/instalar dependências básicas e retorna o comando para rodá-lo."""
+    os.makedirs(RCHECK_DIR, exist_ok=True)
+    deps_path = os.path.join(RCHECK_DIR, "_ensure_deps.R")
+    if not os.path.exists(deps_path):
+        r_code = r'''# auto-gerado pelo make_report.py ─ não editar manualmente
+options(warn = 1)
+repos <- getOption("repos"); repos["CRAN"] <- "https://cloud.r-project.org"; options(repos = repos)
+user_lib <- Sys.getenv("R_LIBS_USER")
+if (nzchar(user_lib)) { dir.create(user_lib, showWarnings = FALSE, recursive = TRUE); .libPaths(unique(c(user_lib, .libPaths()))) }
+message("[deps] .libPaths(): ", paste(.libPaths(), collapse = " | "))
+need <- c("dplyr","tidyr","readr","stringr","purrr","forcats","lubridate","ggplot2","scales","broom","DBI","RSQLite","ggtext","gridtext","ragg","textshaping","cli","glue","curl","httr")
+have <- rownames(installed.packages()); to_install <- setdiff(need, have)
+ncpus <- 1L; try({ ncpus <- max(1L, parallel::detectCores(logical = TRUE) - 1L) }, silent = TRUE)
+if (length(to_install)) { message("[deps] Instalando: ", paste(to_install, collapse = ", ")); 
+  tryCatch({ install.packages(to_install, dependencies = TRUE, Ncpus = ncpus, lib = if (nzchar(user_lib)) user_lib else .libPaths()[1]) },
+           error = function(e) { message("[deps][ERRO] ", conditionMessage(e)); quit(status = 1L) }) 
+} else { message("[deps] Todos os pacotes já presentes.") }
+ok <- TRUE; for (pkg in c("dplyr","ggplot2","DBI","RSQLite")) ok <- ok && requireNamespace(pkg, quietly = TRUE)
+ok <- ok && requireNamespace("ggtext", quietly = TRUE) && requireNamespace("ragg", quietly = TRUE)
+if (!ok) message("[deps][AVISO] Verifique dependências de sistema (ex.: libcurl, harfbuzz, fribidi, freetype).") else message("[deps] OK")
+message(capture.output(sessionInfo()), sep = "\n")
+'''
+        with open(deps_path, "w", encoding="utf-8") as f:
+            f.write(r_code)
+    return [r_bin, deps_path]
+
+def build_commands_for_script(script_file: str, context: dict) -> list:
+    """Monta comandos de execução para um script Python de gráfico, dado o contexto (perito/top10)."""
     cmds = []
-    scripts = RCHECK_GROUP_SCRIPTS if top10 else RCHECK_SCRIPTS
-    for fname, meta in scripts:
-        fpath = os.path.join(RCHECK_DIR, fname)
-        if not os.path.exists(fpath):
-            print(f"[AVISO] R check ausente: {fpath}")
+    name = os.path.basename(script_file)
+    help_info = introspect_script(script_file)
+    flags = set(help_info.get("flags", set())) or set(ASSUME_FLAGS.get(name, []))
+    modes = detect_modes(script_file, help_info)
+    base = ["--start", context["start"], "--end", context["end"]]
+
+    if context["kind"] == "perito":
+        perito = context["perito"]
+        if "--perito" in flags:
+            base += ["--perito", perito]
+        elif "--nome" in flags:
+            base += ["--nome", perito]
+        else:
+            base += ["--perito", perito]
+    else:
+        if ("--top10" in flags) or (name in ASSUME_FLAGS and "--top10" in ASSUME_FLAGS[name]):
+            base += ["--top10"]
+            if "--min-analises" in flags:
+                base += ["--min-analises", str(context["min_analises"])]
+        else:
+            print(f"[INFO] {name} não suporta --top10; pulando no grupo.")
+            return []
+
+    if "--export-org" in flags: base += ["--export-org"]
+    if context.get("add_comments"):
+        if "--export-comment-org" in flags: base += ["--export-comment-org"]
+        elif "--export-comment" in flags:   base += ["--export-comment"]
+        if "--call-api" in flags:           base += ["--call-api"]
+    if "--export-png" in flags: base += ["--export-png"]
+    if "--export-md" in flags:  base += ["--export-md"]
+
+    if name == "compare_productivity.py" and "--threshold" in flags:
+        base += ["--threshold", PRODUCTIVITY_THRESHOLD]
+    if name == "compare_fifteen_seconds.py":
+        if "--threshold" in flags: base += ["--threshold", FIFTEEN_THRESHOLD]
+        if "--cut-n" in flags:     base += ["--cut-n", FIFTEEN_CUT_N]
+
+    def _apply_extra(cmd_list):
+        extra = EXTRA_ARGS.get(name, [])
+        i = 0
+        while i < len(extra):
+            tok = extra[i]
+            if isinstance(tok, str) and tok.startswith("--") and tok in flags:
+                cmd_list.append(tok)
+                if i + 1 < len(extra) and (not isinstance(extra[i+1], str) or not extra[i+1].startswith("--")):
+                    cmd_list.append(str(extra[i+1]))
+                    i += 1
+            i += 1
+        return cmd_list
+
+    if "--mode" in flags and modes:
+        for m in modes:
+            cmd = [sys.executable, script_file] + base + ["--mode", m]
+            cmds.append(_apply_extra(cmd))
+    else:
+        cmd = [sys.executable, script_file] + base
+        cmds.append(_apply_extra(cmd))
+    return cmds
+
+def build_r_commands_for_perito(perito: str, start: str, end: str, r_bin: str) -> list:
+    """Planeja a fila de R checks individuais para o perito."""
+    cmds = []
+    for fname, meta in RCHECK_SCRIPTS:
+        try:
+            fpath = rscript_path(fname)
+        except FileNotFoundError:
+            print(f"[AVISO] R check ausente: {fname} (crie em {RCHECK_DIR})")
             continue
-        c = ["Rscript", fpath, "--db", DB_PATH, "--start", start, "--end", end, "--min-analises", str(min_analises)]
-        if meta.get("need_perito") and perito: c += ["--perito", perito]
-        if meta.get("pass_top10", False) and top10: c += ["--top10"]
         out_flag = _detect_r_out_flag(fpath)
-        if out_flag: c += [out_flag, EXPORT_DIR]
-        for k, v in (meta.get("defaults") or {}).items(): c += [k, str(v)]
-        cmds.append(c)
+        cmd = [r_bin, fpath, "--db", DB_PATH, "--start", start, "--end", end]
+        if out_flag: cmd += [out_flag, EXPORT_DIR]
+        if meta.get("need_perito", False): cmd += ["--perito", perito]
+        for k, v in (meta.get("defaults") or {}).items():
+            cmd += [k, str(v)]
+        cmds.append(cmd)
+    if cmds:
+        print(f"[INFO] R checks individuais enfileirados para '{perito}': {len(cmds)}")
+    else:
+        print("[INFO] Nenhum R check individual enfileirado.")
+    return cmds
+
+def build_r_commands_for_top10(start: str, end: str, r_bin: str, min_analises: int) -> list:
+    """Planeja a fila de R checks para o grupo Top10."""
+    cmds = []
+    for fname, meta in RCHECK_GROUP_SCRIPTS:
+        try:
+            fpath = rscript_path(fname)
+        except FileNotFoundError:
+            print(f"[AVISO] R check de grupo ausente: {fname} (crie em {RCHECK_DIR})")
+            continue
+        out_flag = _detect_r_out_flag(fpath)
+        cmd = [r_bin, fpath, "--db", DB_PATH, "--start", start, "--end", end, "--min-analises", str(min_analises)]
+        if meta.get("pass_top10"): cmd += ["--top10"]
+        if out_flag: cmd += [out_flag, EXPORT_DIR]
+        for k, v in (meta.get("defaults") or {}).items():
+            if k == "--min-analises":
+                v = str(min_analises)
+            cmd += [k, str(v)]
+        cmds.append(cmd)
+    if cmds:
+        print(f"[INFO] R checks de grupo (Top10) enfileirados: {len(cmds)}")
+    else:
+        print("[INFO] Nenhum R check de grupo enfileirado.")
     return cmds
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Coleta de assets (PNG/MD) com validação de imagem
+# Coleta de saídas R (fallback)
 # ────────────────────────────────────────────────────────────────────────────────
-def _is_valid_png(path: str) -> bool:
+def collect_r_outputs_to_export():
+    """Copia rcheck*.{png,md,org} de r_checks/ para exports/ (caso gerados lá)."""
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    patterns = ["rcheck*.png", "rcheck*.md", "rcheck*.org", "*top10*.png", "*top10*.md", "*top10*.org"]
+    moved = 0
+    for pat in patterns:
+        for src in glob(os.path.join(RCHECK_DIR, pat)):
+            dst = os.path.join(EXPORT_DIR, os.path.basename(src))
+            try:
+                shutil.copy2(src, dst)
+                moved += 1
+            except Exception:
+                pass
+    if moved:
+        print(f"[INFO] R-outputs coletados de r_checks/ → exports/: {moved} arquivo(s).")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Limpeza, cópia e organização de artefatos (.png, .org, .md)
+# ────────────────────────────────────────────────────────────────────────────────
+def _cleanup_exports_for_perito(safe_perito: str):
+    """Remove do exports/ os artefatos pendentes do perito (para evitar mistura entre execuções)."""
+    for f in glob(os.path.join(EXPORT_DIR, f"*_{safe_perito}.*")):
+        try: os.remove(f)
+        except Exception: pass
+    for f in glob(os.path.join(EXPORT_DIR, f"*{safe_perito}.*")):
+        if "top10" in os.path.basename(f).lower():
+            continue
+        try: os.remove(f)
+        except Exception: pass
+
+def _cleanup_exports_top10():
+    """Remove do exports/ os artefatos pendentes de top10."""
+    for f in glob(os.path.join(EXPORT_DIR, "*_top10*.*")):
+        try: os.remove(f)
+        except Exception: pass
+    for f in glob(os.path.join(EXPORT_DIR, "*top10*.*")):
+        try: os.remove(f)
+        except Exception: pass
+
+def _move_md_generic_to(markdown_dir: str, pattern: str = "*.md"):
+    """Move quaisquer .md remanescentes de exports/ para a pasta markdown/."""
+    os.makedirs(markdown_dir, exist_ok=True)
+    for src in glob(os.path.join(EXPORT_DIR, pattern)):
+        base = os.path.basename(src)
+        dst  = os.path.join(markdown_dir, base)
+        try:
+            shutil.copy2(src, dst)
+            os.remove(src)
+        except Exception:
+            pass
+
+def copiar_artefatos_perito(
+    perito: str,
+    imgs_dir: str,
+    comments_dir: str,
+    orgs_dir: str,
+    markdown_dir: str,
+    imgs_rel_prefix: str | None = None,
+):
+    """
+    Copia artefatos do perito de exports/ para:
+      - imgs/<escopo>       (PNGs)
+      - orgs/<escopo>       (.org auxiliares com links normalizados)
+      - orgs/<escopo>/comments (comentários .org; .md → .org + preserva .md)
+      - markdown/<escopo>   (todos .md originais)
+    """
+    os.makedirs(imgs_dir, exist_ok=True)
+    os.makedirs(orgs_dir, exist_ok=True)
+    os.makedirs(comments_dir, exist_ok=True)
+    os.makedirs(markdown_dir, exist_ok=True)
+
+    if imgs_rel_prefix is None:
+        # de orgs/<escopo> para imgs/<escopo>
+        imgs_rel_prefix = os.path.relpath(imgs_dir, start=orgs_dir).replace("\\", "/") + "/"
+
+    safe = _safe(perito)
+
+    # PNGs (exclui top10)
+    for pat in (f"*_{safe}.png", f"*{safe}.png"):
+        for src in glob(os.path.join(EXPORT_DIR, pat)):
+            base = os.path.basename(src)
+            if "top10" in base.lower():
+                continue
+            shutil.copy2(src, os.path.join(imgs_dir, base))
+            try: os.remove(src)
+            except Exception: pass
+
+    # Comentários .org (exclui top10)
+    for pat in (f"*_{safe}_comment.org", f"*{safe}_comment.org"):
+        for src in glob(os.path.join(EXPORT_DIR, pat)):
+            base = os.path.basename(src)
+            if "top10" in base.lower():
+                continue
+            shutil.copy2(src, os.path.join(comments_dir, base))
+            try: os.remove(src)
+            except Exception: pass
+
+    # Comentários .md → converte p/ .org (para o relatório) e move .md p/ markdown/
+    for pat in (f"*_{safe}_comment.md", f"*{safe}_comment.md", f"*_{safe}.md", f"*{safe}.md"):
+        for src in glob(os.path.join(EXPORT_DIR, pat)):
+            base = os.path.basename(src)
+            if "top10" in base.lower():
+                continue
+            try:
+                with open(src, encoding="utf-8") as f:
+                    md_text = f.read()
+                org_text = markdown_para_org(md_text)
+                org_text = "\n".join(ln for ln in org_text.splitlines()
+                                     if not ln.strip().lower().startswith('#+title')).strip()
+                dst_org = os.path.join(comments_dir, os.path.splitext(base)[0] + ".org")
+                with open(dst_org, "w", encoding="utf-8") as g:
+                    g.write(org_text + "\n")
+            except Exception as e:
+                print(f"[AVISO] Falha na conversão .md→.org de {base}: {e}")
+            try:
+                shutil.copy2(src, os.path.join(markdown_dir, base))
+                os.remove(src)
+            except Exception:
+                pass
+
+    # ORGs auxiliares dos scripts (regrava links → imgs_rel_prefix)
+    for pat in (f"*_{safe}.org", f"*{safe}.org"):
+        for src in glob(os.path.join(EXPORT_DIR, pat)):
+            base = os.path.basename(src)
+            if "top10" in base.lower():
+                continue
+            with open(src, encoding="utf-8") as f:
+                content = f.read()
+            content = _rewrite_org_image_links(content, imgs_rel_prefix=imgs_rel_prefix)
+            dst = os.path.join(orgs_dir, base)
+            with open(dst, "w", encoding="utf-8") as g:
+                g.write(content)
+            try: os.remove(src)
+            except Exception: pass
+
+    # Por fim, move quaisquer .md remanescentes
+    _move_md_generic_to(markdown_dir)
+
+
+def copiar_artefatos_top10(
+    imgs_dir: str,
+    comments_dir: str,
+    orgs_dir: str,
+    markdown_dir: str,
+    imgs_rel_prefix: str | None = None,
+):
+    """
+    Copia artefatos do grupo Top 10 para o relatório, evitando duplicatas:
+      - imgs/<escopo>       (PNGs)
+      - orgs/<escopo>       (.org auxiliares com links normalizados)
+      - orgs/<escopo>/comments (comentários .org; .md → .org + preserva .md)
+      - markdown/<escopo>   (todos .md originais)
+
+    Correção A:
+      * Usa UM padrão de glob para PNGs ("*top10*.png") e faz dedupe por basename.
+      * Aplica dedupe por basename também para .org e comentários.
+    """
+    os.makedirs(imgs_dir, exist_ok=True)
+    os.makedirs(orgs_dir, exist_ok=True)
+    os.makedirs(comments_dir, exist_ok=True)
+    os.makedirs(markdown_dir, exist_ok=True)
+
+    if imgs_rel_prefix is None:
+        imgs_rel_prefix = os.path.relpath(imgs_dir, start=orgs_dir).replace("\\", "/") + "/"
+
+    def _dedup_by_basename(paths: list[str]) -> list[str]:
+        seen = set()
+        out = []
+        for p in sorted(paths):
+            bn = os.path.basename(p).lower()
+            if bn in seen:
+                continue
+            seen.add(bn)
+            out.append(p)
+        return out
+
+    # ── PNGs (UM padrão + dedupe) ──────────────────────────────────────────────
+    pngs = glob(os.path.join(EXPORT_DIR, "*top10*.png"))
+    for src in _dedup_by_basename(pngs):
+        base = os.path.basename(src)
+        dst  = os.path.join(imgs_dir, base)
+        try:
+            shutil.copy2(src, dst)
+        finally:
+            try: os.remove(src)
+            except Exception: pass
+
+    # ── Comentários .org (UM padrão + dedupe) ─────────────────────────────────
+    org_comments = glob(os.path.join(EXPORT_DIR, "*top10*_comment.org"))
+    for src in _dedup_by_basename(org_comments):
+        base = os.path.basename(src)
+        dst  = os.path.join(comments_dir, base)
+        try:
+            shutil.copy2(src, dst)
+        finally:
+            try: os.remove(src)
+            except Exception: pass
+
+    # ── Comentários .md → .org (apenas *_comment.md) + preserva .md ───────────
+    md_comments = glob(os.path.join(EXPORT_DIR, "*top10*_comment.md")) + \
+                  glob(os.path.join(EXPORT_DIR, "*_top10*_comment.md"))
+    for src in _dedup_by_basename(md_comments):
+        base = os.path.basename(src)
+        try:
+            with open(src, encoding="utf-8") as f:
+                md_text = f.read()
+            org_text = markdown_para_org(md_text)
+            # remove #+title em caso de conversão via pandoc
+            org_text = "\n".join(
+                ln for ln in org_text.splitlines()
+                if not ln.strip().lower().startswith('#+title')
+            ).strip()
+            dst_org = os.path.join(comments_dir, os.path.splitext(base)[0] + ".org")
+            with open(dst_org, "w", encoding="utf-8") as g:
+                g.write(org_text + "\n")
+        except Exception as e:
+            print(f"[AVISO] Falha na conversão .md→.org de {base}: {e}")
+        # preserva o .md em markdown/
+        try:
+            shutil.copy2(src, os.path.join(markdown_dir, base))
+            os.remove(src)
+        except Exception:
+            pass
+
+    # ── ORGs auxiliares de gráficos (UM padrão + dedupe + rewrite de links) ───
+    aux_orgs = glob(os.path.join(EXPORT_DIR, "*top10*.org"))
+    for src in _dedup_by_basename(aux_orgs):
+        # ignora os *_comment.org que já foram movidos
+        if src.lower().endswith("_comment.org"):
+            continue
+        base = os.path.basename(src)
+        with open(src, encoding="utf-8") as f:
+            content = f.read()
+        content = _rewrite_org_image_links(content, imgs_rel_prefix=imgs_rel_prefix)
+        dst = os.path.join(orgs_dir, base)
+        with open(dst, "w", encoding="utf-8") as g:
+            g.write(content)
+        try: os.remove(src)
+        except Exception: pass
+
+    # ── Move quaisquer .md restantes para markdown/ ────────────────────────────
+    _move_md_generic_to(markdown_dir)
+
+
+def copiar_artefatos_weekday2weekend(
+    imgs_dir: str,
+    comments_dir: str,
+    orgs_dir: str | None = None,
+    imgs_rel_prefix: str | None = None,
+):
+    """
+    Move o panorama weekday→weekend:
+      - PNG: rcheck_weekday_to_weekend_by_cr.png → imgs/<escopo>/
+      - .org: rcheck_weekday_to_weekend_table.org, rcheck_weekday_to_weekend_protocols.org → orgs/<escopo>/
+              (com links reescritos para apontar a {imgs_rel_prefix})
+      - .org de comentário → orgs/<escopo>/comments/
+    """
+    if orgs_dir is None:
+        orgs_dir = os.path.dirname(os.path.normpath(comments_dir))
+    os.makedirs(imgs_dir, exist_ok=True)
+    os.makedirs(comments_dir, exist_ok=True)
+    os.makedirs(orgs_dir, exist_ok=True)
+
+    if imgs_rel_prefix is None:
+        imgs_rel_prefix = os.path.relpath(imgs_dir, start=orgs_dir).replace("\\", "/") + "/"
+
+    # PNG principal
+    for fname in ("rcheck_weekday_to_weekend_by_cr.png",):
+        src = os.path.join(EXPORT_DIR, fname)
+        dst = os.path.join(imgs_dir, fname)
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            try: os.remove(src)
+            except Exception: pass
+
+    # ORGs (tabela e protocolos) com reescrita de links
+    for fname in ("rcheck_weekday_to_weekend_table.org", "rcheck_weekday_to_weekend_protocols.org"):
+        src = os.path.join(EXPORT_DIR, fname)
+        dst = os.path.join(orgs_dir, fname)
+        if os.path.exists(src):
+            try:
+                with open(src, encoding="utf-8") as f:
+                    content = f.read()
+                content = _rewrite_org_image_links(content, imgs_rel_prefix=imgs_rel_prefix)
+                with open(dst, "w", encoding="utf-8") as g:
+                    g.write(content)
+            except Exception as e:
+                print(f"[AVISO] Falha ao normalizar {fname}: {e}. Copiando bruto.")
+                shutil.copy2(src, dst)
+            finally:
+                try: os.remove(src)
+                except Exception: pass
+
+    # Comentário .org
+    for fname in ("rcheck_weekday_to_weekend_table_comment.org",):
+        src = os.path.join(EXPORT_DIR, fname)
+        dst = os.path.join(comments_dir, fname)
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            try: os.remove(src)
+            except Exception: pass
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Estatísticas rápidas (cabeçalho)
+# ────────────────────────────────────────────────────────────────────────────────
+def get_summary_stats(perito, start, end):
+    """Retorna (total_tarefas, pct_nc, CR, DR) do perito no período."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""SELECT cr, dr FROM peritos WHERE nomePerito = ?""", (perito,))
+    row = cur.fetchone()
+    cr, dr = (row if row else ("-", "-"))
+    cur.execute("""
+        SELECT
+            COUNT(*) AS total,
+            SUM(
+                CASE
+                    WHEN CAST(IFNULL(a.conformado, 1) AS INTEGER) = 0 THEN 1
+                    WHEN TRIM(IFNULL(a.motivoNaoConformado, '')) <> ''
+                         AND CAST(IFNULL(a.motivoNaoConformado, '0') AS INTEGER) <> 0 THEN 1
+                    ELSE 0
+                END
+            ) AS nc_count
+        FROM analises a
+        JOIN peritos p ON a.siapePerito = p.siapePerito
+        WHERE p.nomePerito = ?
+          AND date(a.dataHoraIniPericia) BETWEEN ? AND ?
+    """, (perito, start, end))
+    total, nc_count = cur.fetchone() or (0, 0)
+    conn.close()
+    pct_nc = (nc_count or 0) / (total or 1) * 100.0
+    return total or 0, pct_nc, cr, dr
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Apêndices por perito
+# ────────────────────────────────────────────────────────────────────────────────
+def gerar_apendice_nc(perito, start, end):
+    """Retorna DataFrame com protocolos NC por motivo para o perito no período."""
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql("""
+        SELECT a.protocolo, pr.motivo AS motivo_text
+        FROM analises a
+        JOIN peritos p ON a.siapePerito = p.siapePerito
+        JOIN protocolos pr ON a.protocolo = pr.protocolo
+        WHERE p.nomePerito = ?
+          AND date(a.dataHoraIniPericia) BETWEEN ? AND ?
+          AND (
+                CAST(IFNULL(a.conformado, 1) AS INTEGER) = 0
+                OR (
+                    TRIM(IFNULL(a.motivoNaoConformado, '')) <> ''
+                    AND CAST(IFNULL(a.motivoNaoConformado, '0') AS INTEGER) <> 0
+                )
+              )
+        ORDER BY a.protocolo
+    """, conn, params=(perito, start, end))
+    conn.close()
+    return df
+
+def gerar_r_apendice_comments_if_possible(perito: str, imgs_dir: str, comments_dir: str, start: str, end: str):
+    """Gera comentários GPT para R checks individuais (se utils.comentarios estiver disponível)."""
+    if comentar_r_apendice is None:
+        return
+    safe = _safe(perito)
+    r_pngs = glob(os.path.join(imgs_dir, f"rcheck_*_{safe}.png"))
+    r_pngs.sort(key=lambda p: _rcheck_perito_rank(p))
+    for png in r_pngs:
+        base = os.path.basename(png)
+        stem = os.path.splitext(base)[0]
+        md_out = os.path.join(comments_dir, f"{stem}_comment.md")
+        try:
+            texto = comentar_r_apendice(
+                titulo="Apêndice estatístico (R) — Perito",
+                imagem_rel=f"imgs/{base}",
+                perito=perito,
+                start=start,
+                end=end
+            )
+            with open(md_out, "w", encoding="utf-8") as f:
+                f.write(texto)
+        except Exception as e:
+            print(f"[AVISO] Falha ao gerar comentário GPT do R check {base}: {e}")
+
+def gerar_r_apendice_group_comments_if_possible(imgs_dir: str, comments_dir: str, start: str, end: str):
+    """Gera comentários GPT para R checks do grupo Top10 (se disponível)."""
+    if comentar_r_apendice is None:
+        return
+    r_pngs = glob(os.path.join(imgs_dir, "rcheck_top10_*.png"))
+    r_pngs.sort(key=lambda p: _rcheck_group_rank(p))
+    for png in r_pngs:
+        base = os.path.basename(png)
+        stem = os.path.splitext(base)[0]
+        md_out = os.path.join(comments_dir, f"{stem}_comment.md")
+        try:
+            texto = comentar_r_apendice(
+                titulo="Apêndice estatístico (R) — Top 10 (grupo)",
+                imagem_rel=f"imgs/{base}",
+                perito=None,
+                start=start,
+                end=end
+            )
+            with open(md_out, "w", encoding="utf-8") as f:
+                f.write(texto)
+        except Exception as e:
+            print(f"[AVISO] Falha ao gerar comentário GPT do R check de grupo {base}: {e}")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Montagem dos .org (perito e grupo)
+# ────────────────────────────────────────────────────────────────────────────────
+def gerar_org_perito(perito, start, end, add_comments, imgs_dir, comments_dir, output_dir, orgs_dir=None):
+    """
+    output_dir deve ser orgs/<escopo>. Os links de imagem serão relativos a ele.
+    """
+    if orgs_dir is None:
+        orgs_dir = output_dir
+    imgs_rel = os.path.relpath(imgs_dir, start=orgs_dir).replace("\\", "/")
+
+    safe = _safe(perito)
+    org_path = os.path.join(orgs_dir, f"{safe}.org")
+
+    lines = [f"** {perito}"]
+    total, pct_nc, cr, dr = get_summary_stats(perito, start, end)
+    lines += [f"- Tarefas: {total}", f"- % NC: {pct_nc:.1f}", f"- CR: {cr} | DR: {dr}", ""]
+
+    # Gráficos principais
+    all_pngs = glob(os.path.join(imgs_dir, "*.png"))
+    main_pngs = [p for p in all_pngs if not os.path.basename(p).lower().startswith("rcheck_")]
+    main_pngs.sort(key=_png_rank_main)
+
+    for png in main_pngs:
+        base = os.path.basename(png)
+        lines += [
+            "#+ATTR_LATEX: :placement [H] :width \\linewidth",
+            f"#+CAPTION: {_nice_caption(base)}",
+            f"[[file:{imgs_rel}/{base}]]",
+        ]
+        if add_comments:
+            stem = os.path.splitext(base)[0]
+            quote_lines = _inject_comment_for_stem(stem, comments_dir, orgs_dir=orgs_dir, imgs_dir=imgs_dir)
+            lines += quote_lines
+        lines.append("\n#+LATEX: \\newpage\n")
+
+    # Protocolos transferidos
+    _append_protocol_transfers_perito_block_if_any(
+        lines, perito, start, end, relatorio_dir=orgs_dir, heading_level="***"
+    )
+
+    # Apêndice: Protocolos NC por motivo
+    apdf = gerar_apendice_nc(perito, start, end)
+    if not apdf.empty:
+        lines.append(f"*** Apêndice: Protocolos Não-Conformados por Motivo")
+        grouped = apdf.groupby('motivo_text')['protocolo'].apply(lambda seq: ', '.join(map(str, seq))).reset_index()
+        for _, grp in grouped.iterrows():
+            lines.append(f"- *{grp['motivo_text']}*: {grp['protocolo']}")
+        lines.append("")
+
+    # Apêndice: R checks
+    r_pngs = glob(os.path.join(imgs_dir, f"rcheck_*_{safe}.png"))
+    r_pngs.sort(key=lambda p: _rcheck_perito_rank(p))
+    if r_pngs:
+        lines.append(f"*** Apêndice estatístico (R) — {perito}\n")
+        for png in r_pngs:
+            base = os.path.basename(png)
+            lines += [
+                "#+ATTR_LATEX: :placement [H] :width \\linewidth",
+                f"#+CAPTION: {_nice_caption(base)}",
+                f"[[file:{imgs_rel}/{base}]]",
+            ]
+            if add_comments:
+                stem = os.path.splitext(base)[0]
+                quote_lines = _inject_comment_for_stem(stem, comments_dir, orgs_dir=orgs_dir, imgs_dir=imgs_dir)
+                lines += quote_lines
+            lines.append("\n#+LATEX: \\newpage\n")
+
+    with open(org_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"✅ Org individual salvo em: {org_path}")
+    return org_path
+
+
+def gerar_org_top10_grupo(start, end, output_dir, imgs_dir, comments_dir, orgs_dir=None):
+    """
+    Gera o .org de grupo do Top 10, evitando duplicatas de figuras.
+
+    Correção B:
+      * Usa UM único glob para PNGs ("*top10*.png").
+      * Dedupe por basename antes de separar main × rcheck.
+    """
+    if orgs_dir is None:
+        orgs_dir = output_dir
+    imgs_rel = os.path.relpath(imgs_dir, start=orgs_dir).replace("\\", "/")
+
+    org_path = os.path.join(orgs_dir, "top10_grupo.org")
+    lines = [f"** Top 10 — Gráficos do Grupo ({start} a {end})\n"]
+
+    # UM glob só + dedupe por basename
+    all_pngs = glob(os.path.join(imgs_dir, "*top10*.png"))
+
+    def _dedup_keep_first(paths: list[str]) -> list[str]:
+        seen = set()
+        out = []
+        # ordena com a mesma função de rank usada no restante do pipeline
+        for p in sorted(paths, key=_png_rank_main):
+            bn = os.path.basename(p).lower()
+            if bn in seen:
+                continue
+            seen.add(bn)
+            out.append(p)
+        return out
+
+    all_pngs = _dedup_keep_first(all_pngs)
+
+    main_pngs = [p for p in all_pngs if "rcheck_" not in os.path.basename(p).lower()]
+    r_pngs    = [p for p in all_pngs if "rcheck_" in  os.path.basename(p).lower()]
+
+    # r_pngs em ordem dos R checks
+    r_pngs.sort(key=lambda p: _rcheck_group_rank(p))
+
+    for png in main_pngs + r_pngs:
+        base = os.path.basename(png)
+        lines += [
+            "#+ATTR_LATEX: :placement [H] :width \\linewidth",
+            f"#+CAPTION: {_nice_caption(base)}",
+            f"[[file:{imgs_rel}/{base}]]",
+        ]
+        stem = os.path.splitext(base)[0]
+        quote_lines = _inject_comment_for_stem(stem, comments_dir, orgs_dir=orgs_dir)
+        lines += quote_lines
+        lines.append("\n#+LATEX: \\newpage\n")
+
+    with open(org_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"✅ Org do grupo Top 10 salvo em: {org_path}")
+    return org_path
+
+
+def gerar_org_individual_consolidado(perito, start, end, relatorio_dir):
+    """Envolve o {perito}.org em um container 'Relatório individual — ...'."""
+    safe = _safe(perito)
+    perito_org = os.path.join(relatorio_dir, f"{safe}.org")
+    final_org  = os.path.join(relatorio_dir, f"relatorio_{safe}_{start}_a_{end}.org")
+    if not os.path.exists(perito_org):
+        raise FileNotFoundError(f"Org individual não encontrado: {perito_org}")
+    with open(perito_org, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+    content = _protect_org_text_for_pandoc(content)
+    lines = [f"* Relatório individual — {perito} ({start} a {end})", "", content, ""]
+    with open(final_org, "w", encoding="utf-8") as g:
+        g.write("\n".join(lines))
+    print(f"✅ Org consolidado (individual) salvo em: {final_org}")
+    return final_org
+
+
+def gerar_org_individual_consolidado_com_panorama(perito, start, end, relatorio_dir):
+    """(Opcional) Insere panorama global UMA VEZ antes da seção do perito."""
+    safe = _safe(perito)
+    perito_org = os.path.join(relatorio_dir, f"{safe}.org")
+    final_org  = os.path.join(relatorio_dir, f"relatorio_{safe}_{start}_a_{end}.org")
+    if not os.path.exists(perito_org):
+        raise FileNotFoundError(f"Org individual não encontrado: {perito_org}")
+    with open(perito_org, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+    content = _protect_org_text_for_pandoc(content)
+
+    # Caminhos locais ao relatório
+    imgs_dir     = os.path.join(relatorio_dir, "imgs")
+    comments_dir = os.path.join(relatorio_dir, "comments")
+
+    lines = []
+    _append_weekday2weekend_panorama_block(
+        lines,
+        imgs_dir=imgs_dir,
+        comments_dir=comments_dir,
+        orgs_dir=relatorio_dir,   # <<< ajuste
+        start=start,
+        end=end,
+        heading_level="**",
+    )
+    lines.extend([content, ""])
+    with open(final_org, "w", encoding="utf-8") as g:
+        g.write("\n".join(lines))
+    print(f"✅ Org consolidado (individual) salvo em: {final_org}")
+    return final_org
+
+
+def gerar_org_individual_consolidado_com_panorama_depois(perito: str, start: str, end: str, relatorio_dir: str, perito_org_path: str) -> str:
+    """Gera .org individual e coloca o panorama weekday→weekend AO FINAL (se existir)."""
+    imgs_dir     = os.path.join(relatorio_dir, "imgs")
+    comments_dir = os.path.join(relatorio_dir, "comments")
+    safe_perito  = _safe(perito)
+    org_final    = os.path.join(relatorio_dir, f"relatorio_{safe_perito}_{start}_a_{end}.org")
+
+    lines = [f"* Relatório individual — {perito} ({start} a {end})", ""]
+    if perito_org_path and os.path.exists(perito_org_path):
+        with open(perito_org_path, encoding="utf-8") as f:
+            content = f.read().strip()
+        if content:
+            lines.append(content)
+            lines.append("#+LATEX: \\newpage\n")
+    else:
+        print(f"[AVISO] Org do perito não encontrado: {perito_org_path}")
+
+    _append_weekday2weekend_panorama_block(
+        lines,
+        imgs_dir=imgs_dir,
+        comments_dir=comments_dir,
+        orgs_dir=relatorio_dir,   # <<< ajuste
+        start=start,
+        end=end,
+        heading_level="**",
+    )
+
+    with open(org_final, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines).strip() + "\n")
+    print(f"✅ Org consolidado (individual) salvo em: {org_final}")
+    return org_final
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Seleção Top 10 & Coorte Extra (funções auxiliares usadas no main)
+# ────────────────────────────────────────────────────────────────────────────────
+
+def pegar_10_piores_peritos(start: str, end: str, min_analises: int = 50) -> pd.DataFrame:
+    """
+    Retorna os 10 piores peritos no período (start..end) de acordo com 'scoreFinal',
+    considerando apenas peritos com pelo menos 'min_analises' tarefas.
+
+    Tabelas esperadas:
+      - indicadores (coluna: perito = siapePerito, scoreFinal)
+      - peritos     (colunas: siapePerito, nomePerito)
+      - analises    (colunas: siapePerito, protocolo, dataHoraIniPericia)
+
+    Obs.: 'scoreFinal' maior = pior (ordena DESC).
+    """
+    conn = sqlite3.connect(DB_PATH)
     try:
-        if Path(path).stat().st_size < 100:
-            return False
-        from io import BytesIO
-        bio = BytesIO(Path(path).read_bytes())
-        img = Image.open(bio)
-        img.load()
-        return True
-    except Exception:
+        query = """
+        SELECT
+            p.nomePerito,
+            i.scoreFinal,
+            COUNT(a.protocolo) AS total_analises
+        FROM indicadores i
+        JOIN peritos     p ON i.perito      = p.siapePerito
+        JOIN analises    a ON a.siapePerito = i.perito
+        WHERE date(a.dataHoraIniPericia) BETWEEN ? AND ?
+        GROUP BY p.nomePerito, i.scoreFinal
+        HAVING total_analises >= ?
+        ORDER BY i.scoreFinal DESC
+        LIMIT 10
+        """
+        df = pd.read_sql(query, conn, params=(start, end, min_analises))
+        return df
+    finally:
+        conn.close()
+
+
+def pegar_peritos_nc_altissima(start: str, end: str,
+                               nc_threshold: float = 90.0,
+                               min_tasks: int = 50) -> pd.DataFrame:
+    """
+    Retorna peritos com % de não conformidade >= nc_threshold e total de tarefas >= min_tasks
+    no período (start..end). A %NC é calculada por perito sobre suas próprias tarefas.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        query = """
+            SELECT
+                p.nomePerito,
+                COUNT(*) AS total,
+                SUM(
+                    CASE
+                        WHEN CAST(IFNULL(a.conformado, 1) AS INTEGER) = 0 THEN 1
+                        WHEN TRIM(IFNULL(a.motivoNaoConformado, '')) <> ''
+                             AND CAST(IFNULL(a.motivoNaoConformado, '0') AS INTEGER) <> 0 THEN 1
+                        ELSE 0
+                    END
+                ) AS nc_count,
+                (SUM(
+                    CASE
+                        WHEN CAST(IFNULL(a.conformado, 1) AS INTEGER) = 0 THEN 1
+                        WHEN TRIM(IFNULL(a.motivoNaoConformado, '')) <> ''
+                             AND CAST(IFNULL(a.motivoNaoConformado, '0') AS INTEGER) <> 0 THEN 1
+                    END
+                ) * 100.0) / COUNT(*) AS pct_nc
+            FROM analises a
+            JOIN peritos p ON a.siapePerito = p.siapePerito
+            WHERE date(a.dataHoraIniPericia) BETWEEN ? AND ?
+            GROUP BY p.nomePerito
+            HAVING total >= ? AND pct_nc >= ?
+            ORDER BY pct_nc DESC, total DESC
+        """
+        df = pd.read_sql(query, conn, params=(start, end, min_tasks, nc_threshold))
+        return df
+    finally:
+        conn.close()
+
+
+def perito_tem_dados(perito: str, start: str, end: str) -> bool:
+    """
+    True se o perito possui pelo menos 1 tarefa no período.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM analises a
+            JOIN peritos p ON a.siapePerito = p.siapePerito
+            WHERE p.nomePerito = ?
+              AND date(a.dataHoraIniPericia) BETWEEN ? AND ?
+            """,
+            (perito, start, end)
+        ).fetchone()[0]
+        return count > 0
+    finally:
+        conn.close()
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Exportação para PDF e main()
+# ────────────────────────────────────────────────────────────────────────────────
+
+LATEX_HEADER_CONTENT = r"""
+%% Inserido automaticamente pelo make_report.py
+\usepackage{float}
+\usepackage{placeins}
+\floatplacement{figure}{H}
+
+% Pacotes úteis para tabelas compridas e colunas com largura fixa
+\usepackage{longtable}
+\usepackage{array}
+"""
+
+def exportar_org_para_pdf(org_path: str, pdf_dir: str, logs_dir: str, font: str = "DejaVu Sans") -> str | None:
+    """
+    Converte um .org para PDF com Pandoc + xelatex, resolvendo imagens de forma robusta:
+      - Reescreve links [[file:...]] para usarem só o basename (preserva descrição se houver).
+      - Injeta \\graphicspath com a pasta ABSOLUTA de imagens do escopo (via \\detokenize).
+      - Passa --resource-path incluindo org_dir, kpi_dir e imgs_dir_abs.
+      - Usa xelatex em modo não-interativo (nonstopmode + halt-on-error + file-line-error).
+    """
+    import os
+    import re
+    import shutil as sh
+    import subprocess
+
+    os.makedirs(pdf_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
+
+    org_path = os.path.abspath(org_path)
+    if not os.path.isfile(org_path):
+        print(f"❌ exportar_org_para_pdf: arquivo inexistente: {org_path}")
+        return None
+
+    # --- caminhos base
+    org_name = os.path.basename(org_path)
+    org_dir  = os.path.dirname(org_path)                     # .../kpi/orgs/<escopo>
+    kpi_dir  = os.path.dirname(os.path.dirname(org_dir))     # .../kpi
+    orgs_root = os.path.join(kpi_dir, "orgs")
+    escopo    = os.path.relpath(org_dir, orgs_root)          # p.ex. "top10" ou "individual/<safe>"
+    imgs_dir_abs = os.path.join(kpi_dir, "imgs", escopo)     # ABS: .../kpi/imgs/<escopo>
+
+    pdf_name    = org_name.replace(".org", ".pdf")
+    pdf_path    = os.path.join(pdf_dir, pdf_name)
+    log_path    = os.path.join(logs_dir, org_name + ".log")
+    header_path = os.path.join(logs_dir, "_header_figs.tex")
+    prot_name   = org_name.replace(".org", "._pandoc.org")
+    prot_path   = os.path.join(org_dir, prot_name)           # cópia protegida AO LADO do .org
+
+    # --- header LaTeX com graphicspath (ABS, detokenize)
+    def _detok(p: str) -> str:
+        return p.replace("\\", "/").rstrip("/") + "/"
+
+    paths = [
+        f"\\detokenize{{{_detok(imgs_dir_abs)}}}",
+        "\\detokenize{./}",
+        "\\detokenize{../}",
+        "\\detokenize{../../}",
+    ]
+    paths_str = "".join("{" + p + "}" for p in paths)
+
+    LATEX_HEADER_CONTENT = (
+        "%% Inserido automaticamente pelo make_report.py\n"
+        "\\usepackage{graphicx}\n"
+        "\\usepackage{float}\n"
+        "\\usepackage{placeins}\n"
+        "\\floatplacement{figure}{H}\n"
+        "\\usepackage{longtable}\n"
+        "\\usepackage{array}\n"
+        f"\\graphicspath{{{paths_str}}}\n"
+        "\\usepackage{morefloats}\n"
+        "\\extrafloats{500}\n"
+        "\\setcounter{topnumber}{20}\n"
+        "\\setcounter{bottomnumber}{20}\n"
+        "\\setcounter{totalnumber}{50}\n"
+        "\\renewcommand{\\topfraction}{0.95}\n"
+        "\\renewcommand{\\bottomfraction}{0.95}\n"
+        "\\renewcommand{\\textfraction}{0.05}\n"
+        "\\renewcommand{\\floatpagefraction}{0.85}\n"
+    )
+
+    try:
+        with open(header_path, "w", encoding="utf-8") as fh:
+            fh.write(LATEX_HEADER_CONTENT)
+    except Exception as e:
+        print(f"❌ Falha ao escrever header LaTeX: {e}")
+        return None
+
+    # --- lê .org e protege para o Pandoc
+    try:
+        with open(org_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        protected = _protect_org_text_for_pandoc(raw)  # usa sua função existente
+    except Exception as e:
+        print(f"❌ Falha lendo/preparando .org: {e}")
+        return None
+
+    # --- REWRITE: [[file:sub/dir/foo.png]]  →  [[file:foo.png]] (preserva descrição)
+    def _strip_dirs_in_file_links(text: str) -> str:
+        def repl(m):
+            path = (m.group(1) or "").strip()
+            desc = m.group(2)
+            if path.startswith(("http://", "https://", "/")):
+                return m.group(0)  # não mexe em http(s) ou absolutos
+            base = os.path.basename(path)
+            return f"[[file:{base}]]" if desc is None else f"[[file:{base}][{desc}]]"
+        # casa [[file:PATH]] e [[file:PATH][DESC]]
+        return re.sub(r"\[\[file:([^\]\n]+?)(?:\]\[([^\]]*))?\]\]", repl, text)
+
+    protected = _strip_dirs_in_file_links(protected)
+
+    # grava cópia ._pandoc.org ao lado do .org
+    try:
+        with open(prot_path, "w", encoding="utf-8") as fprot:
+            fprot.write(protected)
+    except Exception as e:
+        print(f"❌ Falha gravando cópia protegida: {e}")
+        return None
+
+    # --- checa pandoc
+    pandoc = sh.which("pandoc")
+    if not pandoc:
+        print("❌ Pandoc não encontrado no PATH. Instale com: sudo apt install pandoc texlive-xetex")
+        return None
+
+    # --- comando pandoc
+    resource_path = os.pathsep.join([org_dir, kpi_dir, imgs_dir_abs])
+
+    cmd = [
+        "pandoc", prot_path, "-o", pdf_path,
+        "-f", "org",
+        "--pdf-engine=xelatex",
+        "--include-in-header", header_path,
+        "--variable", f"mainfont={font}",
+        "--variable", "geometry:margin=2cm",
+        "--highlight-style=zenburn",
+        "--resource-path", resource_path,
+        "--pdf-engine-opt=-interaction=nonstopmode",
+        "--pdf-engine-opt=-halt-on-error",
+        "--pdf-engine-opt=-file-line-error",
+    ]
+
+    print(f"[Pandoc] Gerando PDF: {' '.join(map(str, cmd))}")
+    try:
+        env = os.environ.copy()
+        # ajuda extra para (la)tex localizar figuras
+        env["TEXINPUTS"] = _detok(imgs_dir_abs) + ":" + env.get("TEXINPUTS", "")
+        with open(log_path, "a", encoding="utf-8") as flog:
+            flog.write("\n\n===== NOVA EXECUÇÃO =====\n")
+            flog.flush()
+            result = subprocess.run(
+                cmd,
+                stdout=flog,
+                stderr=flog,
+                text=True,
+                cwd=org_dir,       # roda no diretório do .org
+                timeout=1800,      # 30 min
+                env=env,
+            )
+    except subprocess.TimeoutExpired:
+        print("❌ Pandoc/LaTeX excedeu 30 min. Veja o log para o ponto de parada.")
+        return None
+    except Exception as e:
+        print(f"❌ Erro ao executar Pandoc: {e}")
+        return None
+
+    if result.returncode == 0 and os.path.exists(pdf_path):
+        print(f"✅ PDF gerado: {pdf_path}")
+        # opcional: limpar a cópia protegida
+        try:
+            os.remove(prot_path)
+        except Exception:
+            pass
+        return pdf_path
+
+    print(f"❌ Erro ao gerar PDF. Veja o log: {log_path}")
+    return None
+
+
+def adicionar_capa_pdf(pdf_final_path: str) -> None:
+    """
+    Prependa a capa oficial (misc/capa.pdf) ao PDF final.
+    Gera um novo arquivo com sufixo '_com_capa.pdf' no mesmo diretório.
+
+    Parâmetros
+    ----------
+    pdf_final_path : str
+        Caminho do PDF base (sem capa).
+    """
+    capa_path = os.path.join(MISC_DIR, "capa.pdf")
+    if not os.path.exists(capa_path):
+        print(f"[AVISO] Capa não encontrada: {capa_path}. Pulando.")
+        return
+    if not os.path.exists(pdf_final_path):
+        print(f"[ERRO] PDF base não encontrado: {pdf_final_path}.")
+        return
+
+    output_path = pdf_final_path.replace(".pdf", "_com_capa.pdf")
+    merger = PdfMerger()
+    try:
+        merger.append(capa_path)
+        merger.append(pdf_final_path)
+        merger.write(output_path)
+        merger.close()
+        print(f"✅ Relatório final com capa: {output_path}")
+    except Exception as e:
+        print(f"[ERRO] Falha ao adicionar capa: {e}")
+
+def _mover_markdowns_de_exports(markdown_dir: str) -> int:
+    """
+    Move todos os arquivos '.md' que restarem em EXPORT_DIR para a pasta 'markdown/'
+    do relatório corrente. Isso ocorre após:
+      - conversão de comentários .md → .org (que já remove os .md correspondentes); e
+      - cópia dos artefatos principais (.png/.org) para suas pastas.
+
+    Parâmetros
+    ----------
+    markdown_dir : str
+        Caminho para a pasta 'markdown' do relatório (será criada se necessário).
+
+    Retorna
+    -------
+    int
+        Quantidade de arquivos .md movidos.
+    """
+    os.makedirs(markdown_dir, exist_ok=True)
+    moved = 0
+    for src in glob(os.path.join(EXPORT_DIR, "*.md")):
+        dst = os.path.join(markdown_dir, os.path.basename(src))
+        try:
+            shutil.copy2(src, dst)
+            os.remove(src)
+            moved += 1
+        except Exception as e:
+            print(f"[AVISO] Falha movendo {src} → {dst}: {e}")
+    if moved:
+        print(f"[INFO] Markdowns movidos para '{markdown_dir}': {moved} arquivo(s).")
+    return moved
+
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Protocolos transferidos (mesmo protocolo analisado por >1 perito)
+# ────────────────────────────────────────────────────────────────────────────────
+
+_PROTO_TRANSFER_CACHE = {}
+
+def _find_protocol_transfers(start: str, end: str) -> "pd.DataFrame":
+    """
+    Retorna um DataFrame com protocolos analisados por >1 perito no período.
+    Colunas: protocolo, perito, ini, fim
+    """
+    key = (start, end)
+    if key in _PROTO_TRANSFER_CACHE:
+        # retorna uma cópia defensiva
+        return _PROTO_TRANSFER_CACHE[key].copy()
+
+    import pandas as pd  # já importado globalmente, mas garante no escopo
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        end_col = _detect_end_datetime_column(conn)
+        fim_expr = f"a.{end_col}" if end_col else "NULL"
+        sql = f"""
+            WITH per_protocol AS (
+               SELECT a.protocolo      AS protocolo,
+                      p.nomePerito     AS perito,
+                      a.dataHoraIniPericia AS ini,
+                      {fim_expr}       AS fim
+                 FROM analises a
+                 JOIN peritos p ON p.siapePerito = a.siapePerito
+                WHERE date(a.dataHoraIniPericia) BETWEEN ? AND ?
+            ),
+            prot_multi AS (
+               SELECT protocolo
+                 FROM per_protocol
+             GROUP BY protocolo
+               HAVING COUNT(DISTINCT perito) > 1
+            )
+            SELECT pp.protocolo, pp.perito, pp.ini, pp.fim
+              FROM per_protocol pp
+              JOIN prot_multi m USING (protocolo)
+             ORDER BY pp.protocolo, pp.ini
+        """
+        df = pd.read_sql(sql, conn, params=(start, end))
+    finally:
+        conn.close()
+
+    # normalização de tipos (para ordenação e resumo)
+    if not df.empty:
+        df["ini"] = pd.to_datetime(df["ini"], errors="coerce")
+        if "fim" in df.columns:
+            df["fim"] = pd.to_datetime(df["fim"], errors="coerce")
+
+    _PROTO_TRANSFER_CACHE[key] = df.copy()
+    return df
+
+def _summarize_protocol_transfers(df: "pd.DataFrame") -> "pd.DataFrame":
+    """
+    Resume por protocolo: cadeia de peritos (ordem cronológica), nº de trocas,
+    primeiro início e último fim.
+    """
+    import pandas as pd
+    if df.empty:
+        return pd.DataFrame(columns=["protocolo","peritos_env","trocas","primeiro_ini","ultimo_fim"])
+
+    df = df.sort_values(["protocolo","ini"])
+    def chain(series):
+        seen = []
+        for x in series:
+            if len(seen)==0 or seen[-1] != x:
+                seen.append(x)
+        return " → ".join(seen)
+
+    def swaps(series):
+        uniq = []
+        for x in series:
+            if len(uniq)==0 or uniq[-1] != x:
+                uniq.append(x)
+        return max(len(uniq)-1, 1)
+
+    g = df.groupby("protocolo", as_index=False).agg(
+        peritos_env = ("perito", chain),
+        trocas      = ("perito", swaps),
+        primeiro_ini= ("ini", "min"),
+        ultimo_fim  = ("fim", "max"),
+    )
+    # formata datas para string curta
+    g["primeiro_ini"] = g["primeiro_ini"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
+    g["ultimo_fim"]   = g["ultimo_fim"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
+    return g
+
+def _csv_write(df: "pd.DataFrame", path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_csv(path, index=False, encoding="utf-8")
+
+def _df_to_org_table(df: "pd.DataFrame", headers: list[str]) -> str:
+    """Converte DataFrame para tabela Org simples com cabeçalho informado."""
+    lines = []
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("---" for _ in headers) + "|")
+    for _, row in df.iterrows():
+        vals = [str(row.get(h, "")) for h in headers]
+        lines.append("| " + " | ".join(vals) + " |")
+    return "\n".join(lines)
+
+def _append_protocol_transfers_group_block(lines: list[str], relatorio_dir: str, start: str, end: str, heading_level: str = "**") -> bool:
+    """
+    Acrescenta seção 'Protocolos transferidos' ao relatório (grupo).
+    Salva CSV completo em relatorio_dir.
+    """
+    import pandas as pd
+    df = _find_protocol_transfers(start, end)
+    lines.append("")
+    lines.append(f"{heading_level} Protocolos transferidos (mesmo protocolo analisado por >1 perito)")
+    lines.append("Critério: mesmo identificador de protocolo com participação de dois ou mais peritos distintos. Indicador complementar (não pontuado).")
+
+    if df.empty:
+        lines.append(f"\nNão foram identificados protocolos com troca de perito no período {start} a {end}.\n")
         return False
 
-def _collect_assets(start: str, end: str, perito: Optional[str], top10: bool) -> Dict[str, Any]:
-    mapping = [
-        ("Taxa de Não Conformidade (NC)",            ("nc_rate","nc-rate","comparativo_nc")),
-        ("≤ 15 segundos",                            ("fifteen","15s","le15")),
-        ("Produtividade (≥ 50/h)",                   ("productivity","produtiv","share_50h")),
-        ("Sobreposição de análises",                 ("overlap",)),
-        ("Motivos de NC — Top10 vs Brasil",          ("motivo","vs_brasil","motivos")),
-        ("Indicadores (ICRA/IATD/Score)",            ("composto","icra","iatd","score")),
-        ("Weekday → Weekend (panorama)",             ("weekday","weekend")),
-        ("R: Proporções ponderadas (NC/LE)",         ("weighted",)),
-        ("R: Testes / Robustez (Top10/Individual)",  ("robust","robustness","chisq","cmh","binom","betabin")),
-    ]
-    order = {t:i for i,(t,_) in enumerate(mapping)}
-    def _classify(fn:str)->Optional[str]:
-        low=fn.lower()
-        for title, keys in mapping:
-            if any(k in low for k in keys): return title
+    summary = _summarize_protocol_transfers(df)
+    csv_path = os.path.join(relatorio_dir, f"protocolos_transferidos_{start}_a_{end}.csv")
+    _csv_write(summary, csv_path)
+
+    # Tabela enxuta no corpo do relatório
+    headers = ["protocolo","peritos_env","trocas","primeiro_ini","ultimo_fim"]
+    table = _df_to_org_table(summary, headers)
+    lines.append("")
+    lines.append("#+ATTR_LATEX: :environment longtable :align l l c l l")
+    lines.append(table)
+    lines.append("")
+    lines.append(f"Arquivo completo: [[file:{os.path.basename(csv_path)}]]")
+    lines.append("")
+    lines.append("_Nota:_ Transferência pode ocorrer por reanálise, redistribuição de carga ou outros motivos operacionais; não implica, por si só, irregularidade.")
+    lines.append("")
+    return True
+
+def _append_protocol_transfers_perito_block_if_any(lines: list[str], perito: str, start: str, end: str, relatorio_dir: str, heading_level: str = "***") -> bool:
+    """
+    Acrescenta mini-bloco para o perito com a lista de protocolos transferidos em que ele aparece.
+    """
+    df = _find_protocol_transfers(start, end)
+    if df.empty:
+        # Se inexistem no período, opcionalmente diga explicitamente.
+        lines.append(f"{heading_level} Protocolos transferidos (este perito)")
+        lines.append(f"Não foram identificados protocolos transferidos envolvendo este perito no período {start} a {end}.\n")
+        return False
+
+    mask = df["perito"].astype(str).str.strip().str.casefold() == str(perito).strip().casefold()
+    protos = sorted(df.loc[mask, "protocolo"].astype(str).unique().tolist())
+    lines.append(f"{heading_level} Protocolos transferidos (este perito)")
+    if not protos:
+        lines.append(f"**Protocolos transferidos:** este perito não participou de protocolos transferidos no período.")
+        lines.append("")
+        return False
+
+    # menciona também o CSV do grupo, se existir/gerado
+    csv_name = f"protocolos_transferidos_{start}_a_{end}.csv"
+    csv_path = os.path.join(relatorio_dir, csv_name)
+    hint = f"  (ver [[file:{csv_name}]] para detalhes)" if os.path.exists(csv_path) else ""
+    lines.append(f"**Protocolos transferidos que envolvem este perito ({len(protos)}):** {', '.join(protos)}{hint}")
+    lines.append("")
+    return True
+
+
+def _sha256sum(path: str, chunk: int = 1024 * 1024) -> str:
+    """SHA-256 de um arquivo grande (streaming)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _write_manifest_csv(logs_dir: str, base_kpi_dir: str, roots: list[str], start: str, end: str) -> str | None:
+    """
+    Gera logs/<escopo>/manifest_<start>_a_<end>.csv com colunas:
+      rel_path, size_bytes, sha256, mtime_iso
+    onde rel_path é relativo a base_kpi_dir (ex.: 'imgs/top10/foo.png').
+    """
+    os.makedirs(logs_dir, exist_ok=True)
+    rows = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                p = os.path.join(dirpath, fn)
+                try:
+                    rel = os.path.relpath(p, start=base_kpi_dir).replace("\\", "/")
+                    st  = os.stat(p)
+                    rows.append((rel, st.st_size, _sha256sum(p), datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")))
+                except Exception as e:
+                    print(f"[AVISO] Manifest: falha em {p}: {e}")
+
+    if not rows:
         return None
-    sections: Dict[str, Dict[str, Any]] = {}
-    for png in sorted(Path(EXPORT_DIR).glob("*.png")):
-        key = _classify(png.name)
-        if not key:
-            continue
-        full = str(png)
-        if not _is_valid_png(full):
-            print(f"[WARN] Ignorando PNG corrompido/truncado: {full}")
-            continue
-        s = sections.setdefault(key, {"title": key, "images": [], "comment_md": "", "kind":"result"})
-        s["images"].append(full)
-    for md in sorted(Path(EXPORT_DIR).glob("*.md")):
-        key = _classify(md.name.replace(".md",".png"))
-        if not key: continue
-        sections.setdefault(key, {"title": key, "images": [], "comment_md": "", "kind":"result"})
-        sections[key]["comment_md"] = _read_text(str(md))
-    ordered = sorted(sections.values(), key=lambda d: order.get(d["title"], 999))
-    return {"sections": ordered}
 
-# ────────────────────────────────────────────────────────────────────────────────
-# PDF build (com proteção per-image)
-# ────────────────────────────────────────────────────────────────────────────────
-def _image_flowable(path: str, max_w: float):
-    """Abre com PIL, re-encoda para PNG RGB e retorna RLImage dimensionada."""
-    from io import BytesIO
-    with open(path, "rb") as fh:
-        raw = fh.read()
-    bio_in = BytesIO(raw)
-    pil = Image.open(bio_in)
-    pil.load()
-    if pil.mode not in ("RGB","L"):
-        pil = pil.convert("RGB")
-    bio_out = BytesIO()
-    pil.save(bio_out, format="PNG")
-    bio_out.seek(0)
-    img = RLImage(bio_out)
-    iw, ih = img.wrap(0,0)
-    if iw > max_w:
-        scale = max_w/iw
-        img._restrictSize(max_w, ih*scale)
-    return img
+    out = os.path.join(logs_dir, f"manifest_{start}_a_{end}.csv")
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["rel_path", "size_bytes", "sha256", "mtime_iso"])
+        for r in sorted(rows, key=lambda x: (x[0].lower())):
+            w.writerow(r)
+    print(f"📄 Manifesto salvo em: {out}")
+    return out
 
-def _build_pdf(meta: Dict[str, Any], assets: Dict[str, Any], pdf_path: str, front_pdfs: Optional[List[str]]=None) -> str:
-    os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
-    doc = SimpleDocTemplate(pdf_path, pagesize=A4,
-        leftMargin=PDF_MARGIN_LEFT_CM*cm, rightMargin=PDF_MARGIN_RIGHT_CM*cm,
-        topMargin=PDF_MARGIN_TOP_CM*cm, bottomMargin=PDF_MARGIN_BOTTOM_CM*cm)
-    story: List = []
 
-    title = meta.get("title") or ("Relatório ATESTMED — KPI (Top10)" if meta.get("top10") else f"Relatório ATESTMED — KPI: {meta.get('perito')}")
-    story.append(Paragraph(_escape(f"{title} — {meta['start']} a {meta['end']}"), STYLES["Title"]))
-    story.append(Spacer(1,6))
-
-    if meta.get("top10") and meta.get("lista_top10"):
-        df_list = pd.DataFrame({"Perito":[str(x) for x in meta["lista_top10"]]})
-        story.append(Paragraph("Top 10 peritos selecionados", STYLES["Heading2"]))
-        story.append(_df_table(df_list, ["Perito"], [doc.width]))
-        story.append(Spacer(1,10))
-
-    for sec in assets.get("sections", []):
-        story.append(Paragraph(_escape(sec["title"]), STYLES["Heading2"]))
-        for path_png in sec["images"]:
-            try:
-                story.append(_image_flowable(path_png, max_w=doc.width*PDF_IMG_FRAC))
-                story.append(Spacer(1,4))
-            except Exception as e:
-                story.append(Paragraph(_escape(f"[AVISO] Não foi possível inserir a imagem: {path_png} ({e})"), STYLES["Small"]))
-        if sec.get("comment_md"):
-            # Markdowns simples (sem renderização): quebra por parágrafos
-            paras = [p.strip() for p in sec["comment_md"].strip().split("\n\n") if p.strip()]
-            for ptext in paras:
-                story.append(Paragraph(_escape(ptext).replace("\n","<br/>"), STYLES["Small"]))
-        story.append(Spacer(1,10))
-
-    doc.build(story, onFirstPage=lambda c,d:_header_footer(c,d,meta),
-                     onLaterPages=lambda c,d:_header_footer(c,d,meta))
-
-    final_path = pdf_path
-    if front_pdfs and len(front_pdfs) and PdfMerger:
-        merged = pdf_path.replace(".pdf","_FINAL.pdf")
-        try:
-            merger = PdfMerger()
-            for p in front_pdfs:
-                if p and os.path.exists(p):
-                    merger.append(p)
-            merger.append(pdf_path)
-            merger.write(merged)
-            merger.close()
-            final_path = merged
-        except Exception as e:
-            print(f"[warn] Falha ao concatenar FRONT PDFs: {e}")
-    return final_path
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Shipping
-# ────────────────────────────────────────────────────────────────────────────────
-def _ship_outputs(start: str, end: str, subdir: str, files: List[str], copy_png_md: bool=True) -> str:
-    dest = os.path.join(OUTPUTS_DIR, f"{start}_a_{end}", subdir)
-    os.makedirs(dest, exist_ok=True)
-    for p in files:
-        if p and os.path.exists(p):
-            shutil.copy2(p, os.path.join(dest, os.path.basename(p)))
-    if copy_png_md:
-        for f in Path(EXPORT_DIR).glob("*.png"):
-            shutil.copy2(str(f), os.path.join(dest, f.name))
-        for f in Path(EXPORT_DIR).glob("*.md"):
-            shutil.copy2(str(f), os.path.join(dest, f.name))
-    print(f"[OK] Saída organizada em: {dest}")
-    return dest
-
-# ────────────────────────────────────────────────────────────────────────────────
-# CLI
-# ────────────────────────────────────────────────────────────────────────────────
-def _build_argparser():
-    ap = argparse.ArgumentParser(description="Relatório ATESTMED — KPI (NG, PDF direto)")
-    g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--top10", action="store_true", help="Relatório Top-10 (KPI)")
-    g.add_argument("--perito", type=str, help="Relatório individual para o perito")
-    ap.add_argument("--start", required=True); ap.add_argument("--end", required=True)
-    ap.add_argument("--min-analises", type=int, default=50)
-    ap.add_argument("--topn", type=int, default=10)
-    ap.add_argument("--export-png", action="store_true")
-    ap.add_argument("--all-tests", action="store_true")
-    ap.add_argument("--add-comments", action="store_true")
-    ap.add_argument("--export-pdf", action="store_true")
-    ap.add_argument("--out-root", default=OUTPUTS_DIR); ap.add_argument("--out-subdir", default=None)
-    ap.add_argument("--ship-outputs", action="store_true")
-    ap.add_argument("--front-pdf", nargs="*", default=None)
-    # compat inócuas (ex-ORG)
-    ap.add_argument("--export-org", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--final-org", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--final-org-name", type=str, help=argparse.SUPPRESS)
-    ap.add_argument("--no-front", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--no-head", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--header-org", type=str, help=argparse.SUPPRESS)
-    ap.add_argument("--front-org", type=str, help=argparse.SUPPRESS)
-    ap.add_argument("--selection-mode", type=str, default="kpi", help=argparse.SUPPRESS)
-    return ap
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Main
-# ────────────────────────────────────────────────────────────────────────────────
 def main():
-    args = _build_argparser().parse_args()
+    """
+    Orquestração principal:
+      1) Parse de args e preflight (env, R).
+      2) Execução dos gráficos (Python e R) — ou reutilização (--reuse-kpi).
+      3) Coleta/cópia de artefatos para as pastas por escopo.
+      4) Geração do(s) .org consolidado(s) e PDF em pdf/<escopo> com logs/<escopo>.
+      5) Manifesto (CSV) com checksums em logs/<escopo>.
+      6) Se Top10: anexa seção de 'Peritos reincidentes'.
+    """
+    t0 = time.time()
+    args = parse_args()
 
-    # Limpa quaisquer .org antes de iniciar
-    _purge_org_files(EXPORT_DIR)
+    # Aviso apenas se pretendemos gerar comentários IA sem OPENAI_API_KEY
+    if (args.add_comments or getattr(args, "export_comment_org", False)) and not os.getenv("OPENAI_API_KEY"):
+        print("⚠️  Sem OPENAI_API_KEY. Os scripts com comentário podem cair no fallback (sem IA).")
 
-    # Seleção Top10 / lista de peritos
-    lista_top10: List[str] = []
+    # Preflight do R, se apêndice habilitado e houver execução (não no reuse)
+    if args.r_appendix and not args.reuse_kpi:
+        _preflight_r(args.r_bin)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Estrutura de diretórios por período e ESCOPO
+    # ─────────────────────────────────────────────────────────────────────
+    PERIODO_DIR   = os.path.join(OUTPUTS_DIR, f"{args.start}_a_{args.end}")
+    BASE_KPI_DIR  = os.path.join(PERIODO_DIR, "kpi")
+
     if args.top10:
-        df_top = get_top10_dataframe(args.start, args.end, min_analises=args.min_analises)
-        if df_top is None or df_top.empty:
-            print("[AVISO] Nenhum perito encontrado para Top10 com os critérios atuais.")
-        else:
-            lista_top10 = df_top["nomePerito"].tolist()
-            print("[INFO] Top10:", lista_top10)
-
-    # Scripts globais
-    for c in _build_global_cmds(args.start, args.end):
-        _run(c, cwd=GRAPHS_DIR)
-    _purge_org_files(EXPORT_DIR)
-
-    # Gráficos Python
-    if args.export_png:
-        gcmds = _build_graph_cmds(args.top10, args.perito, args.start, args.end, args.min_analises, args.add_comments, args.topn)
-        for c in gcmds:
-            _run(c, cwd=GRAPHS_DIR)
-            _purge_org_files(EXPORT_DIR)
-
-    # R checks
-    if args.all_tests:
-        rcmds = _build_r_cmds(args.top10, args.perito, args.start, args.end, args.min_analises)
-        for c in rcmds:
-            _run(c, cwd=RCHECK_DIR)
-        _purge_org_files(EXPORT_DIR)
-
-    # Coleta assets + PDF
-    assets = _collect_assets(args.start, args.end, args.perito, args.top10)
-    meta = {"title":"Relatório ATESTMED — KPI (NG)","top10":bool(args.top10),
-            "perito": args.perito, "lista_top10": lista_top10, "start": args.start, "end": args.end}
-
-    safe_perito = _safe(args.perito) if args.perito else None
-    pdf_basename = f"kpi_{args.start}_a_{args.end}.pdf" if not args.perito else f"kpi_{safe_perito}_{args.start}_a_{args.end}.pdf"
-    pdf_out = os.path.join(EXPORT_DIR, pdf_basename)
-
-    final_path = _build_pdf(meta, assets, pdf_out, front_pdfs=args.front_pdf)
-
-    # Shipping
-    if args.ship_outputs or args.export_pdf:
-        subdir = args.out_subdir or ("top10/kpi" if args.top10 else f"perito/{safe_perito}/kpi")
-        outdir = os.path.join(args.out_root, f"{args.start}_a_{args.end}", subdir)
-        os.makedirs(outdir, exist_ok=True)
-        shipped_dir = _ship_outputs(args.start, args.end, subdir, [final_path], copy_png_md=True)
-        try:
-            zip_path = os.path.join(outdir, os.path.basename(pdf_out).replace(".pdf", ".zip"))
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                for root, _, files in os.walk(shipped_dir):
-                    for f in files:
-                        full = os.path.join(root, f); rel = os.path.relpath(full, shipped_dir)
-                        z.write(full, rel)
-            print(f"[OK] ZIP gerado: {zip_path}")
-        except Exception as e:
-            print(f"[warn] Falha ao zipar: {e}")
-        print(f"PDF final: {final_path}\nSaída em: {shipped_dir}")
+        ESCOPO = "top10"
     else:
-        print(f"PDF (local): {final_path}")
+        safe_perito = _safe(args.perito.strip())
+        ESCOPO = os.path.join("individual", safe_perito)
 
-if __name__ == "__main__":
+    # Diretórios por TIPO com <escopo> na cauda
+    IMGS_DIR      = os.path.join(BASE_KPI_DIR, "imgs", ESCOPO)
+    ORGS_DIR      = os.path.join(BASE_KPI_DIR, "orgs", ESCOPO)        # aqui ficam os .org finais
+    COMMENTS_DIR  = os.path.join(ORGS_DIR, "comments")                 # comentários lado a lado do org
+    MARKDOWN_DIR  = os.path.join(BASE_KPI_DIR, "markdown", ESCOPO)
+    PDF_DIR       = os.path.join(BASE_KPI_DIR, "pdf", ESCOPO)
+    LOGS_DIR      = os.path.join(BASE_KPI_DIR, "logs", ESCOPO)
+
+    # "RELATORIO_DIR" = base onde escrevemos os .org
+    RELATORIO_DIR = ORGS_DIR
+
+    for d in (PERIODO_DIR, BASE_KPI_DIR, IMGS_DIR, ORGS_DIR, COMMENTS_DIR, MARKDOWN_DIR, PDF_DIR, LOGS_DIR):
+        os.makedirs(d, exist_ok=True)
+
+    planned_cmds = []
+
+    # =========================
+    # PLANEJAMENTO — TOP 10
+    # =========================
+    if args.top10:
+        peritos_df = pegar_10_piores_peritos(args.start, args.end, min_analises=args.min_analises)
+        if peritos_df.empty:
+            print("Nenhum perito encontrado com os critérios.")
+            return
+
+        lista_top10 = peritos_df['nomePerito'].tolist()
+        set_top10   = set(lista_top10)
+        print(f"Gerando para os 10 piores: {lista_top10}")
+
+        if not args.reuse_kpi:
+            # Limpa exports "top10" antigos
+            _cleanup_exports_top10()
+
+            # Contexto de grupo
+            group_ctx = {
+                "kind": "top10",
+                "start": args.start,
+                "end":   args.end,
+                "min_analises": args.min_analises,
+                "add_comments": args.add_comments,
+            }
+
+            # Agenda scripts de grupo (Python)
+            for script in SCRIPT_ORDER:
+                script_file = script_path(script)
+                planned_cmds.extend(build_commands_for_script(script_file, group_ctx))
+
+            # Agenda R checks do grupo
+            if args.r_appendix:
+                planned_cmds.extend(build_r_commands_for_top10(args.start, args.end, args.r_bin, args.min_analises))
+
+            # Agenda scripts individuais (para cada perito do Top10)
+            for perito in lista_top10:
+                if not perito_tem_dados(perito, args.start, args.end):
+                    print(f"⚠️  Perito '{perito}' sem análises no período! Pulando.")
+                    continue
+                safe = _safe(perito)
+                _cleanup_exports_for_perito(safe)
+
+                indiv_ctx = {
+                    "kind": "perito",
+                    "perito": perito,
+                    "start": args.start,
+                    "end":   args.end,
+                    "add_comments": args.add_comments,
+                }
+                for script in SCRIPT_ORDER:
+                    script_file = script_path(script)
+                    planned_cmds.extend(build_commands_for_script(script_file, indiv_ctx))
+
+                if args.r_appendix:
+                    planned_cmds.extend(build_r_commands_for_perito(perito, args.start, args.end, args.r_bin))
+
+            # Coorte extra de %NC altíssima (opcional)
+            extras_list = []
+            if args.include_high_nc:
+                df_high = pegar_peritos_nc_altissima(
+                    args.start, args.end,
+                    nc_threshold=args.high_nc_threshold,
+                    min_tasks=args.high_nc_min_tasks
+                )
+                if df_high.empty:
+                    print("Nenhum perito com %NC acima do limiar e mínimo de tarefas.")
+                else:
+                    extras_list = [n for n in df_high['nomePerito'].tolist() if n not in set_top10]
+                    if extras_list:
+                        print(f"Incluindo coorte extra (%NC ≥ {args.high_nc_threshold} e ≥ {args.high_nc_min_tasks} tarefas): {extras_list}")
+                    else:
+                        print("Coorte extra presente, mas todos já estão no Top 10 — sem novos peritos.")
+            else:
+                print("Coorte extra de %NC alta desativada (--no-high-nc).")
+
+            # Agenda scripts para a coorte extra
+            for perito in (extras_list if args.include_high_nc else []):
+                if not perito_tem_dados(perito, args.start, args.end):
+                    print(f"⚠️  Perito '{perito}' sem análises no período! Pulando.")
+                    continue
+                safe = _safe(perito)
+                _cleanup_exports_for_perito(safe)
+
+                indiv_ctx = {
+                    "kind": "perito",
+                    "perito": perito,
+                    "start": args.start,
+                    "end":   args.end,
+                    "add_comments": args.add_comments,
+                }
+                for script in SCRIPT_ORDER:
+                    script_file = script_path(script)
+                    planned_cmds.extend(build_commands_for_script(script_file, indiv_ctx))
+                if args.r_appendix:
+                    planned_cmds.extend(build_r_commands_for_perito(perito, args.start, args.end, args.r_bin))
+
+            # Scripts globais (por período) — executar uma única vez ANTES
+            try:
+                for script in GLOBAL_SCRIPTS:
+                    script_file = script_path(script)
+                    planned_cmds[:0] = build_commands_for_global(script_file, args.start, args.end)
+            except NameError:
+                pass
+
+    # =========================
+    # PLANEJAMENTO — INDIVIDUAL
+    # =========================
+    else:
+        perito = args.perito.strip()
+        if not perito_tem_dados(perito, args.start, args.end):
+            print(f"⚠️  Perito '{perito}' sem análises no período.")
+            return
+
+        if not args.reuse_kpi:
+            safe = _safe(perito)
+            _cleanup_exports_for_perito(safe)
+
+            indiv_ctx = {
+                "kind": "perito",
+                "perito": perito,
+                "start": args.start,
+                "end":   args.end,
+                "add_comments": args.add_comments,
+            }
+            for script in SCRIPT_ORDER:
+                script_file = script_path(script)
+                planned_cmds.extend(build_commands_for_script(script_file, indiv_ctx))
+
+            if args.r_appendix:
+                planned_cmds.extend(build_r_commands_for_perito(perito, args.start, args.end, args.r_bin))
+
+            # Scripts globais (por período) — ainda executa para obter orgs-base
+            try:
+                for script in GLOBAL_SCRIPTS:
+                    script_file = script_path(script)
+                    planned_cmds[:0] = build_commands_for_global(script_file, args.start, args.end)
+            except NameError:
+                pass
+
+    # Bootstrap de dependências R (entra antes de tudo) — apenas quando não for reuse
+    if args.r_appendix and not args.reuse_kpi:
+        cmd_boot = _r_deps_bootstrap_cmd(args.r_bin)
+        if cmd_boot:
+            planned_cmds.insert(0, cmd_boot)
+        else:
+            print("[AVISO] r_checks/_ensure_deps.R não encontrado; pulando bootstrap de pacotes.")
+
+    # Apenas listar plano?
+    if args.plan_only:
+        print("\n===== PLANO DE EXECUÇÃO (dry-run) =====")
+        for c in planned_cmds:
+            print(" ".join(map(str, c)))
+        print("=======================================\n")
+        return
+
+    # Execução dos comandos (Python e R), exceto no modo reuse
+    if not args.reuse_kpi:
+        for cmd in planned_cmds:
+            try:
+                if _is_r_cmd(cmd):
+                    print(f"[RUN] {' '.join(map(str, cmd))}")
+                    subprocess.run(cmd, check=False, cwd=RCHECK_DIR)
+                else:
+                    print(f"[RUN] {' '.join(map(str, cmd))}")
+                    subprocess.run(cmd, check=False, env=_env_with_project_path(), cwd=SCRIPTS_DIR)
+            except Exception as e:
+                print(f"[ERRO] Falha executando: {' '.join(map(str, cmd))}\n  -> {e}")
+
+        # Coleta saídas R (fallback) em EXPORT_DIR
+        collect_r_outputs_to_export()
+
+    # --------------------------------------------------------------------------
+    # MONTAGEM DOS RELATÓRIOS E MOVIMENTAÇÃO DE ARTEFATOS
+    # --------------------------------------------------------------------------
+    org_paths = []
+    extras_org_paths = []
+    org_grupo_top10 = None
+    org_to_export = None
+    pdf_path = None
+
+    if args.top10:
+        # Copia artefatos de grupo (inclui conversão de comments .md → .org)
+        if not args.reuse_kpi:
+            copiar_artefatos_top10(IMGS_DIR, COMMENTS_DIR, ORGS_DIR, MARKDOWN_DIR)
+
+            # Copia artefatos do panorama W→WE (global)
+            try:
+                copiar_artefatos_weekday2weekend(IMGS_DIR, COMMENTS_DIR, ORGS_DIR)
+            except NameError:
+                pass
+
+        # (Top10 grupo) Comentários GPT dos R checks (se habilitado e não for reuse)
+        if args.r_appendix and args.add_comments and not args.reuse_kpi:
+            gerar_r_apendice_group_comments_if_possible(IMGS_DIR, COMMENTS_DIR, args.start, args.end)
+
+        # Org do grupo
+        org_grupo_top10 = gerar_org_top10_grupo(args.start, args.end, RELATORIO_DIR, IMGS_DIR, COMMENTS_DIR)
+
+        # Peritos do Top10
+        peritos_df = pegar_10_piores_peritos(args.start, args.end, min_analises=args.min_analises)
+        lista_top10 = peritos_df['nomePerito'].tolist()
+        for perito in lista_top10:
+            if not perito_tem_dados(perito, args.start, args.end):
+                continue
+            if not args.reuse_kpi:
+                copiar_artefatos_perito(perito, IMGS_DIR, COMMENTS_DIR, ORGS_DIR, MARKDOWN_DIR)
+                if args.r_appendix and args.add_comments:
+                    gerar_r_apendice_comments_if_possible(perito, IMGS_DIR, COMMENTS_DIR, args.start, args.end)
+            org_path = gerar_org_perito(perito, args.start, args.end, args.add_comments, IMGS_DIR, COMMENTS_DIR, RELATORIO_DIR)
+            org_paths.append(org_path)
+
+        # Coorte extra
+        extras_list = []
+        if args.include_high_nc:
+            df_high = pegar_peritos_nc_altissima(args.start, args.end,
+                                                 nc_threshold=args.high_nc_threshold,
+                                                 min_tasks=args.high_nc_min_tasks)
+            set_top10 = set(lista_top10)
+            extras_list = [n for n in df_high['nomePerito'].tolist() if n not in set_top10]
+
+        for perito in extras_list:
+            if not perito_tem_dados(perito, args.start, args.end):
+                continue
+            if not args.reuse_kpi:
+                copiar_artefatos_perito(perito, IMGS_DIR, COMMENTS_DIR, ORGS_DIR, MARKDOWN_DIR)
+                if args.r_appendix and args.add_comments:
+                    gerar_r_apendice_comments_if_possible(perito, IMGS_DIR, COMMENTS_DIR, args.start, args.end)
+            org_path = gerar_org_perito(perito, args.start, args.end, args.add_comments, IMGS_DIR, COMMENTS_DIR, RELATORIO_DIR)
+            extras_org_paths.append(org_path)
+
+        # ← mover quaisquer .md remanescentes para 'markdown/<escopo>/' (se houver)
+        if not args.reuse_kpi:
+            _mover_markdowns_de_exports(MARKDOWN_DIR)
+
+        # Org consolidado do Top10 (com impacto, protocolos transferidos, panorama e reincidentes)
+        if (args.export_org or args.export_pdf) and (org_paths or org_grupo_top10 or extras_org_paths):
+            org_final = os.path.join(RELATORIO_DIR, f"relatorio_dez_piores_{args.start}_a_{args.end}.org")
+            lines = [f"* Relatório dos 10 piores peritos ({args.start} a {args.end})", ""]
+
+            # Grupo (Top10)
+            if org_grupo_top10 and os.path.exists(org_grupo_top10):
+                with open(org_grupo_top10, encoding="utf-8") as f:
+                    lines.append(f.read().strip())
+                    lines.append("#+LATEX: \\newpage\n")
+
+            # Cada perito + Impacto na Fila (perito)
+            for org_path in org_paths:
+                with open(org_path, encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    lines.append(content)
+                    lines.append("#+LATEX: \\newpage\n")
+
+                # Impacto do PERITO (se existir)
+                perito_safe = os.path.splitext(os.path.basename(org_path))[0]
+                per_impacts = coletar_orgs_impacto(PERIODO_DIR, args.start, args.end, perito=perito_safe)
+                for imp_path in per_impacts:
+                    try:
+                        with open(imp_path, encoding="utf-8") as fi:
+                            imp_txt = fi.read().strip()
+                        if imp_txt:
+                            imp_txt = shift_org_headings(_protect_org_text_for_pandoc(imp_txt), delta=1)
+                            lines.append(imp_txt)
+                            lines.append("#+LATEX: \\newpage\n")
+                    except Exception as e:
+                        print(f"[AVISO] Falha ao anexar impacto do perito ({e}): {imp_path}")
+
+            # Extras (coorte de %NC altíssima)
+            if extras_org_paths:
+                lines.append(f"** Peritos com %NC ≥ {args.high_nc_threshold:.0f}% e ≥ {args.high_nc_min_tasks} tarefas\n")
+                for org_path in extras_org_paths:
+                    with open(org_path, encoding="utf-8") as f:
+                        content = f.read().strip()
+                        if content:
+                            content = shift_org_headings(content, delta=1)
+                            lines.append(content)
+                            lines.append("#+LATEX: \\newpage\n")
+
+            # Impacto do GRUPO (Top10)
+            grp_impacts = coletar_orgs_impacto(PERIODO_DIR, args.start, args.end, perito=None)
+            for path in grp_impacts:
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        content = f.read().strip()
+                    if content:
+                        content = shift_org_headings(_protect_org_text_for_pandoc(content), delta=1)
+                        lines.append(content)
+                        lines.append("#+LATEX: \\newpage\n")
+                except Exception as e:
+                    print(f"[AVISO] Falha ao anexar impacto do grupo ({e}): {path}")
+
+            # Protocolos transferidos (grupo)
+            _append_protocol_transfers_group_block(
+                lines, RELATORIO_DIR, args.start, args.end, heading_level="**"
+            )
+
+            # Panorama global (W→WE) AO FINAL — com orgs_dir correto (ajuste #1)
+            _append_weekday2weekend_panorama_block(
+                lines,
+                imgs_dir=IMGS_DIR,
+                comments_dir=COMMENTS_DIR,
+                orgs_dir=RELATORIO_DIR,
+                start=args.start, end=args.end,
+                heading_level="**"
+            )
+
+            with open(org_final, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines).strip() + "\n")
+            print(f"✅ Org consolidado salvo em: {org_final}")
+            org_to_export = org_final
+
+            # Passo #5: Reincidentes (≥2 meses) gerado via DB e anexado ao final
+            try:
+                reinc_csv = os.path.join(RELATORIO_DIR, f"reincidentes_{args.start}_a_{args.end}.csv")
+                _run_reincidentes_scan(
+                    out_csv=reinc_csv,
+                    min_months=2,
+                    root=BASE_KPI_DIR,
+                    start=args.start,
+                    end=args.end,
+                    min_analises=args.min_analises
+                )
+                _append_reincidentes_to_org(org_final, reinc_csv, min_months=2, heading_level="**")
+            except Exception as e:
+                print(f"[AVISO] Falha ao gerar/anexar reincidentes: {e}")
+
+        else:
+            org_to_export = org_paths[0] if org_paths else None
+
+    # --------------------------------------------------------------------------
+    # INDIVIDUAL — consolidado + bloco W→WE condicional por perito
+    # --------------------------------------------------------------------------
+    else:
+        perito = args.perito.strip()
+
+        if not args.reuse_kpi:
+            copiar_artefatos_perito(perito, IMGS_DIR, COMMENTS_DIR, ORGS_DIR, MARKDOWN_DIR)
+
+            # Copia artefatos globais pois o bloco W→WE do perito será extraído deles
+            try:
+                copiar_artefatos_weekday2weekend(IMGS_DIR, COMMENTS_DIR, ORGS_DIR)
+            except NameError:
+                pass
+
+            # mover quaisquer .md remanescentes para 'markdown/<escopo>/'
+            _mover_markdowns_de_exports(MARKDOWN_DIR)
+
+        # Monta org individual base (sem panorama no topo)
+        perito_org_path = gerar_org_perito(
+            perito, args.start, args.end, args.add_comments,
+            IMGS_DIR, COMMENTS_DIR, RELATORIO_DIR
+        )
+
+        # Consolida: relatório do perito + (se houver) bloco W→WE deste perito no FINAL
+        org_final = os.path.join(
+            RELATORIO_DIR, f"relatorio_{_safe(perito)}_{args.start}_a_{args.end}.org"
+        )
+        lines = [f"* Relatório individual — {perito} ({args.start} a {args.end})", ""]
+
+        with open(perito_org_path, encoding="utf-8") as f:
+            content = f.read().strip()
+            if content:
+                lines.append(content)
+                lines.append("#+LATEX: \\newpage\n")
+
+        # Acrescenta bloco W→WE apenas se o perito tiver casos
+        _append_weekday2weekend_perito_block_if_any(
+            lines, perito, IMGS_DIR, COMMENTS_DIR,
+            start=args.start, end=args.end,
+            heading_level="**"
+        )
+
+        with open(org_final, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines).strip() + "\n")
+
+        org_to_export = org_final
+
+    # Exportação para PDF (opcional) + capa
+    if args.export_pdf and org_to_export:
+        pdf_path = exportar_org_para_pdf(
+            org_path=org_to_export,
+            pdf_dir=PDF_DIR,
+            logs_dir=LOGS_DIR,
+            font="DejaVu Sans"
+        )
+        if pdf_path and os.path.exists(pdf_path):
+            adicionar_capa_pdf(pdf_path)
+
+    # Manifesto + SHA256 das saídas principais do escopo
+    try:
+        _write_manifest_csv(
+            logs_dir=LOGS_DIR,
+            base_kpi_dir=BASE_KPI_DIR,
+            roots=[IMGS_DIR, ORGS_DIR, MARKDOWN_DIR, PDF_DIR],
+            start=args.start,
+            end=args.end
+        )
+    except Exception as e:
+        print(f"[AVISO] Falha ao escrever manifesto: {e}")
+
+    # Tempo total
+    dt = time.time() - t0
+    mm, ss = divmod(int(dt + 0.5), 60)
+    hh, mm = divmod(mm, 60)
+    print(f"⏱️ Tempo total: {hh:02d}:{mm:02d}:{ss:02d}")
+
+
+if __name__ == '__main__':
     main()
+
+
