@@ -1,9 +1,0 @@
-#+CAPTION: Top 10 — %NC (robusto) no período
-[[file:rcheck_top10_nc_rate.png]]
-
-*Método.* Selecionamos os *10 piores* peritos no período (2025-06-01 a 2025-06-30) pelo *ScoreFinal* em `indicadores`, exigindo ao menos *50* análises. Para cada um deles, calculamos a *taxa de NC robusto* (conformado=0 OU motivo≠'' e CAST(...)≠0) com base em 'analises'. O gráfico exibe o *ranking* por %NC entre esses 10.
-
-*Interpretação.* Entre os Top 10, a %NC variou de 14.6% a 80.3%; média=42.8%, mediana=39.6%.
-- Maiores %NC: EDUARDO DE CARVALHO: 80.3% (n=94/117); VANIA CRISTINA CAMPELO BARROSO CARNEIRO: 66.1% (n=290/439); GIDEAO CABRAL DA SILVA: 44.3% (n=86/194).
-Observação: 'Top 10' é definido pelo *ScoreFinal* (não necessariamente pelas maiores %NC). Use estes resultados como *pistas* para auditoria, levando em conta o volume (n) e o contexto.
-
