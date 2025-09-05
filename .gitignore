@@ -6,8 +6,10 @@ lista*
 .zip
 
 # Pastas de resultados
-/r_stats/outputs/**
-!/r_stats/outputs/.gitkeep
+
+/testing/**
+
+/debug_logs/**
 
 /reports/outputs/**
 !/reports/outputs/.gitkeep

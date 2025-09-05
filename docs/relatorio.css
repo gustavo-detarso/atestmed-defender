@@ -1,0 +1,275 @@
+/* ======================================================================
+   relatorio.css — Estilo institucional para relatórios (HTML → PDF)
+   Compatível com Org-mode (ox-html) + Chromium/Playwright
+   ----------------------------------------------------------------------
+   Dicas:
+     - Garanta <html lang="pt-br"> (no Org: #+LANGUAGE: pt-br)
+     - Este arquivo pode ficar em docs/ e ser linkado no HEAD
+   ====================================================================== */
+
+/* ---------- Variáveis de tema (ajuste livre) ------------------------- */
+:root{
+  --fg: #0f172a;
+  --muted: #475569;
+  --border: #e5e7eb;
+  --accent: #111827;
+
+  --body-fs: 12.5pt;
+  --h1-fs: 32px;
+  --h2-fs: 22px;
+  --h3-fs: 18px;
+
+  /* Capa / identidade opcional (se houver marca) */
+  --logo-h: 96px;
+  --logo-mb: 0mm;
+  --brand-gap: 4mm;
+  --ent-fs: 11pt;
+  --ent-gap: 0.5mm;
+  --ent-lh: 1.15;
+  --dept-fs: 12pt;
+
+  --container-w: 880px;
+}
+
+/* ---------- Página (Paged Media) ------------------------------------ */
+@page{
+  size: A4;
+  margin: 24mm 22mm 24mm 22mm;
+}
+
+/* ---------- Base tipográfica ---------------------------------------- */
+html{
+  -webkit-text-size-adjust: 100%;
+  hyphens: auto;
+  -webkit-hyphens: auto;
+  -ms-hyphens: auto;
+}
+html:lang(pt-br), body:lang(pt-br){
+  hyphens: auto;
+}
+
+html, body{
+  margin: 0; padding: 0;
+  color: var(--fg);
+  font-family: "Source Serif Pro","Noto Serif",Georgia,Cambria,"Times New Roman",Times,serif;
+  line-height: 1.6;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+body{
+  font-size: var(--body-fs);
+  counter-reset: fig tbl eqn;
+}
+
+p{
+  text-align: justify;
+  text-justify: inter-word;
+  margin: 0 0 3.5mm 0;
+  orphans: 3; widows: 3;
+}
+
+.container{
+  max-width: var(--container-w);
+  margin: 0 auto;
+  padding: 0 6mm 14mm;
+}
+
+/* ---------- Capa / Identidade (opcional) ---------------------------- */
+/* Se o HTML tiver esse bloco (como no gerador HTML+CSS), será estilizado */
+header.cover{
+  margin: 6mm 0 10mm;
+  padding-bottom: 8mm;
+  border-bottom: 2px solid var(--border);
+  text-align: center;
+}
+.brand{
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--brand-gap);
+}
+.brand img.logo{
+  height: var(--logo-h);
+  width: auto;
+  display: block;
+  margin: 0 auto var(--logo-mb) auto;
+}
+.brand .ents{
+  display: flex; flex-direction: column; align-items: center; gap: var(--ent-gap);
+}
+.brand .ents .ent{ font-size: var(--ent-fs); line-height: var(--ent-lh); }
+.brand .dept{ font-size: var(--dept-fs); }
+.brand .dept-line{ display: inline-block; border-bottom: 1.5px solid #94a3b8; padding-bottom: 2px; }
+.brand .person{ font-size: 12.5pt; font-weight: 600; }
+
+h1{
+  font-size: var(--h1-fs);
+  letter-spacing: .2px;
+  margin: 8mm 0 4mm;
+  text-align: center;
+}
+.meta{ color: var(--muted); font-size: 11.5pt; text-align: center; }
+
+/* ---------- Sumário (TOC) ------------------------------------------- */
+/* Org-mode: #+OPTIONS: toc:t → <div id="table-of-contents"> */
+#table-of-contents, .toc{
+  margin: 10mm 0 6mm;
+}
+#table-of-contents h2, .toc h2{
+  font-size: 20px; margin: 0 0 4mm;
+  font-variant-caps: small-caps; letter-spacing: .04em;
+}
+#table-of-contents ul, .toc ol{
+  list-style: none; padding-left: 0; margin: 0;
+}
+#table-of-contents li, .toc li{ margin: 2.2mm 0; }
+#table-of-contents a, .toc a{
+  text-decoration: none; color: var(--fg);
+}
+
+/* ---------- Headings de seção --------------------------------------- */
+h2{
+  font-size: var(--h2-fs);
+  margin: 12mm 0 4mm;
+  font-variant-caps: small-caps; letter-spacing: .04em;
+  position: relative;
+  break-after: avoid;
+}
+h2::after{
+  content: "";
+  position: absolute; left: 0; bottom: -6px;
+  width: 85px; height: 2px; background: #d1d5db;
+}
+h3{
+  font-size: var(--h3-fs);
+  margin: 8mm 0 3mm;
+  break-after: avoid;
+}
+
+.section{ break-inside: avoid; }
+
+/* Primeira letra em drop-cap opcional */
+.section p:first-of-type::first-letter{
+  float: left; font-size: 44px; line-height: .9;
+  padding-right: 6px; padding-top: 2px;
+  font-weight: 600; color: var(--accent);
+}
+
+/* ---------- Listas e links ------------------------------------------ */
+ul, ol{ padding-left: 6mm; margin: 0 0 3.5mm 0; }
+li{ margin: 1.8mm 0; orphans: 2; widows: 2; }
+a{ color: #0b5cff; text-decoration: none; }
+a:hover{ text-decoration: underline; }
+
+/* ---------- Tabelas ------------------------------------------------- */
+table{
+  border-collapse: collapse;
+  width: 100%;
+  margin: 6mm 0;
+  font-size: 12pt;
+  counter-increment: tbl;
+  break-inside: avoid;
+}
+th, td{
+  border: 1px solid #e5e7eb;
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+th{ background: #f8fafc; }
+caption{
+  caption-side: bottom;
+  padding-top: 2mm;
+  font-size: 11.5pt;
+  color: #334155;
+  text-align: center;
+}
+caption::before{
+  content: "Tabela " counter(tbl) ": ";
+  font-weight: 600; color: #111827;
+}
+
+/* ---------- Figuras (duas versões: <figure> e Org .figure) ---------- */
+figure{
+  margin: 6mm auto;
+  counter-increment: fig;
+  break-inside: avoid;
+}
+figure img{
+  max-width: 100%; height: auto; display: block; margin: 0 auto;
+}
+figure figcaption{
+  margin-top: 2mm;
+  font-size: 11.5pt; text-align: center; color: #334155;
+}
+figure figcaption::before{
+  content: "Figura " counter(fig) ": ";
+  font-weight: 600; color: #111827;
+}
+
+/* Org-mode (ox-html) gera <div class="figure"><img><p class="caption">… */
+div.figure{
+  margin: 6mm auto;
+  counter-increment: fig;
+  break-inside: avoid;
+  text-align: center;
+}
+div.figure > img, div.figure > a > img{
+  max-width: 100%; height: auto; display: block; margin: 0 auto;
+}
+div.figure > p.caption{
+  margin-top: 2mm;
+  font-size: 11.5pt; color: #334155;
+}
+div.figure > p.caption::before{
+  content: "Figura " counter(fig) ": ";
+  font-weight: 600; color: #111827;
+}
+
+/* ---------- Citações, códigos, notas -------------------------------- */
+blockquote{
+  margin: 4mm 0; padding: 3mm 5mm;
+  border-left: 3px solid #d1d5db; color: #334155;
+  background: #f8fafc;
+  break-inside: avoid;
+}
+code, pre, tt{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.95em;
+}
+code{
+  background: #f1f5f9; padding: 0 .25em; border-radius: 3px;
+  border: 1px solid #e2e8f0;
+}
+pre{
+  background: #0b1220; color: #e5e7eb;
+  padding: 8px 10px; border-radius: 6px;
+  overflow: auto;
+  border: 1px solid #111827;
+  break-inside: avoid;
+}
+pre code{ background: transparent; border: 0; padding: 0; }
+
+/* Footnotes do Org */
+div.footnotes{
+  font-size: 0.95em; color: #334155;
+  border-top: 1px solid #e5e7eb; margin-top: 8mm; padding-top: 4mm;
+}
+div.footnotes ol{ padding-left: 6mm; }
+div.footnotes li{ margin: 2mm 0; }
+
+/* ---------- Quebras e suavização de paginação ----------------------- */
+img, table, pre, blockquote, div.figure, figure{ page-break-inside: avoid; break-inside: avoid; }
+h2, h3{ page-break-after: avoid; }
+hr{ border: none; border-top: 1px solid #e5e7eb; margin: 6mm 0; }
+
+/* Forçar quebras onde desejar (use class="page-break" no HTML) */
+.page-break{ break-before: page; page-break-before: always; }
+
+/* ---------- Impressão: remoção de sublinhados de link, etc. ---------- */
+@media print{
+  a{ color: inherit; text-decoration: underline; }
+  pre{ box-shadow: none; }
+}
+
