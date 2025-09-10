@@ -3,11 +3,15 @@
 
 """
 Indicadores (composto) — Perito OU Top 10 piores vs Brasil (excl.)
+Compatível com o pipeline do make_kpi_report:
+- Flags extras: --peritos-csv, --scope-csv, --save-manifests, --fluxo {A,B}, --db, --out-dir
+- Fluxo B (padrão): gate %NC ≥ 2× Brasil e ranking por scoreFinal (se disponível).
+
 Barras (4 indicadores) + linhas (média, mediana, média+DP do BR-excl.)
 e quadro de “cortes atingidos” (Top10: X/Y; Individual: Sim/Não).
 
 Indicadores (%):
-1) % NC                         → (motivoNaoConformado=1) / total * 100
+1) % NC                         → (motivoNaoConformado=1 ou conformado=0) / total * 100
 2) Produtividade (% do alvo)   → (total / horas_efetivas) / alvo * 100
 3) ≤ 15s (%)                    → (dur <= 15s) / total * 100
 4) Sobreposição (%)            → % de análises que participam de overlap
@@ -23,13 +27,16 @@ Alvo de produtividade: --alvo-prod (padrão 50 análises/h)
 
 Saídas:
 --export-png, --export-org, --export-comment, --export-comment-org (opcional: --chart ASCII, --call-api)
+
+Compat flags (make_kpi_report):
+--peritos-csv, --scope-csv, --save-manifests, --fluxo {A,B}, --db, --out-dir
 """
 
 import os
 import sys
 import argparse
 import sqlite3
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Set
 
 # permitir imports de utils/*
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -57,13 +64,16 @@ except Exception:
     _comentar_composto_api = None
 
 # ────────────────────────────────────────────────────────────────────────────────
-# OpenAI helper (SDK 1.x e legado) + .env
+# Paths padrão (podem ser sobrescritos por --db / --out-dir)
 # ────────────────────────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DB_PATH    = os.path.join(BASE_DIR, 'db', 'atestmed.db')
 EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
+# ────────────────────────────────────────────────────────────────────────────────
+# OpenAI helper (SDK 1.x e legado) + .env
+# ────────────────────────────────────────────────────────────────────────────────
 def _load_openai_key_from_dotenv() -> Optional[str]:
     """Carrega OPENAI_API_KEY do .env na raiz do projeto (se existir)."""
     env_path = os.path.join(BASE_DIR, ".env")
@@ -153,7 +163,7 @@ def _cap_words(text: str, max_words: int) -> str:
     return " ".join(ws[:max_words]).rstrip() + ("…" if len(ws) > max_words else "")
 
 # -----------------------
-# Utilidades de schema
+# Utilidades de schema e CSV (compat flags)
 # -----------------------
 
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -167,6 +177,27 @@ def detect_analises_table(conn: sqlite3.Connection) -> str:
         if table_exists(conn, t):
             return t
     raise RuntimeError("Não encontrei 'analises' nem 'analises_atestmed'.")
+
+def _load_names_from_csv(path: Optional[str]) -> Optional[Set[str]]:
+    """Lê uma coluna 'nomePerito' de um CSV e devolve um conjunto em UPPER()."""
+    if not path:
+        return None
+    try:
+        x = pd.read_csv(path)
+        if "nomePerito" not in x.columns:
+            return None
+        return set(x["nomePerito"].astype(str).str.strip().str.upper())
+    except Exception:
+        return None
+
+def _apply_scope(df_all: pd.DataFrame, scope_csv: Optional[str]) -> pd.DataFrame:
+    """Se scope_csv for dado, limita df_all aos peritos listados nele."""
+    if df_all.empty or not scope_csv:
+        return df_all
+    names = _load_names_from_csv(scope_csv)
+    if not names:
+        return df_all
+    return df_all.loc[df_all["nomePerito"].str.strip().str.upper().isin(names)].copy()
 
 # -----------------------
 # Carga de dados
@@ -209,7 +240,6 @@ def parse_durations(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             return None
 
-    # duração em segundos
     dur = (df['fim_dt'] - df['ini_dt']).dt.total_seconds()
     need_fallback = dur.isna()
     if need_fallback.any():
@@ -223,18 +253,14 @@ def parse_durations(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df['dur_s'] > 0]
     df = df[df['dur_s'] <= 3600]  # regra do projeto
 
-    # ---- NC robusto (texto) ----
-    # conf: default 1 (conformado) quando vazio/nulo
+    # NC robusto
     conf_int = pd.to_numeric(df.get('conf'), errors='coerce').fillna(1).astype(int)
-    # motivo como texto + cast
     nc_txt = df.get('nc_txt').astype(str).str.strip().fillna("")
     nc_cast = pd.to_numeric(nc_txt, errors='coerce').fillna(0).astype(int)
-
     df['nc_flag'] = np.where(
         (conf_int == 0) | ((nc_txt != "") & (nc_cast != 0)),
         1, 0
     ).astype(int)
-
     return df
 
 # -----------------------
@@ -375,6 +401,74 @@ def count_cut_hits(df: pd.DataFrame,
         overlap=f"{hits['overlap']}/{len(sel)}" if cut_overlap_pct is not None else "—",
         _n=len(sel)
     )
+
+# -----------------------
+# Seleção Top10 — Fluxo A vs Fluxo B (compat make_kpi_report)
+# -----------------------
+
+def _scores_df(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Lê (nomePerito, scoreFinal) da tabela indicadores se existir."""
+    if not table_exists(conn, "indicadores"):
+        return pd.DataFrame(columns=["nomePerito","scoreFinal"])
+    sql = """
+        SELECT p.nomePerito, i.scoreFinal
+          FROM indicadores i
+          JOIN peritos p ON p.siapePerito = i.perito
+    """
+    df = pd.read_sql(sql, conn)
+    df["nomePerito"] = df["nomePerito"].astype(str).str.strip()
+    return df
+
+def _top10_fluxo_a(conn: sqlite3.Connection, start: str, end: str, min_analises: int) -> List[str]:
+    """Top10 piores somente por scoreFinal (compat fluxo A)."""
+    t = detect_analises_table(conn)
+    if not table_exists(conn, "indicadores"):
+        return []
+    sql = f"""
+        SELECT p.nomePerito, i.scoreFinal, COUNT(a.protocolo) AS total_analises
+          FROM indicadores i
+          JOIN peritos p  ON i.perito = p.siapePerito
+          JOIN {t} a      ON a.siapePerito = i.perito
+         WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
+         GROUP BY p.nomePerito, i.scoreFinal
+        HAVING total_analises >= ?
+         ORDER BY i.scoreFinal DESC, total_analises DESC
+         LIMIT 10
+    """
+    rows = conn.execute(sql, (start, end, min_analises)).fetchall()
+    return [r[0] for r in rows]
+
+def _top10_fluxo_b(conn: sqlite3.Connection, df_periodo_parsed: pd.DataFrame,
+                   start: str, end: str, min_analises: int) -> List[str]:
+    """
+    Gate: %NC_perito ≥ 2× p_BR e N ≥ min_analises.
+    Ranking: scoreFinal (se disponível). Caso não haja 'indicadores', retorna só os gated (até 10).
+    """
+    # p_br no período
+    tot = len(df_periodo_parsed)
+    if tot == 0:
+        return []
+    p_br = df_periodo_parsed['nc_flag'].sum() / tot
+
+    base = df_periodo_parsed.groupby("nomePerito").agg(
+        N=("protocolo","count"),
+        NC=("nc_flag","sum")
+    ).reset_index()
+    base["p_hat"] = base["NC"] / base["N"].replace(0, np.nan)
+    gated = base.loc[(base["N"] >= int(min_analises)) & (base["p_hat"] >= 2.0 * float(p_br))].copy()
+    if gated.empty:
+        return []
+
+    # ranking por scoreFinal se houver
+    scores = _scores_df(conn)
+    if scores.empty:
+        out = gated.sort_values(["NC","N"], ascending=[False, False]).head(10)["nomePerito"].tolist()
+        return out
+
+    merged = gated.merge(scores, on="nomePerito", how="left")
+    merged["scoreFinal"] = pd.to_numeric(merged["scoreFinal"], errors="coerce").fillna(0.0)
+    out = merged.sort_values(["scoreFinal","NC","N"], ascending=[False, False, False]).head(10)["nomePerito"].tolist()
+    return out
 
 # -----------------------
 # Gráfico
@@ -623,7 +717,7 @@ def _gerar_comentario_composto(payload: Dict[str, Any], call_api: bool, max_word
     return _cap_words(_to_one_paragraph(_strip_markers(fb)), max_words)
 
 # -----------------------
-# CLI e pipeline
+# CLI e pipeline (compat make_kpi_report)
 # -----------------------
 
 def parse_args() -> argparse.Namespace:
@@ -633,9 +727,13 @@ def parse_args() -> argparse.Namespace:
 
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument('--perito', help='Nome exato do perito')
-    g.add_argument('--top10', action='store_true', help='Usa os 10 piores por scoreFinal (no período)')
+    g.add_argument('--top10', action='store_true', help='Usa os 10 piores (ver --fluxo)')
 
-    ap.add_argument('--min-analises', type=int, default=50, help='Mínimo p/ elegibilidade ao Top10 (padrão: 50)')
+    # compat: controle de DB/out-dir como no wrapper
+    ap.add_argument('--db', default=DB_PATH, help='Caminho do SQLite (padrão: db/atestmed.db)')
+    ap.add_argument('--out-dir', default=EXPORT_DIR, help='Diretório de saída (padrão: graphs_and_tables/exports)')
+
+    ap.add_argument('--min-analises', type=int, default=50, help='Mínimo p/ elegibilidade ao Top10 [50]')
     ap.add_argument('--alvo-prod', type=float, default=50.0, help='Alvo de produtividade (análises/h) [50]')
 
     # cortes (opcionais)
@@ -653,26 +751,33 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--call-api', action='store_true', help='Chama a API (utils.comentarios) ou OpenAI local para obter o texto final do comentário')
     ap.add_argument('--chart', action='store_true', help='Gráfico ASCII no terminal')
 
+    # ╭───────────────────────────────────── compat wrapper ─────────────────────────────────────╮
+    # │ ver make_kpi_report: --peritos-csv / --scope-csv / --save-manifests / --fluxo (A/B)     │
+    # ╰─────────────────────────────────────────────────────────────────────────────────────────╯
+    ap.add_argument('--peritos-csv', default=None, help="(Opcional) CSV com lista de peritos (coluna nomePerito). Se informado, sobrescreve a seleção Top10/--perito.")
+    ap.add_argument('--scope-csv', default=None, help="(Opcional) CSV com peritos que definem o ESCOPO da base para gráficos (ex.: coorte do gate do fluxo B).")
+    ap.add_argument('--save-manifests', action='store_true', help="Salvar CSVs com Top10 e escopo (gate) usados neste run.")
+    ap.add_argument('--fluxo', choices=['A','B'], default='B',
+                    help="B (padrão): gate %%NC ≥ 2× Brasil e ranking por scoreFinal; A: Top 10 direto por scoreFinal.")
+    # ───────────────────────────────────────────────────────────────────────────────────────────
+
+    # flag inócua para compatibilidade (ignoramos se passada pelo wrapper global)
+    ap.add_argument('--export-protocols', action='store_true', help=argparse.SUPPRESS)
+
     return ap.parse_args()
 
-def top10_names(conn: sqlite3.Connection, start: str, end: str, min_analises: int) -> List[str]:
-    t = detect_analises_table(conn)
-    sql = f"""
-        SELECT p.nomePerito, i.scoreFinal, COUNT(a.protocolo) AS total_analises
-          FROM indicadores i
-          JOIN peritos p ON p.siapePerito = i.perito
-          JOIN {t} a     ON a.siapePerito = i.perito
-         WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
-         GROUP BY p.nomePerito, i.scoreFinal
-        HAVING total_analises >= ?
-         ORDER BY i.scoreFinal DESC, total_analises DESC
-         LIMIT 10
-    """
-    rows = conn.execute(sql, (start, end, min_analises)).fetchall()
-    return [r[0] for r in rows]
+# -----------------------
+# Main
+# -----------------------
 
 def main():
     args = parse_args()
+
+    # sobrescreve caminhos globais se vierem por CLI (compat)
+    global DB_PATH, EXPORT_DIR
+    DB_PATH = args.db
+    EXPORT_DIR = args.out_dir
+    os.makedirs(EXPORT_DIR, exist_ok=True)
 
     with sqlite3.connect(DB_PATH) as conn:
         df = load_period(conn, args.start, args.end)
@@ -682,38 +787,75 @@ def main():
         print("⚠️ Sem dados no período.")
         return
 
-    if args.top10:
+    # aplica escopo, se fornecido (compat make_kpi_report)
+    df_scoped = _apply_scope(df, args.scope_csv)
+
+    # Seleção do grupo (perito ou top10)
+    if args.peritos_csv:
+        names_set = _load_names_from_csv(args.peritos_csv) or set()
+        if not names_set:
+            print("⚠️ --peritos-csv não pôde ser lido ou está sem coluna 'nomePerito'.")
+            return
+        grupo = sorted({n for n in df_scoped['nomePerito'].unique()
+                        if n.strip().upper() in names_set})
+        if not grupo:
+            print("⚠️ Nenhum perito do CSV encontrado no período/escopo.")
+            return
+        grp_title = "Top 10 piores" if args.top10 else "Seleção CSV"
+    elif args.top10:
         with sqlite3.connect(DB_PATH) as conn:
-            grupo = top10_names(conn, args.start, args.end, args.min_analises)
+            if args.fluxo.upper() == "B":
+                grupo = _top10_fluxo_b(conn, df, args.start, args.end, args.min_analises)
+            else:
+                grupo = _top10_fluxo_a(conn, args.start, args.end, args.min_analises)
         if not grupo:
             print("⚠️ Nenhum perito elegível ao Top10 no período.")
             return
         grp_title = "Top 10 piores"
     else:
         if not args.perito:
-            print("ERRO: informe --perito ou --top10.")
+            print("ERRO: informe --perito, --top10 ou --peritos-csv.")
             return
         grupo = [args.perito]
         grp_title = args.perito
 
-    # painéis e estatísticas BR-excl.
-    grp_panel, br_panel, mdf_b = build_panels(df, grupo, args.alvo_prod)
+    # painéis e estatísticas BR-excl. (sempre sobre df_scoped — respeita --scope-csv)
+    grp_panel, br_panel, mdf_b = build_panels(df_scoped, grupo, args.alvo_prod)
     br_stats = compute_br_stats(mdf_b)
 
     # contagem de cortes
     cut_hits = count_cut_hits(
-        df, grupo, args.alvo_prod,
+        df_scoped, grupo, args.alvo_prod,
         cut_nc_pct=args.cut_nc_pct,
         cut_prod_pct=args.cut_prod_pct,
         cut_le15s_pct=args.cut_le15s_pct,
         cut_overlap_pct=args.cut_overlap_pct
     )
 
-    # montar arquivos
+    # nomes de saída
     safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in grp_title).strip("_")
     png_name = "indicadores_composto_top10.png" if args.top10 else f"indicadores_composto_{safe}.png"
     org_name = "indicadores_composto_top10.org" if args.top10 else f"indicadores_composto_{safe}.org"
 
+    # opcionalmente salva manifests (compat wrapper)
+    if args.save_manifests and args.top10:
+        try:
+            peritos_csv_path = os.path.join(EXPORT_DIR, "top10_peritos.csv")
+            pd.DataFrame({"nomePerito": grupo, "rank": range(1, len(grupo)+1),
+                          "fluxo": args.fluxo, "start": args.start, "end": args.end}
+                        ).to_csv(peritos_csv_path, index=False, encoding="utf-8")
+            print(f"🗂️  top10_peritos.csv salvo em {peritos_csv_path}")
+            if args.fluxo.upper() == "B" and args.scope_csv:
+                # se o escopo veio externamente, replique como manifest
+                scope_csv_path = os.path.join(EXPORT_DIR, "scope_gate_b.csv")
+                pd.DataFrame({"nomePerito": sorted({n for n in df['nomePerito'].unique()
+                                                   if n.strip().upper() in (_load_names_from_csv(args.scope_csv) or set())})}
+                            ).to_csv(scope_csv_path, index=False, encoding="utf-8")
+                print(f"🗂️  scope_gate_b.csv salvo em {scope_csv_path}")
+        except Exception as e:
+            print(f"[WARN] Falha salvando manifests: {e}")
+
+    # gerar PNG
     png_path = None
     if args.export_png:
         png_path = plot_png(
@@ -726,8 +868,8 @@ def main():
             out_path=os.path.join(EXPORT_DIR, png_name)
         )
 
+    # gerar ORG (e comentário, se pedido)
     if args.export_org or args.export_comment or args.export_comment_org:
-        # garanta PNG para figlink no .org
         if not png_path:
             png_path = plot_png(
                 start=args.start, end=args.end,
@@ -755,12 +897,12 @@ def main():
             out_name=org_name
         )
 
-        # Se for salvar comentário (.md) ou incorporar no .org, gere o texto uma única vez
+        # comentário
         if args.export_comment or args.export_comment_org:
             payload = {
                 "period": (args.start, args.end),
                 "grp_title": grp_title,
-                "grupo": "top10" if args.top10 else "perito",
+                "grupo": "top10" if (args.top10 or args.peritos_csv) else "perito",
                 "alvo_prod": args.alvo_prod,
                 "metrics": grp_panel,
                 "br_metrics": br_panel,
@@ -768,7 +910,6 @@ def main():
                 "cuts": cuts_dict,
                 "cut_hits": cut_hits,
             }
-            # ativa API automaticamente se houver OPENAI_API_KEY, mesmo sem --call-api
             call_api = bool(args.call_api or _load_openai_key_from_dotenv())
             comment_text = _gerar_comentario_composto(payload, call_api=call_api)
 
@@ -778,7 +919,6 @@ def main():
                 print(f"✅ Comentário salvo em: {cpath}")
 
             if args.export_comment_org:
-                # Anexa ao .org sob uma seção própria
                 with open(org_path, "a", encoding="utf-8") as f:
                     f.write("\n** Comentário\n")
                     f.write(comment_text.strip() + "\n")
@@ -805,7 +945,7 @@ def main():
                 p.show()
             except Exception:
                 p.clear_data()
-                p.bar([grp_title, 'Brasil (excl.)'], [1, 1])  # placeholder para não quebrar
+                p.bar([grp_title, 'Brasil (excl.)'], [1, 1])  # placeholder
                 p.title("plotext incompatível; exibição simplificada")
                 p.show()
 

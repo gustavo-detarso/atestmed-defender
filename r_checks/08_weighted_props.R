@@ -1,9 +1,94 @@
 #!/usr/bin/env Rscript
+# ---- Auto-normalized header (injected by run_r_checks_autofix.py) ----
+options(stringsAsFactors = FALSE)
+options(encoding = "UTF-8")
+options(warn = 1)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+Sys.setlocale(category = "LC_ALL", locale = "C.UTF-8")
+# ----------------------------------------------------------------------
 
 suppressPackageStartupMessages({
+
+# --- hardening: garanta am_resolve_export_dir mesmo sem _common.R ---
+if (!exists("am_resolve_export_dir", mode = "function", inherits = TRUE)
+
+) {
+  `%||%` <- function(a,b) if (is.null(a)) b else a
+  am_resolve_export_dir <- function(out_dir = NULL) {
+    od <- if (!is.null(out_dir) && nzchar(out_dir)) {
+      normalizePath(out_dir, mustWork = FALSE)
+    } else {
+      dbp <- tryCatch(am_args[["db"]], error = function(e) NULL) %||% ""
+      base_dir <- if (nzchar(dbp)) normalizePath(file.path(dirname(dbp), ".."), mustWork = FALSE) else getwd()
+      file.path(base_dir, "graphs_and_tables", "exports")
+    }
+    if (!dir.exists(od)) dir.create(od, recursive = TRUE, showWarnings = FALSE)
+    od
+  }
+}
   library(DBI); library(RSQLite)
-  library(dplyr); library(ggplot2); library(scales); library(stringr); library(tibble)
+  library(dplyr); library(ggplot2); library(scales); library(stringr); library(tibble); library(readr)
 })
+
+# --- begin: am_db_reconnect_helpers ---
+if (!exists("am_safe_disconnect", mode="function", inherits=TRUE)) {
+  am_safe_disconnect <- function(con) {
+    try({
+      if (inherits(con, "DBIConnection") && DBI::dbIsValid(con)) DBI::dbDisconnect(con)
+    }, silent=TRUE)
+  }
+}
+if (!exists("am__db_path_guess", mode="function", inherits=TRUE)) {
+  am__db_path_guess <- function() {
+    tryCatch({
+      if (exists("am_args", inherits=TRUE)) {
+        p <- tryCatch(am_args[["db"]], error=function(e) NULL)
+        if (!is.null(p) && nzchar(p)) return(p)
+      }
+      if (exists("opt", inherits=TRUE)) {
+        p <- tryCatch(opt$db, error=function(e) NULL)
+        if (!is.null(p) && nzchar(p)) return(p)
+      }
+      NULL
+    }, error=function(e) NULL)
+  }
+}
+if (!exists("am_ensure_con", mode="function", inherits=TRUE)) {
+  am_ensure_con <- function(con) {
+    if (inherits(con, "DBIConnection") && DBI::dbIsValid(con)) return(con)
+    dbp <- am__db_path_guess()
+    if (is.null(dbp) || !nzchar(dbp)) stop("am_ensure_con: caminho do DB desconhecido")
+    DBI::dbConnect(RSQLite::SQLite(), dbname = dbp)
+  }
+}
+if (!exists("am_dbGetQuery", mode="function", inherits=TRUE)) {
+  am_dbGetQuery <- function(con, ...) { con <- am_ensure_con(con); DBI::dbGetQuery(con, ...) }
+}
+if (!exists("am_dbReadTable", mode="function", inherits=TRUE)) {
+  am_dbReadTable <- function(con, ...) { con <- am_ensure_con(con); DBI::dbReadTable(con, ...) }
+}
+if (!exists("am_dbListFields", mode="function", inherits=TRUE)) {
+  am_dbListFields <- function(con, ...) { con <- am_ensure_con(con); DBI::dbListFields(con, ...) }
+}
+# --- fix: am_dbQuoteIdentifier sem recursão ---
+if (!exists("am_dbQuoteIdentifier", mode="function", inherits=TRUE)) {
+  am_dbQuoteIdentifier <<- (function(.f){
+    force(.f)
+    function(con, ...) {
+      con <- am_ensure_con(con)
+      as.character(.f(con, ...))
+    }
+  })(DBI::dbQuoteIdentifier)
+}
+# --- fim do fix ---
+
+# --- end: am_db_reconnect_helpers ---
+
+
+
+
+
+
 
 # ==== ATESTMED PROLOGO (INICIO) ====
 local({
@@ -43,6 +128,8 @@ local({
   }
 })
 # ==== ATESTMED PROLOGO (FIM) ====
+
+
 # ---- CLI fallback (ATESTMED) ----
 if (!exists("start_d", inherits=TRUE) ||
     !exists("end_d", inherits=TRUE) ||
@@ -53,9 +140,10 @@ if (!exists("start_d", inherits=TRUE) ||
     !exists("measure", inherits=TRUE) ||
     !exists("export_dir", inherits=TRUE) ||
     !exists("con", inherits=TRUE) ||
-    !exists("a_tbl", inherits=TRUE)) {
+    !exists("a_tbl", inherits=TRUE) ||
+    !exists("peritos_csv", inherits=TRUE)) {
 
-  .args <- commandArgs(trailingOnly=TRUE)
+  .args <- base::commandArgs(TRUE)
   .kv <- list(); i <- 1L; n <- length(.args)
   while (i <= n) {
     k <- .args[[i]]
@@ -68,14 +156,15 @@ if (!exists("start_d", inherits=TRUE) ||
 
   `%||%` <- function(a,b) if (is.null(a)) b else a
 
-  start_d   <- if (!exists("start_d", inherits=TRUE))   .kv[["start"]]   else start_d
-  end_d     <- if (!exists("end_d", inherits=TRUE))     .kv[["end"]]     else end_d
-  perito    <- if (!exists("perito", inherits=TRUE))    (.kv[["perito"]] %||% NULL) else perito
-  top10     <- if (!exists("top10", inherits=TRUE))     isTRUE(.kv[["top10"]]) else top10
-  min_n     <- if (!exists("min_n", inherits=TRUE))     suppressWarnings(as.integer(.kv[["min-analises"]] %||% .kv[["min_analises"]] %||% "50")) else min_n
-  threshold <- if (!exists("threshold", inherits=TRUE)) suppressWarnings(as.numeric(.kv[["threshold"]] %||% "15")) else threshold
-  measure   <- if (!exists("measure", inherits=TRUE))   as.character((.kv[["measure"]] %||% "nc")) else measure
+  start_d     <- if (!exists("start_d", inherits=TRUE))     .kv[["start"]]   else start_d
+  end_d       <- if (!exists("end_d", inherits=TRUE))       .kv[["end"]]     else end_d
+  perito      <- if (!exists("perito", inherits=TRUE))      (.kv[["perito"]] %||% NULL) else perito
+  top10       <- if (!exists("top10", inherits=TRUE))       isTRUE(.kv[["top10"]]) else top10
+  min_n       <- if (!exists("min_n", inherits=TRUE))       suppressWarnings(as.integer(.kv[["min-analises"]] %||% .kv[["min_analises"]] %||% "50")) else min_n
+  threshold   <- if (!exists("threshold", inherits=TRUE))   suppressWarnings(as.numeric(.kv[["threshold"]] %||% "15")) else threshold
+  measure     <- if (!exists("measure", inherits=TRUE))     as.character((.kv[["measure"]] %||% "nc")) else measure
   if (is.character(measure)) measure <- measure[[1L]]
+  peritos_csv <- if (!exists("peritos_csv", inherits=TRUE)) (.kv[["peritos-csv"]] %||% NULL) else peritos_csv
 
   if (!exists("export_dir", inherits=TRUE) || is.null(export_dir)) {
     db_path <- .kv[["db"]]
@@ -91,7 +180,7 @@ if (!exists("start_d", inherits=TRUE) ||
     if (!exists("am_detect_analises_table", mode="function", inherits=TRUE)) {
       am_detect_analises_table <<- function(con) {
         has <- function(nm) {
-          out <- tryCatch(DBI::dbGetQuery(con,
+          out <- tryCatch(DBI::dbGetQuery((con <- am_ensure_con(con)),
             "SELECT 1 FROM sqlite_master WHERE type in ('table','view') AND name=? LIMIT 1",
             params=list(nm)), error=function(e) NULL)
           !is.null(out) && is.data.frame(out) && nrow(out) > 0
@@ -103,24 +192,16 @@ if (!exists("start_d", inherits=TRUE) ||
     if (!exists("am_detect_columns", mode="function", inherits=TRUE)) {
       am_detect_columns <<- function(con, tbl) {
         if (is.na(tbl) || !nzchar(tbl)) return(character(0))
-        DBI::dbGetQuery(con, sprintf("PRAGMA table_info(%s)", tbl))$name
+        DBI::dbGetQuery((con <- am_ensure_con(con)), sprintf("PRAGMA table_info(%s)", tbl))$name
       }
     }
 
     a_tbl <- tryCatch(am_detect_analises_table(con), error=function(e) NA_character_)
     cols  <- tryCatch(am_detect_columns(con, a_tbl), error=function(e) character(0))
 
-    on.exit({
-      try({ if (exists("con", inherits=TRUE)) DBI::dbDisconnect(con) }, silent=TRUE)
-      try({ conns <- DBI::dbListConnections(RSQLite::SQLite()); for (cc in conns) try(DBI::dbDisconnect(cc), silent=TRUE) }, silent=TRUE)
-    }, add=TRUE)
+    # (patch) removido on.exit de desconexão precoce
   }
 }
-
-
-
-
-
 
 # ---------------- Helpers locais ----------------
 `%||%` <- function(a,b) if (is.null(a)) b else a
@@ -160,7 +241,15 @@ write_org_bundle <- function(png_base, caption, metodo_txt, interpreta_txt, org_
   if (!is.null(md_out)) writeLines(comm_txt, md_out, useBytes = TRUE)
 }
 
-get_top10_names <- function(con, start_date, end_date, min_n=50) {
+load_names_csv <- function(path) {
+  if (is.null(path) || !nzchar(path) || !file.exists(path)) return(character(0))
+  df <- tryCatch(readr::read_csv(path, show_col_types = FALSE), error=function(e) NULL)
+  if (is.null(df) || !nrow(df)) return(character(0))
+  key <- if ("nomePerito" %in% names(df)) "nomePerito" else names(df)[1]
+  out <- unique(trimws(as.character(df[[key]]))); out[nzchar(out)]
+}
+
+get_top10_names_legacy <- function(con, start_date, end_date, min_n=50) {
   q <- sprintf("
     SELECT p.nomePerito AS perito, i.scoreFinal, COUNT(a.protocolo) AS total_analises
       FROM indicadores i
@@ -176,7 +265,16 @@ get_top10_names <- function(con, start_date, end_date, min_n=50) {
   if (nrow(df) == 0) character(0) else df$perito
 }
 
-build_agg_query <- function(measure, threshold, start_date, end_date) {
+detect_duration_expr <- function(con, a_tbl) {
+  cols <- tryCatch(am_detect_columns(con, a_tbl), error=function(e) character(0))
+  cand <- intersect(cols, c("tempoAnaliseSeg","tempoAnalise","duracaoSegundos","duracao_seg","tempo_seg"))
+  if (length(cand)) return(sprintf("CAST(a.%s AS REAL)", cand[[1]]))
+  if (all(c("dataHoraIniPericia","dataHoraFimPericia") %in% cols))
+    return("((julianday(a.dataHoraFimPericia) - julianday(a.dataHoraIniPericia)) * 86400.0)")
+  NULL
+}
+
+build_agg_query <- function(measure, threshold, start_date, end_date, con, a_tbl) {
   if (tolower(measure) == "nc") {
     title_txt <- "Meta-análise simples: Não Conformidade (NC robusto)"
     ylab_txt  <- "Proporção de NC"
@@ -199,17 +297,21 @@ build_agg_query <- function(measure, threshold, start_date, end_date) {
     ", a_tbl, start_date, end_date)
   } else if (tolower(measure) == "le") {
     title_txt <- sprintf("Meta-análise simples: ≤ %ds", as.integer(threshold))
-    ylab_txt  <- "Proporção (≤ threshold)"
+    ylab_txt  <- "Proporção (≤ threshold, entre válidas)"
     meas_tag  <- sprintf("le%ds", as.integer(threshold))
+    dur_expr  <- detect_duration_expr(con, a_tbl)
+    if (is.null(dur_expr)) stop("Sem coluna de duração nem (início/fim) para calcular 'LE'.")
     sql <- sprintf("
       SELECT p.nomePerito AS perito,
-             SUM( ((julianday(a.dataHoraFimPericia) - julianday(a.dataHoraIniPericia)) * 86400) <= %d ) AS x,
-             COUNT(*) AS n
+             SUM(CASE WHEN (%s) > 0 AND (%s) <= 3600 AND (%s) <= %d THEN 1 ELSE 0 END) AS x,
+             SUM(CASE WHEN (%s) > 0 AND (%s) <= 3600 THEN 1 ELSE 0 END)                AS n
         FROM %s a
         JOIN peritos  p ON a.siapePerito = p.siapePerito
        WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN '%s' AND '%s'
        GROUP BY p.nomePerito
-    ", as.integer(threshold), a_tbl, start_date, end_date)
+    ", dur_expr, dur_expr, dur_expr, as.integer(threshold),
+       dur_expr, dur_expr,
+       a_tbl, start_date, end_date)
   } else {
     stop("Valor inválido para --measure. Use 'nc' ou 'le'.")
   }
@@ -233,7 +335,7 @@ plot_two_groups <- function(df_plot, title_txt, subtitle_txt, ylab_txt, outfile)
   gg <- ggplot(df_plot, aes(Grupo, prop)) +
     geom_col(aes(fill=Grupo), width=.55, alpha=.9, show.legend = FALSE) +
     scale_fill_manual(values = df_plot$fill) +
-    geom_errorbar(aes(ymin=lo, ymax=hi), width=.15, linewidth=.5, na.rm = TRUE) +  # <- aqui
+    geom_errorbar(aes(ymin=lo, ymax=hi), width=.15, linewidth=.5, na.rm = TRUE) +
     geom_text(aes(y = ifelse(label_inside, prop - 0.02, y_label), label = label_text),
               color = ifelse(df_plot$prop > 0.85, "white", "black"),
               vjust = ifelse(df_plot$prop > 0.85, 1.2, -0.35),
@@ -262,7 +364,6 @@ make_names_top10 <- function(tag) {
   list(png=png, org=org, orgc=orgc, md=md)
 }
 
-# ---- Pequenos fixes automáticos (ATESTMED) ----
 # ---------------- Execução ----------------
 
 # Checagens básicas
@@ -271,10 +372,10 @@ if (!top10 && is.null(perito)) stop("Informe --perito ou --top10.")
 if (top10 && !is.null(perito)) stop("Use OU --perito OU --top10, não ambos.")
 
 # 1) agrega x/n por perito para a métrica desejada
-spec <- build_agg_query(measure, threshold, start_d, end_d)
+spec <- build_agg_query(measure, threshold, start_d, end_d, con, a_tbl)
 agg  <- am_dbGetQuery(con, spec$sql)
 
-# Se não houver dados no período, já gera artefatos de falha
+# Saída imediata se não houver dados
 if (nrow(agg) == 0) {
   if (!top10) {
     per_safe <- safe(perito %||% "perito")
@@ -291,7 +392,7 @@ if (nrow(agg) == 0) {
     nm <- make_names_top10(spec$tag)
     ggsave(nm$png, fail_plot("Top 10: sem dados no período."), width=8, height=5, dpi=160)
     metodo_txt <- paste0(
-      "*Método.* Comparamos duas proporções (Top 10 piores por scoreFinal vs Brasil (excl.)) ",
+      "*Método.* Comparamos duas proporções (Top 10 vs Brasil (excl.)) ",
       "para a métrica '", measure, "' no período ", start_d, "–", end_d,
       ", com IC de Wilson e teste z de duas proporções (pooled)."
     )
@@ -365,18 +466,26 @@ if (!top10) {
   write_org_bundle(nm$png, spec$title, metodo_txt, interp_txt, nm$org, nm$orgc, nm$md)
 
 } else {
-  # ---------------- modo top10 ----------------
-  top10_names <- get_top10_names(con, start_d, end_d, min_n)
-
+  # ---------------- modo top10 (Fluxo/legado) ----------------
   nm <- make_names_top10(spec$tag)
+
+  manifest_names <- load_names_csv(peritos_csv)
+  if (length(manifest_names)) {
+    top10_names <- unique(head(manifest_names, 10L))
+    sel_caption <- "Seleção: lista externa (manifest) — alinhada ao Fluxo."
+  } else {
+    top10_names <- get_top10_names_legacy(con, start_d, end_d, min_n)
+    sel_caption <- "Seleção: Top10 por scoreFinal (legado)."
+  }
 
   if (length(top10_names) == 0) {
     ggsave(nm$png, fail_plot("Top 10: nenhum perito encontrado com os critérios no período."), width=8, height=5, dpi=160)
     metodo_txt <- paste0(
-      "*Método.* Comparamos a métrica '", measure, "' entre o grupo Top 10 piores (scoreFinal) ",
-      "e o Brasil (excl.), com IC de Wilson e teste z de duas proporções (pooled)."
+      "*Método.* Comparamos a métrica '", measure, "' entre o grupo Top 10 ",
+      "e o Brasil (excl.), com IC de Wilson e teste z de duas proporções (pooled). ",
+      sel_caption
     )
-    interpreta_txt <- "Sem peritos elegíveis no período para compor o Top 10."
+    interpreta_txt <- "Sem peritos elegíveis no período para compor o grupo-alvo."
     write_org_bundle(nm$png, spec$title, metodo_txt, interpreta_txt, nm$org, nm$orgc, nm$md)
     quit(save="no")
   }
@@ -391,7 +500,7 @@ if (!top10) {
   zt    <- z_test_2props(grp$x, grp$n, oth$x, oth$n)
 
   plot_df <- tibble(
-    Grupo = factor(c("Top 10 piores", "Brasil (excl.)"), levels=c("Top 10 piores", "Brasil (excl.)")),
+    Grupo = factor(c("Grupo-alvo", "Brasil (excl.)"), levels=c("Grupo-alvo", "Brasil (excl.)")),
     prop  = c(g_hat, o_hat),
     lo    = c(g_ci[1], o_ci[1]),
     hi    = c(g_ci[2], o_ci[2]),
@@ -399,12 +508,13 @@ if (!top10) {
     x     = c(grp$x, oth$x)
   )
 
-  subtitle_txt <- sprintf("Período: %s a %s | Top10 n=%d (%s) vs Brasil n=%d | z=%s, p=%s",
+  subtitle_txt <- sprintf("Período: %s a %s | Alvo n=%d (%s) vs Brasil n=%d | z=%s, p=%s | %s",
                           start_d, end_d, grp$n,
                           paste(head(top10_names, 5), collapse = ", "),
                           oth$n,
                           ifelse(is.na(zt$z), "NA", sprintf("%.2f", zt$z)),
-                          ifelse(is.na(zt$p), "NA", ifelse(zt$p < 0.001, "<0.001", sprintf("%.3f", zt$p))))
+                          ifelse(is.na(zt$p), "NA", ifelse(zt$p < 0.001, "<0.001", sprintf("%.3f", zt$p))),
+                          sel_caption)
 
   plot_two_groups(plot_df, spec$title, subtitle_txt, spec$ylab, nm$png)
 
@@ -415,13 +525,14 @@ if (!top10) {
   }
 
   metodo_txt <- paste0(
-    "*Método.* Comparamos a ", what_txt, " do grupo *Top 10 piores por scoreFinal* ",
-    "contra o Brasil (excl.) no período ", start_d, "–", end_d,
-    ". Estimativas com IC 95%% de Wilson; diferença testada via z de duas proporções (pooled)."
+    "*Método.* Comparamos a ", what_txt, " do *grupo-alvo* contra o Brasil (excl.) ",
+    "no período ", start_d, "–", end_d,
+    ". Estimativas com IC 95%% de Wilson; diferença testada via z de duas proporções (pooled). ",
+    sel_caption
   )
 
   interp_txt <- paste0(
-    "*Interpretação.* Top 10: ", percent_s(g_hat), " (", grp$x, "/", grp$n, "); ",
+    "*Interpretação.* Grupo-alvo: ", percent_s(g_hat), " (", grp$x, "/", grp$n, "); ",
     "Brasil (excl.): ", percent_s(o_hat), " (", oth$x, "/", oth$n, "). ",
     "Diferença ",
     if (is.finite(g_hat) && is.finite(o_hat)) sprintf("= %s", percent_s(g_hat - o_hat)) else "= NA",

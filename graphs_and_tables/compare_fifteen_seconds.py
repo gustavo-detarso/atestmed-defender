@@ -5,14 +5,17 @@
 Perícias ≤ THRESHOLD s — comparação em %
 - Modo 1: --perito "NOME"  vs Brasil (excluindo esse perito)
 - Modo 2: --top10 (10 piores por scoreFinal no período) vs Brasil (excluindo o grupo)
+- Modo 3: --peritos-csv <arquivo.csv>  (usa EXATAMENTE esses peritos como grupo)
+         [opcional] --scope-csv <arquivo.csv>  (restringe o "Brasil (excl.)" ao escopo)
+         [opcional] --fluxo A|B  (apenas para log/telemetria)
 
-Pipeline alinhado ao compare_indicadores_composto:
-1) Carrega dados do período e NORMALIZA durações via parse_durations do
-   compare_indicadores_composto (se disponível). Fallback replica o mesmo:
-   - dur_s por fim−início (preferência), fallback HH:MM:SS/MM:SS/numérico,
-   - remove inválidos/≤0 e > 3600s (1h).
+Regras de limpeza e métrica:
+1) Durações normalizadas:
+   - Preferência: fim−início (segundos).
+   - Fallback: HH:MM:SS / MM:SS / numérico.
+   - Exclui inválidos/≤0 e > 3600s (1h).
 
-2) Cálculo pedido:
+2) Métrica (com corte por perito no numerador):
    - Denominador = total de protocolos do grupo no período (linhas após limpeza).
    - Numerador   = soma das tarefas ≤ threshold **apenas** dos peritos que,
      individualmente, tenham ≥ cut_n tarefas ≤ threshold no período.
@@ -20,19 +23,21 @@ Pipeline alinhado ao compare_indicadores_composto:
 
 Exportações:
     --export-png           (gráfico PNG)
-    --export-org           (arquivo .org com :PROPERTIES:, tabela e imagem)
-    --export-comment       (arquivo *_comment.org com comentário automático)
-    --export-comment-org   (incorpora o comentário no .org principal)
-    --call-api             (liga a chamada da API p/ gerar o comentário via utils/comentarios/OpenAI)
+    --export-org           (.org com :PROPERTIES:, tabela e imagem)
+    --export-comment       (.org separado com comentário automático)
+    --export-comment-org   (incorpora comentário no .org principal)
+    --call-api             (tenta gerar comentário via OpenAI; senão heurístico)
     --chart                (gráfico ASCII no terminal)
 """
 
 from __future__ import annotations
+
 import os
-import sys
 import re
-import sqlite3
+import sys
+import json
 import argparse
+import sqlite3
 from typing import Tuple, List, Optional, Callable, Dict, Any
 
 import matplotlib
@@ -40,39 +45,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 try:
-    import plotext as p  # opcional (--chart) e p/ ASCII no comentário
+    import plotext as p  # opcional (--chart)
 except Exception:
     p = None
-
-def _px_build() -> str:
-    """Compat: retorna o buffer ASCII do plotext se disponível."""
-    if p is None:
-        return ""
-    b = getattr(p, "build", None)
-    try:
-        return b() if callable(b) else ""
-    except Exception:
-        return ""
-
-import importlib
-import importlib.util
 
 try:
     import pandas as pd
 except Exception as e:
     raise RuntimeError("Pandas é necessário para este script.") from e
 
+import importlib
+import importlib.util
 from pathlib import Path
-
-# Preferência: usar utils/comentarios.comentar_le15s se existir (fallback caso não haja API direta)
-_COMENT_FUNCS: List[Callable[..., Any]] = []
-try:
-    # Assinatura moderna preferida:
-    # comentar_le15s(md_table, ascii_chart, start, end, threshold, cut_n, *, call_api=True, model=..., ...)
-    from utils.comentarios import comentar_le15s as _cf_le15s  # type: ignore
-    _COMENT_FUNCS.append(_cf_le15s)
-except Exception:
-    pass
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Paths
@@ -83,8 +67,17 @@ EXPORT_DIR = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# OpenAI helpers (API direta por VALORES)
+# Comentários (API externa ou heurística local)
 # ────────────────────────────────────────────────────────────────────────────────
+_COMENT_FUNCS: List[Callable[..., Any]] = []
+try:
+    # Assinatura moderna preferida:
+    # comentar_le15s(md_table, ascii_chart, start, end, threshold, cut_n, *, call_api=True, model=..., ...)
+    from utils.comentarios import comentar_le15s as _cf_le15s  # type: ignore
+    _COMENT_FUNCS.append(_cf_le15s)
+except Exception:
+    pass
+
 def _load_openai_key_from_dotenv(env_path: str) -> Optional[str]:
     """Carrega OPENAI_API_KEY do .env (python-dotenv se disponível; senão parse manual)."""
     if not os.path.exists(env_path):
@@ -138,7 +131,7 @@ def _call_openai_chat(messages: List[Dict[str, str]], model: str, temperature: f
     return None
 
 def _sanitize_paragraph(text: str, max_words: int = 180) -> str:
-    """Limpa cercas, cabeçalhos, tabelas e compacta em um parágrafo com limite de palavras."""
+    """Remove cercas/headers/tabelas e limita nº de palavras para 1 parágrafo."""
     if not text:
         return ""
     text = re.sub(r"^```.*?$", "", text, flags=re.M)
@@ -235,7 +228,7 @@ def _comment_from_values_leq(start: str, end: str,
     )
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Import helpers (usa parse_durations do módulo que funcionou)
+# Import de módulo para reaproveitar parse_durations (se existir)
 # ────────────────────────────────────────────────────────────────────────────────
 def _import_composto_module():
     candidates = [
@@ -247,7 +240,7 @@ def _import_composto_module():
             return importlib.import_module(modname)
         except Exception:
             pass
-    fallback_path = "/mnt/data/compare_indicadores_composto.py"
+    fallback_path = os.path.join(BASE_DIR, "graphs_and_tables", "compare_indicadores_composto.py")
     if os.path.exists(fallback_path):
         spec = importlib.util.spec_from_file_location("compare_indicadores_composto", fallback_path)
         if spec and spec.loader:
@@ -299,7 +292,7 @@ def _load_period_df(conn: sqlite3.Connection, tbl: str, start: str, end: str) ->
     return df
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Duração: fallback compatível
+# Duração
 # ────────────────────────────────────────────────────────────────────────────────
 def _parse_durations_fallback(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -351,7 +344,7 @@ def _parse_durations(df: pd.DataFrame) -> pd.DataFrame:
     return _parse_durations_fallback(df)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Top 10
+# Top 10 por score (Fluxo A)
 # ────────────────────────────────────────────────────────────────────────────────
 def _top10_names(conn: sqlite3.Connection, tbl: str,
                  start: str, end: str, min_analises: int) -> List[str]:
@@ -402,7 +395,7 @@ def _sum_tot_and_leq_with_perito_cut_df(
     return total, leq_final
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Gráficos / Export (iguais em opções ao outro script)
+# Render / Export
 # ────────────────────────────────────────────────────────────────────────────────
 def _pct(n: int, d: int) -> float:
     return (n / d * 100.0) if d > 0 else 0.0
@@ -468,10 +461,10 @@ def export_org(path_png: Optional[str],
                threshold: int, cut_n: int,
                out_name: str) -> str:
     """
-    Estilo replicado do compare_indicadores_composto:
-    - bloco :PROPERTIES:
-    - tabela com valores
-    - imagem com #+CAPTION
+    Bloco Org:
+      - :PROPERTIES:
+      - tabela com valores
+      - imagem com #+CAPTION
     """
     out_path = os.path.join(EXPORT_DIR, out_name)
     lines = []
@@ -485,81 +478,140 @@ def export_org(path_png: Optional[str],
     lines.append("| Grupo | ≤{0}s | Total | % |".format(threshold))
     lines.append("|-")
     lines.append(f"| {grp_title} | {left_leq} | {left_tot} | {left_pct:.2f}% |")
-    lines.append(f"| Brasil (excl.) | {right_leq} | {right_tot} | {right_pct:.2f}% |\n")
+    lines.append(f"| Brasil (excl.) | {right_leq} | {right_tot} | {right_pct:.2f}% |")
+    lines.append("")
 
     if path_png and os.path.exists(path_png):
-        lines.append("#+CAPTION: Comparação do % de perícias ≤ {0}s (com corte por perito).".format(threshold))
-        lines.append(f"[[file:{os.path.basename(path_png)}]]\n")
+        base = os.path.basename(path_png)
+        lines.append("#+ATTR_LATEX: :placement [H] :width \\linewidth")
+        lines.append(f"#+CAPTION: Perícias ≤ {threshold}s — {grp_title} vs Brasil (excl.)")
+        lines.append(f"[[file:{base}]]")
 
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    print(f"✅ Org salvo em: {out_path}")
+        f.write("\n".join(lines).rstrip() + "\n")
+
+    print(f"✅ ORG salvo em: {out_path}")
     return out_path
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Comentário (.org) — novo fluxo por VALORES + compat utils.comentarios
-# ────────────────────────────────────────────────────────────────────────────────
-def _md_table_leq(lhs_label: str, rhs_label: str,
-                  lhs_leq: int, lhs_tot: int, lhs_pct: float,
-                  rhs_leq: int, rhs_tot: int, rhs_pct: float,
-                  threshold: int) -> str:
-    return (
-        f"| Grupo | ≤{threshold}s | Total | % |\n"
-        f"|-------|-----------:|------:|---:|\n"
-        f"| {lhs_label}  | {lhs_leq} | {lhs_tot} | {lhs_pct:.1f}% |\n"
-        f"| {rhs_label} | {rhs_leq} | {rhs_tot} | {rhs_pct:.1f}% |\n"
-    )
-
-def _build_ascii_for_comment(lhs_label: str, rhs_label: str, lhs_pct: float, rhs_pct: float,
-                             threshold: int, cut_n: int, title: str) -> str:
-    if p is None:
-        return ""
-    try:
-        p.clear_data()
-        p.bar([lhs_label, rhs_label], [lhs_pct, rhs_pct])
-        p.title(title)
-        p.xlabel("")
-        p.ylabel(f"% ≤ {threshold}s (corte ≥ {cut_n})")
-        p.plotsize(80, 15)
-        return _px_build()
-    except Exception:
-        return ""
-
-def _export_comment_org(title: str, start: str, end: str,
-                        md_table: str, ascii_chart: str,
-                        threshold: int, cut_n: int,
-                        stem: str, comment_text: str) -> str:
+def _write_comment_org(org_main_path: str, comment_text: str) -> str:
+    stem = os.path.splitext(os.path.basename(org_main_path))[0]
     out = os.path.join(EXPORT_DIR, f"{stem}_comment.org")
-    lines = []
-    lines.append(f"* Comentário – {title}")
-    lines.append(":PROPERTIES:")
-    lines.append(f":PERIODO: {start} a {end}")
-    lines.append(f":THRESHOLD: {threshold}s")
-    lines.append(f":CUT_N: {cut_n}")
-    lines.append(":END:\n")
-
-    lines.append("** Tabela base")
-    lines.append("#+BEGIN_EXAMPLE")
-    lines.append(md_table.strip())
-    lines.append("#+END_EXAMPLE\n")
-
-    if ascii_chart and ascii_chart.strip():
-        lines.append("** Gráfico ASCII (opcional)")
-        lines.append("#+BEGIN_EXAMPLE")
-        lines.append(ascii_chart.strip())
-        lines.append("#+END_EXAMPLE\n")
-
-    lines.append("** Texto")
-    lines.append((comment_text or "(sem comentário)").strip())
-
     with open(out, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    print("🗒️ Comentário .org salvo em", out)
+        f.write("#+TITLE: Comentário — " + stem + "\n\n")
+        f.write(_sanitize_paragraph(comment_text) + "\n")
+    print(f"📝 Comentário salvo em: {out}")
     return out
 
+def _append_comment_into_org(org_main_path: str, comment_text: str) -> None:
+    try:
+        with open(org_main_path, "a", encoding="utf-8") as f:
+            f.write("\n#+BEGIN_QUOTE\n")
+            f.write(_sanitize_paragraph(comment_text) + "\n")
+            f.write("#+END_QUOTE\n")
+        print("🧩 Comentário incorporado ao .org principal.")
+    except Exception as e:
+        print(f"[AVISO] Falha ao incorporar comentário no .org: {e}")
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Execução
+# CSV helpers (Fluxo B / wrappers)
 # ────────────────────────────────────────────────────────────────────────────────
+def _load_names_from_csv(path: str) -> List[str]:
+    import pandas as pd
+    df = pd.read_csv(path)
+    col = next((c for c in df.columns if c.lower() == "nomeperito"), None)
+    if not col:
+        raise RuntimeError("CSV sem coluna 'nomePerito'.")
+    return df[col].astype(str).str.strip().tolist()
+
+def _apply_scope(df: pd.DataFrame, scope_names: List[str] | None) -> pd.DataFrame:
+    """Se scope_names vier, limita df aos peritos listados no escopo."""
+    if not scope_names:
+        return df
+    scope_upper = {n.strip().upper() for n in scope_names}
+    return df[df["nomePerito"].str.upper().isin(scope_upper)].copy()
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Execuções
+# ────────────────────────────────────────────────────────────────────────────────
+def run_group_from_csv(start: str, end: str,
+                       peritos_csv: str, scope_csv: Optional[str],
+                       threshold: int, cut_n: int,
+                       export_png_flag: bool, export_org_flag: bool,
+                       export_comment_flag: bool, export_comment_org_flag: bool,
+                       call_api: bool, chart: bool,
+                       model: str, max_words: int, temperature: float,
+                       fluxo: Optional[str] = None) -> None:
+    names = _load_names_from_csv(peritos_csv)
+    scope_names = _load_names_from_csv(scope_csv) if scope_csv and os.path.exists(scope_csv) else None
+
+    with sqlite3.connect(DB_PATH) as conn:
+        tbl, _ = _detect_tables(conn)
+        df_raw = _load_period_df(conn, tbl, start, end)
+    df = _parse_durations(df_raw)
+
+    # Grupo (à esquerda)
+    left_tot, left_leq = _sum_tot_and_leq_with_perito_cut_df(df, names, True, threshold, cut_n)
+
+    # Brasil (excl.) — opcionalmente restringe ao ESCOPO
+    df_right = _apply_scope(df, scope_names) if scope_names else df
+    right_tot, right_leq = _sum_tot_and_leq_with_perito_cut_df(df_right, names, False, threshold, cut_n)
+
+    left_pct  = _pct(left_leq, left_tot)
+    right_pct = _pct(right_leq, right_tot)
+    left_label, right_label = "Top 10 piores", "Brasil (excl.)"
+    title = f"Perícias ≤ {threshold}s – Top 10 piores vs Brasil (excl.)"
+
+    print(f"\n📊 {title}")
+    print(f"  Grupo: {left_leq}/{left_tot}  ({left_pct:.1f}%)  | peritos: {', '.join(names)}")
+    print(f"  {right_label}: {right_leq}/{right_tot}  ({right_pct:.1f}%)")
+    if fluxo:
+        print(f"  [fluxo={fluxo}] peritos_csv={os.path.basename(peritos_csv)} scope_csv={os.path.basename(scope_csv) if scope_csv else '-'}")
+
+    png_path = None
+    if chart:
+        render_ascii(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
+    if export_png_flag:
+        png_path = os.path.join(EXPORT_DIR, f"compare_{threshold}s_top10.png")
+        png_path = render_png(title, left_label, right_label,
+                              left_pct, right_pct, left_leq, right_leq, left_tot, right_tot,
+                              threshold, cut_n, png_path)
+    org_path = None
+    if export_org_flag:
+        org_path = export_org(png_path, start, end, left_label,
+                              left_tot, left_leq, left_pct,
+                              right_tot, right_leq, right_pct,
+                              threshold, cut_n, f"compare_{threshold}s_top10.org")
+
+    # Comentário
+    if export_comment_flag or export_comment_org_flag:
+        comment = ""
+        # 1) tenta função utilitária se existir
+        for fn in _COMENT_FUNCS:
+            try:
+                ascii_buf = ""  # deixamos vazio; algumas impls aceitam
+                md_tbl = f"| Grupo | ≤{threshold}s | Total | % |\n" \
+                         f"|---|---:|---:|---:|\n" \
+                         f"| {left_label} | {left_leq} | {left_tot} | {left_pct:.1f}% |\n" \
+                         f"| {right_label} | {right_leq} | {right_tot} | {right_pct:.1f}% |\n"
+                comment = fn(md_tbl, ascii_buf, start, end, threshold, cut_n, call_api=call_api)
+                if comment:
+                    comment = _sanitize_paragraph(comment)
+                    break
+            except Exception:
+                pass
+        # 2) fallback por valores
+        if not comment:
+            comment = _comment_from_values_leq(start, end,
+                                               left_label, left_leq, left_tot, left_pct,
+                                               right_label, right_leq, right_tot, right_pct,
+                                               threshold, cut_n,
+                                               call_api=call_api, model=model, max_words=max_words, temperature=temperature)
+        if comment:
+            if export_comment_flag and org_path:
+                _write_comment_org(org_path, comment)
+            if export_comment_org_flag and org_path:
+                _append_comment_into_org(org_path, comment)
+
 def run_perito(start: str, end: str, perito: str,
                threshold: int, cut_n: int,
                export_png_flag: bool, export_org_flag: bool,
@@ -569,85 +621,50 @@ def run_perito(start: str, end: str, perito: str,
     with sqlite3.connect(DB_PATH) as conn:
         tbl, _ = _detect_tables(conn)
         df_raw = _load_period_df(conn, tbl, start, end)
-        df = _parse_durations(df_raw)
+    df = _parse_durations(df_raw)
 
-        left_tot, left_leq   = _sum_tot_and_leq_with_perito_cut_df(df, [perito], True, threshold, cut_n)
-        right_tot, right_leq = _sum_tot_and_leq_with_perito_cut_df(df, [perito], False, threshold, cut_n)
+    names = [perito]
+    left_tot, left_leq   = _sum_tot_and_leq_with_perito_cut_df(df, names, True,  threshold, cut_n)
+    right_tot, right_leq = _sum_tot_and_leq_with_perito_cut_df(df, names, False, threshold, cut_n)
 
     left_pct  = _pct(left_leq, left_tot)
     right_pct = _pct(right_leq, right_tot)
-
-    left_label  = perito
-    right_label = "Brasil (excl.)"
+    left_label, right_label = perito, "Brasil (excl.)"
     title = f"Perícias ≤ {threshold}s – {perito} vs Brasil (excl.)"
-    safe = _safe(perito)
 
     print(f"\n📊 {title}")
-    print(f"  {left_label}:  {left_leq}/{left_tot}  ({left_pct:.1f}%)")
+    print(f"  {perito}: {left_leq}/{left_tot}  ({left_pct:.1f}%)")
     print(f"  {right_label}: {right_leq}/{right_tot}  ({right_pct:.1f}%)")
 
-    png_path = os.path.join(EXPORT_DIR, f"compare_{threshold}s_{safe}.png")
-    org_name = f"compare_{threshold}s_{safe}.org"
-    org_path = os.path.join(EXPORT_DIR, org_name)
-
+    png_path = None
+    if chart:
+        render_ascii(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
     if export_png_flag:
+        safe = _safe(perito)
+        png_path = os.path.join(EXPORT_DIR, f"compare_{threshold}s_{safe}.png")
         png_path = render_png(title, left_label, right_label,
                               left_pct, right_pct, left_leq, right_leq, left_tot, right_tot,
                               threshold, cut_n, png_path)
-
-    # Se vamos comentar e/ou exportar .org, gere .org (precisamos da imagem linkada)
-    if export_org_flag or export_comment_flag or export_comment_org_flag:
-        if not (png_path and os.path.exists(png_path)):
-            png_path = render_png(title, left_label, right_label,
-                                  left_pct, right_pct, left_leq, right_leq, left_tot, right_tot,
-                                  threshold, cut_n, png_path)
-        org_path = export_org(png_path, start, end, left_label,
+    org_path = None
+    if export_org_flag:
+        safe = _safe(perito)
+        org_path = export_org(png_path, start, end, perito,
                               left_tot, left_leq, left_pct,
                               right_tot, right_leq, right_pct,
-                              threshold, cut_n, org_name)
+                              threshold, cut_n, f"compare_{threshold}s_{safe}.org")
 
-    # Preparar insumos e gerar comentário **por valores**
-    comment_text = ""
+    # Comentário
     if export_comment_flag or export_comment_org_flag:
-        # Preferência: API direta (valores) → heurístico
-        _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
-        comment_text = _comment_from_values_leq(
-            start, end,
-            left_label, left_leq, left_tot, left_pct,
-            right_label, right_leq, right_tot, right_pct,
-            threshold, cut_n,
-            call_api=call_api and bool(os.getenv("OPENAI_API_KEY")),
-            model=model, max_words=max_words, temperature=temperature
-        )
-        # Fallback extra: utils.comentarios (se existir) — apenas se vazio por algum motivo
-        if not comment_text.strip() and _COMENT_FUNCS:
-            md_tbl = _md_table_leq(left_label, right_label,
-                                   left_leq, left_tot, left_pct,
-                                   right_leq, right_tot, right_pct, threshold)
-            ascii_chart = _build_ascii_for_comment(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
-            try:
-                out = _COMENT_FUNCS[0](md_tbl, ascii_chart, start, end, threshold, cut_n, call_api=call_api)  # type: ignore
-                comment_text = (out.get("comment") if isinstance(out, dict) else str(out)).strip()
-            except Exception:
-                pass
-
-    # Exportações de comentário
-    if export_comment_flag:
-        md_tbl = _md_table_leq(left_label, right_label,
-                               left_leq, left_tot, left_pct,
-                               right_leq, right_tot, right_pct, threshold)
-        ascii_chart = _build_ascii_for_comment(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
-        stem = f"compare_{threshold}s_{safe}"
-        _export_comment_org(title, start, end, md_tbl, ascii_chart, threshold, cut_n, stem, comment_text)
-
-    if export_comment_org_flag:
-        with open(org_path, "a", encoding="utf-8") as f:
-            f.write("\n** Comentário\n")
-            f.write((comment_text or "(sem comentário)").strip() + "\n")
-        print(f"✅ Comentário incorporado ao ORG: {org_path}")
-
-    if chart:
-        render_ascii(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
+        comment = _comment_from_values_leq(start, end,
+                                           left_label, left_leq, left_tot, left_pct,
+                                           right_label, right_leq, right_tot, right_pct,
+                                           threshold, cut_n,
+                                           call_api=call_api, model=model, max_words=max_words, temperature=temperature)
+        if comment and org_path:
+            if export_comment_flag:
+                _write_comment_org(org_path, comment)
+            if export_comment_org_flag:
+                _append_comment_into_org(org_path, comment)
 
 def run_top10(start: str, end: str, min_analises: int,
               threshold: int, cut_n: int,
@@ -655,146 +672,136 @@ def run_top10(start: str, end: str, min_analises: int,
               export_comment_flag: bool, export_comment_org_flag: bool,
               call_api: bool, chart: bool,
               model: str, max_words: int, temperature: float) -> None:
+    """Top 10 por scoreFinal no período (Fluxo A, legado)."""
     with sqlite3.connect(DB_PATH) as conn:
-        tbl, has_ind = _detect_tables(conn)
-        if not has_ind:
-            raise RuntimeError("Tabela 'indicadores' não encontrada — calcule indicadores antes de usar --top10.")
+        tbl, indicadores_ok = _detect_tables(conn)
+        if not indicadores_ok:
+            raise RuntimeError("Tabela 'indicadores' não encontrada para calcular Top 10 por score.")
         names = _top10_names(conn, tbl, start, end, min_analises)
-        if not names:
-            print("⚠️ Nenhum perito elegível para Top 10 nesse período.")
-            return
-
         df_raw = _load_period_df(conn, tbl, start, end)
-        df = _parse_durations(df_raw)
+    df = _parse_durations(df_raw)
 
-        left_tot, left_leq   = _sum_tot_and_leq_with_perito_cut_df(df, names, True, threshold, cut_n)
-        right_tot, right_leq = _sum_tot_and_leq_with_perito_cut_df(df, names, False, threshold, cut_n)
+    left_tot, left_leq   = _sum_tot_and_leq_with_perito_cut_df(df, names, True,  threshold, cut_n)
+    right_tot, right_leq = _sum_tot_and_leq_with_perito_cut_df(df, names, False, threshold, cut_n)
 
     left_pct  = _pct(left_leq, left_tot)
     right_pct = _pct(right_leq, right_tot)
-
-    left_label  = "Top 10 piores"
-    right_label = "Brasil (excl.)"
+    left_label, right_label = "Top 10 piores", "Brasil (excl.)"
     title = f"Perícias ≤ {threshold}s – Top 10 piores vs Brasil (excl.)"
 
     print(f"\n📊 {title}")
     print(f"  Grupo: {left_leq}/{left_tot}  ({left_pct:.1f}%)  | peritos: {', '.join(names)}")
     print(f"  {right_label}: {right_leq}/{right_tot}  ({right_pct:.1f}%)")
 
-    png_path = os.path.join(EXPORT_DIR, f"compare_{threshold}s_top10.png")
-    org_name = f"compare_{threshold}s_top10.org"
-    org_path = os.path.join(EXPORT_DIR, org_name)
-
+    png_path = None
+    if chart:
+        render_ascii(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
     if export_png_flag:
+        png_path = os.path.join(EXPORT_DIR, f"compare_{threshold}s_top10.png")
         png_path = render_png(title, left_label, right_label,
                               left_pct, right_pct, left_leq, right_leq, left_tot, right_tot,
                               threshold, cut_n, png_path)
-
-    if export_org_flag or export_comment_flag or export_comment_org_flag:
-        if not (png_path and os.path.exists(png_path)):
-            png_path = render_png(title, left_label, right_label,
-                                  left_pct, right_pct, left_leq, right_leq, left_tot, right_tot,
-                                  threshold, cut_n, png_path)
+    org_path = None
+    if export_org_flag:
         org_path = export_org(png_path, start, end, left_label,
                               left_tot, left_leq, left_pct,
                               right_tot, right_leq, right_pct,
-                              threshold, cut_n, org_name)
+                              threshold, cut_n, f"compare_{threshold}s_top10.org")
 
-    # Comentário por VALORES (preferido)
-    comment_text = ""
     if export_comment_flag or export_comment_org_flag:
-        _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
-        comment_text = _comment_from_values_leq(
-            start, end,
-            left_label, left_leq, left_tot, left_pct,
-            right_label, right_leq, right_tot, right_pct,
-            threshold, cut_n,
-            call_api=call_api and bool(os.getenv("OPENAI_API_KEY")),
-            model=model, max_words=max_words, temperature=temperature
-        )
-        # Fallback extra: utils.comentarios (se vazio)
-        if not comment_text.strip() and _COMENT_FUNCS:
-            md_tbl = _md_table_leq(left_label, right_label,
-                                   left_leq, left_tot, left_pct,
-                                   right_leq, right_tot, right_pct, threshold)
-            ascii_chart = _build_ascii_for_comment(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
-            try:
-                out = _COMENT_FUNCS[0](md_tbl, ascii_chart, start, end, threshold, cut_n, call_api=call_api)  # type: ignore
-                comment_text = (out.get("comment") if isinstance(out, dict) else str(out)).strip()
-            except Exception:
-                pass
-
-    if export_comment_flag:
-        md_tbl = _md_table_leq(left_label, right_label,
-                               left_leq, left_tot, left_pct,
-                               right_leq, right_tot, right_pct, threshold)
-        ascii_chart = _build_ascii_for_comment(left_label, right_label, left_pct, right_pct,
-                                               threshold, cut_n, title)
-        stem = f"compare_{threshold}s_top10"
-        _export_comment_org(title, start, end, md_tbl, ascii_chart, threshold, cut_n, stem, comment_text)
-
-    if export_comment_org_flag:
-        with open(org_path, "a", encoding="utf-8") as f:
-            f.write("\n** Comentário\n")
-            f.write((comment_text or "(sem comentário)").strip() + "\n")
-        print(f"✅ Comentário incorporado ao ORG: {org_path}")
-
-    if chart:
-        render_ascii(left_label, right_label, left_pct, right_pct, threshold, cut_n, title)
+        comment = _comment_from_values_leq(start, end,
+                                           left_label, left_leq, left_tot, left_pct,
+                                           right_label, right_leq, right_tot, right_pct,
+                                           threshold, cut_n,
+                                           call_api=call_api, model=model, max_words=max_words, temperature=temperature)
+        if comment and org_path:
+            if export_comment_flag:
+                _write_comment_org(org_path, comment)
+            if export_comment_org_flag:
+                _append_comment_into_org(org_path, comment)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CLI
 # ────────────────────────────────────────────────────────────────────────────────
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
-        description="Perícias ≤ THRESHOLD s — comparação em % (perito ou Top 10 piores) vs Brasil (excl.)"
-    )
-    ap.add_argument('--start',     required=True)
-    ap.add_argument('--end',       required=True)
+def parse_args():
+    ap = argparse.ArgumentParser(description="Comparação do % de perícias ≤ limiar (com corte por perito no numerador).")
+    ap.add_argument('--db', default=DB_PATH)
+    ap.add_argument('--start', required=True)
+    ap.add_argument('--end',   required=True)
 
-    g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument('--perito', help='Nome do perito (exato)')
-    g.add_argument('--top10',  action='store_true', help='Comparar o grupo dos 10 piores por scoreFinal')
+    who = ap.add_mutually_exclusive_group(required=True)
+    who.add_argument('--perito', help='Nome do perito para comparação individual.')
+    who.add_argument('--top10', action='store_true', help='Top 10 piores por scoreFinal (Fluxo A, legado).')
 
-    ap.add_argument('--min-analises', type=int, default=50, help='Elegibilidade p/ Top 10 (mínimo no período)')
-    ap.add_argument('--threshold', '-t', type=int, default=15, help='Limite em segundos para considerar “≤ threshold” (padrão: 15)')
-    ap.add_argument('--cut-n',      type=int, default=10, help='Corte: mínimo de tarefas ≤ threshold por perito para entrar no numerador (padrão: 10)')
+    ap.add_argument('--min-analises', type=int, default=50, help='Mínimo de tarefas no período para elegibilidade do Top 10 por score.')
+    ap.add_argument('--threshold', type=int, default=15, help='Limiar (segundos).')
+    ap.add_argument('--cut-n', type=int, default=10, help='Corte por perito para entrar no numerador (tarefas ≤threshold).')
 
-    # Exportações/saídas
-    ap.add_argument('--export-png',           action='store_true')
-    ap.add_argument('--export-org',           action='store_true')
-    ap.add_argument('--export-comment',       action='store_true', help='Gera *_comment.org com texto corrido (IA ou fallback local)')
-    ap.add_argument('--export-comment-org',   action='store_true', help='Incorpora o comentário automaticamente no arquivo .org principal')
-    ap.add_argument('--call-api',             action='store_true', help='Chama a API (utils.comentarios / OpenAI) para obter o texto final do comentário (requer OPENAI_API_KEY)')
-    ap.add_argument('--chart',                action='store_true', help='Gráfico ASCII no terminal')
+    # Novas flags (Fluxo B)
+    ap.add_argument('--peritos-csv', default=None, help='CSV com coluna nomePerito; se informado, ignora --top10 interno.')
+    ap.add_argument('--scope-csv', default=None, help='CSV com coluna nomePerito para definir o ESCOPO do Brasil (excl.).')
+    ap.add_argument('--fluxo', choices=['A','B'], default=None, help='Apenas log/telemetria (não altera o cálculo).')
 
-    # GPT (opcionais, com defaults sensatos)
-    ap.add_argument('--model',       default='gpt-4o-mini', help='Modelo ChatGPT (padrão: gpt-4o-mini)')
-    ap.add_argument('--max-words',   type=int, default=180, help='Máx. de palavras do comentário (padrão: 180)')
-    ap.add_argument('--temperature', type=float, default=0.2, help='Temperatura da geração (padrão: 0.2)')
+    # Export/comentários/visual
+    ap.add_argument('--export-png', action='store_true')
+    ap.add_argument('--export-org', action='store_true')
+    ap.add_argument('--export-comment', action='store_true')
+    ap.add_argument('--export-comment-org', action='store_true')
+    ap.add_argument('--call-api', action='store_true', help='Se setado, tenta usar OPENAI_API_KEY para comentar.')
+    ap.add_argument('--model', default='gpt-4o-mini', help='Modelo de chat para comentário (se --call-api).')
+    ap.add_argument('--temperature', type=float, default=0.15)
+    ap.add_argument('--max-words', type=int, default=180)
+    ap.add_argument('--chart', action='store_true', help='Imprime gráfico ASCII (plotext).')
 
     return ap.parse_args()
 
-def main() -> None:
+# ────────────────────────────────────────────────────────────────────────────────
+# main
+# ────────────────────────────────────────────────────────────────────────────────
+def main():
     args = parse_args()
 
-    # liga API automaticamente se existir OPENAI_API_KEY no ambiente
-    call_api = bool(args.call_api or os.getenv("OPENAI_API_KEY"))
+    # Permite override do DB por flag --db
+    global DB_PATH
+    if args.db and os.path.abspath(args.db) != os.path.abspath(DB_PATH):
+        DB_PATH = args.db
 
+    # Prioridade Fluxo B: se vier --peritos-csv, usa a lista EXATA
+    if args.peritos_csv:
+        return run_group_from_csv(
+            args.start, args.end,
+            args.peritos_csv, args.scope_csv,
+            args.threshold, args.cut_n,
+            args.export_png, args.export_org,
+            args.export_comment, args.export_comment_org,
+            args.call_api, args.chart,
+            args.model, args.max_words, args.temperature,
+            fluxo=args.fluxo
+        )
+
+    # Caso não tenha CSV: segue os modos clássicos
     if args.top10:
-        run_top10(args.start, args.end, args.min_analises,
-                  args.threshold, args.cut_n,
-                  args.export_png, args.export_org,
-                  args.export_comment, args.export_comment_org,
-                  call_api, args.chart,
-                  args.model, args.max_words, args.temperature)
-    else:
-        run_perito(args.start, args.end, args.perito,
-                   args.threshold, args.cut_n,
-                   args.export_png, args.export_org,
-                   args.export_comment, args.export_comment_org,
-                   call_api, args.chart,
-                   args.model, args.max_words, args.temperature)
+        return run_top10(
+            args.start, args.end, args.min_analises,
+            args.threshold, args.cut_n,
+            args.export_png, args.export_org,
+            args.export_comment, args.export_comment_org,
+            args.call_api, args.chart,
+            args.model, args.max_words, args.temperature
+        )
+
+    # Senão, é --perito
+    if args.perito:
+        return run_perito(
+            args.start, args.end, args.perito,
+            args.threshold, args.cut_n,
+            args.export_png, args.export_org,
+            args.export_comment, args.export_comment_org,
+            args.call_api, args.chart,
+            args.model, args.max_words, args.temperature
+        )
+
+    raise SystemExit("Nenhum modo selecionado. Use --perito, --top10 ou --peritos-csv.")
 
 if __name__ == "__main__":
     main()

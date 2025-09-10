@@ -150,7 +150,8 @@ fi
 
 echo
 echo "Período escolhido: ${START} a ${END}"
-echo "Padrão: Top 10, --min-analises 50, --export-org --export-pdf --add-comments,"
+echo "Padrão: Top 10, --min-analises 50, fluxo=B, kpi-base=nc-only, --save-manifests,"
+echo "        --export-org --export-pdf --add-comments,"
 echo "        --r-appendix (Rscript), --include-high-nc (thr=90, min=50),"
 echo "        sem --with-impact, sem --reuse-kpi, sem --plan-only."
 if confirm "Usar COMANDO PADRÃO agora?" "y"; then
@@ -171,6 +172,9 @@ INCLUDE_HIGH_NC="y"; HIGH_NC_THRESHOLD="90"; HIGH_NC_MIN_TASKS="50"
 WITH_IMPACT="n"; IMPACT_ALL_TESTS="n"
 REUSE_KPI="n"
 PLAN_ONLY="n"
+FLUXO="B"           # padrão do fluxo
+KPI_BASE="nc-only"  # padrão da base de KPI
+SAVE_MANIFESTS="y"  # ← NOVO: padrão salva manifests (p/ Rchecks B)
 
 if [[ "${USE_DEFAULT}" == "n" ]]; then
   echo
@@ -188,6 +192,37 @@ if [[ "${USE_DEFAULT}" == "n" ]]; then
   fi
 
   MIN_ANALISES="$(ask "--min-analises" "50")"
+
+  # Fluxo (A ou B)
+  echo
+  echo "Fluxo:"
+  echo "  1) B — Gate %NC ≥ 2× Brasil (válidas) e ranking por scoreFinal [Padrão]"
+  echo "  2) A — Top 10 direto por scoreFinal (sem gate)"
+  read -rp "Opção [1-2]: " FOPT || true
+  case "${FOPT:-1}" in
+    1) FLUXO="B" ;;
+    2) FLUXO="A" ;;
+    *) FLUXO="B" ;;
+  esac
+
+  # Base de KPI (score)
+  echo
+  echo "Base de KPI (score):"
+  echo "  1) nc-only — usar score_final_nc quando disponível [Padrão]"
+  echo "  2) full     — usar score_final completo"
+  read -rp "Opção [1-2]: " KBOPT || true
+  case "${KBOPT:-1}" in
+    1) KPI_BASE="nc-only" ;;
+    2) KPI_BASE="full" ;;
+    *) KPI_BASE="nc-only" ;;
+  esac
+
+  # Manifests (Top10 + scope do Fluxo B)
+  if confirm "Salvar manifests para os Rchecks (top10_peritos.csv / scope_gate_b.csv)?" "y"; then
+    SAVE_MANIFESTS="y"
+  else
+    SAVE_MANIFESTS="n"
+  fi
 
   # Exportações e comentários
   confirm "Exportar ORG?" "y" && EXPORT_ORG="y" || EXPORT_ORG="n"
@@ -227,6 +262,9 @@ if [[ "$MODE" == "top10" ]]; then
 else
   echo "Modo: Individual — Perito='${PERITO_NAME}'"
 fi
+echo "Fluxo: ${FLUXO}"
+echo "KPI base: ${KPI_BASE}"
+echo "Salvar manifests: ${SAVE_MANIFESTS}"
 echo "min-analises: ${MIN_ANALISES}"
 echo "Export ORG: ${EXPORT_ORG} / Export PDF: ${EXPORT_PDF} / Comentários: ${ADD_COMMENTS}"
 echo "Apêndice R: ${R_APPENDIX} (R bin=${R_BIN})"
@@ -239,6 +277,22 @@ echo
 # ──────────────────────────────────────────────────────────────────────
 # Montagem do comando (aceita flags extras via "$@")
 # ──────────────────────────────────────────────────────────────────────
+# Detecta se o usuário já passou --fluxo / --kpi-base / --save-manifests em flags extras; se sim, não adicionamos aqui.
+HAS_FLUXO="n"; HAS_KPI_BASE="n"; HAS_SAVE_MANIFESTS="n"
+if (( "$#" > 0 )); then
+  for arg in "$@"; do
+    if [[ "$arg" == "--fluxo" || "$arg" =~ ^--fluxo= ]]; then
+      HAS_FLUXO="y"
+    fi
+    if [[ "$arg" == "--kpi-base" || "$arg" =~ ^--kpi-base= ]]; then
+      HAS_KPI_BASE="y"
+    fi
+    if [[ "$arg" == "--save-manifests" ]]; then
+      HAS_SAVE_MANIFESTS="y"
+    fi
+  done
+fi
+
 cmd=( "${PYTHON}" "${TARGET}" --start "${START}" --end "${END}" )
 if [[ "$MODE" == "top10" ]]; then
   cmd+=( --top10 )
@@ -246,6 +300,21 @@ else
   cmd+=( --perito "${PERITO_NAME}" )
 fi
 cmd+=( --min-analises "${MIN_ANALISES}" )
+
+# fluxo (só adiciona se o usuário não forneceu via "$@")
+if [[ "${HAS_FLUXO}" == "n" ]]; then
+  cmd+=( --fluxo "${FLUXO}" )
+fi
+
+# kpi-base (só adiciona se o usuário não forneceu via "$@")
+if [[ "${HAS_KPI_BASE}" == "n" ]]; then
+  cmd+=( --kpi-base "${KPI_BASE}" )
+fi
+
+# manifests (gera top10_peritos.csv e scope_gate_b.csv quando Fluxo B)
+if [[ "${SAVE_MANIFESTS}" == "y" && "${HAS_SAVE_MANIFESTS}" == "n" ]]; then
+  cmd+=( --save-manifests )
+fi
 
 # exportações
 [[ "${EXPORT_ORG}" == "y" ]] && cmd+=( --export-org )

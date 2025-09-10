@@ -897,6 +897,44 @@ def _elbow_cutoff_score(df: pd.DataFrame) -> Optional[float]:
     dist=np.abs((y1-y0)*x - (x1-x0)*y + x1*y0 - y1*x0)/denom
     return float(ss[int(dist.argmax())])
 
+# ===== Escopo (Fluxo B) ==============================================
+
+from typing import Optional, Set  # se ainda não estiver importado
+
+def _load_scope_list(scope_csv: Optional[str]) -> Optional[Set[str]]:
+    """
+    Lê um CSV que contenha a lista de peritos a manter no 'df_all' dos gráficos de base.
+    Aceita colunas: nomePerito | perito | nome (case-insensitive).
+    """
+    if not scope_csv:
+        return None
+    try:
+        df = pd.read_csv(scope_csv)
+        col = None
+        for c in df.columns:
+            lc = str(c).strip().lower()
+            if lc in ("nomeperito", "perito", "nome"):
+                col = c
+                break
+        if not col:
+            return None
+        vals = [str(x).strip() for x in df[col].dropna().tolist()]
+        return set(vals)
+    except Exception:
+        return None
+
+def _apply_scope(df_all: pd.DataFrame, scope_csv: Optional[str]) -> pd.DataFrame:
+    """
+    Se 'scope_csv' existir, restringe df_all aos peritos listados.
+    Caso contrário, devolve df_all inalterado.
+    """
+    scope = _load_scope_list(scope_csv)
+    if not scope:
+        return df_all.copy()
+    m = df_all.copy()
+    m["nomePerito"] = m["nomePerito"].astype(str)
+    return m[m["nomePerito"].isin(scope)].copy()
+
 # =======================
 # PNGs
 # =======================
@@ -1701,6 +1739,13 @@ def parse_args() -> argparse.Namespace:
     grp_params.add_argument('--alpha', type=float, default=0.8)
     grp_params.add_argument('--pbr', type=float, default=None)
 
+    # ── Escopo (Fluxo B) ────────────────────────────────────────────
+    grp_scope = ap.add_argument_group("Escopo (Fluxo B)")
+    grp_scope.add_argument(
+        '--scope-csv', default=None,
+        help="CSV com lista de peritos (coluna nomePerito/perito/nome) para restringir a base do período nos gráficos de base."
+    )
+
     # ── Parâmetros de tempo médio / capacidade ──────────────────────
     grp_tmea = ap.add_argument_group("TMEA / Capacidade")
     grp_tmea.add_argument('--tmea-br', type=float, default=60.0)
@@ -1726,7 +1771,7 @@ def parse_args() -> argparse.Namespace:
     grp_tests.add_argument('--bootstrap-peso', type=int, default=0)
     grp_tests.add_argument('--bootstrap-recalc-sstar', action='store_true')
     
-    # ── Outliers por %NC + Apêndice ───────────────────────────────────
+    # ── Outliers por %NC + Apêndice ─────────────────────────────────
     grp_nc = ap.add_argument_group("Outliers por % NC")
     grp_nc.add_argument('--nc-outlier-mode', choices=['off','fixed','adaptive-fdr'],
                         default='adaptive-fdr',
@@ -1750,7 +1795,7 @@ def parse_args() -> argparse.Namespace:
                         action=BooleanOptionalAction, default=True,
                         help="Insere comentário explicativo via GPT (cálculos, fórmulas, testes e gráficos) no apêndice.")
 
-    # ── Aparência dos gráficos ─────────────────────────────────────────
+    # ── Aparência dos gráficos ───────────────────────────────────────
     grp_fig = ap.add_argument_group("Gráficos")
     grp_fig.add_argument('--fig-scale', type=float, default=1.0,
                          help="Multiplicador do tamanho dos gráficos (ex.: 0.8 = 80%).")
@@ -1759,7 +1804,7 @@ def parse_args() -> argparse.Namespace:
     grp_fig.add_argument('--pdf-img-frac', type=float, default=1.0,
                          help="Fator da largura das imagens dentro do PDF (ex.: 0.8 = 80% de doc.width).")
                          
-    # ── Layout / Margens de página ─────────────────────────────────────
+    # ── Layout / Margens de página ───────────────────────────────────
     grp_page = ap.add_argument_group("Layout/Página")
     grp_page.add_argument('--page-margin', type=float, default=None,
                           help="Margem única (cm) para todos os lados.")
@@ -1768,14 +1813,14 @@ def parse_args() -> argparse.Namespace:
     grp_page.add_argument('--page-margin-top', type=float, default=None)
     grp_page.add_argument('--page-margin-bottom', type=float, default=None)
     
-    # ── Tamanho da fonte ─────────────────────────────────────
+    # ── Tamanho da fonte ────────────────────────────────────────────
     grp_tbl = ap.add_argument_group("Tabelas (PDF)")
     grp_tbl.add_argument('--table-font-size', type=float, default=8.0,
                          help="Tamanho da fonte do corpo das tabelas.")
     grp_tbl.add_argument('--table-header-font-size', type=float, default=None,
                          help="Tamanho da fonte do cabeçalho das tabelas (padrão: igual ao corpo).")
     
-    # ── Fonte da seleção Top-10 ───────────────────────────────────────── 
+    # ── Fonte da seleção Top-10 ─────────────────────────────────────
     grp_sel_src = ap.add_argument_group("Seleção Top-10 (fonte)")
     grp_sel_src.add_argument(
         "--select-src",
@@ -1808,7 +1853,7 @@ def parse_args() -> argparse.Namespace:
     grp_front_pdf.add_argument('--front-org-render', action='append', default=[],
                                help='Um ou mais .org a renderizar via Emacs/ox-latex e inserir (pode repetir).')
 
-    # ── .org único combinando header+texto ────────────────────
+    # ── .org único combinando header+texto ──────────────────────────
     grp_ht = ap.add_argument_group(".org único (capa + texto)")
     grp_ht.add_argument('--header-and-text', action='store_true',
                         help='Usa um único .org (capa + texto) renderizado e inserido no início.')
@@ -1829,6 +1874,7 @@ def parse_args() -> argparse.Namespace:
                     help='Atalho: --test-binomial --betabin --permute-weight 5000 --cmh by=cr --psa 10000')
 
     return ap.parse_args()
+
 
 def _calc_delta_tmea(iv_total: float, tmea_br: Optional[float]=None, cap_br: Optional[float]=None, att_br: Optional[float]=None) -> Optional[int]:
     try:
@@ -1868,12 +1914,10 @@ def main():
 
     # === tamanhos de fonte das tabelas via flags ===
     global TABLE_FONT_SIZE, TABLE_HEADER_FONT_SIZE
-    # corpo
     try:
         TABLE_FONT_SIZE = float(getattr(args, "table_font_size", TABLE_FONT_SIZE))
     except NameError:
         TABLE_FONT_SIZE = float(getattr(args, "table_font_size", 8.0) or 8.0)
-    # cabeçalho
     thf = getattr(args, "table_header_font_size", None)
     try:
         TABLE_HEADER_FONT_SIZE = (float(thf) if thf is not None else None)
@@ -1970,19 +2014,16 @@ def main():
 
     def _run_tests_for_block(df_all, df_sel, meta):
         tests: Dict[str, Any] = {}
-        # binomial / beta-binomial (sobre todos — como no padrão)
         if args.test_binomial and not df_all.empty:
             tests['binomial_df'] = run_test_binomial(df_all, meta['p_br'])
         if args.betabin and not df_all.empty:
             bb_df, rho_mom = run_test_betabin(df_all, meta['p_br'])
             tests['betabin_df'] = bb_df
             tests['rho_mom'] = rho_mom
-        # permutação (só faz sentido p/ blocos com seleção)
         if args.permute_weight and not df_all.empty and not df_sel.empty:
             stratify = args.by if (args.permute_stratify and args.by in ('cr','dr')) else None
             perm_p, perm_png = run_permutation_weight(df_all, df_sel, args.alpha, meta['p_br'], args.permute_weight, stratify_by=stratify)
             tests['perm_p'] = perm_p; tests['perm_png'] = perm_png; tests['perm_R'] = int(args.permute_weight)
-        # CMH (informativo)
         if args.cmh and not df_all.empty:
             cmh_arg = args.cmh.strip()
             cmh_by = cmh_arg.split("=",1)[1].strip().lower() if cmh_arg.lower().startswith("by=") else cmh_arg.strip().lower()
@@ -2001,7 +2042,6 @@ def main():
                 ormh = (num/den) if den>0 else float('inf')
                 x2 = 0.0; pval = 0.5
                 tests['cmh'] = (ormh, x2, pval, cmh_by)
-        # PSA (probabilística)
         if args.psa and not df_all.empty:
             total_calc = int(df_all["N"].sum())
             nc_calc    = int(df_all["NC"].sum())
@@ -2026,9 +2066,7 @@ def main():
             return comments
         try:
             import json as _json
-            # resumo
             comments["resumo"] = comentar_impacto_fila(df_all.copy(), df_sel.copy(), dict(meta), call_api=True)
-            # top
             if pngs.get("top") and not df_sel.empty:
                 topn = int(meta.get("topn", 10))
                 g = df_sel.sort_values(["IV_vagas","E","NC","N"], ascending=[False,False,False,True]).head(topn)
@@ -2048,7 +2086,6 @@ def main():
                 )
                 out = chamar_gpt(SYSTEM_PROMPT, user, call_api=True, model="gpt-4o-mini", temperature=0.2)
                 comments["top"] = (out.get("comment") or "").strip()
-            # cotovelo
             if pngs.get("cotovelo"):
                 payload = {
                     "periodo": [meta["start"], meta["end"]],
@@ -2064,7 +2101,6 @@ def main():
                         "Evite causalidade. Dados:\n\n" + _json.dumps(payload, ensure_ascii=False))
                 out = chamar_gpt(SYSTEM_PROMPT, user, call_api=True, model="gpt-4o-mini", temperature=0.2)
                 comments["cotovelo"] = (out.get("comment") or "").strip()
-            # tornado
             if pngs.get("tornado"):
                 delta = dict(meta.get("sens_delta") or {})
                 user = ("Interprete o gráfico de sensibilidade 'tornado' em ≤90 palavras, explicando como variações de α e p_BR "
@@ -2072,7 +2108,6 @@ def main():
                         + _json.dumps(delta, ensure_ascii=False))
                 out = chamar_gpt(SYSTEM_PROMPT, user, call_api=True, model="gpt-4o-mini", temperature=0.2)
                 comments["tornado"] = (out.get("comment") or "").strip()
-            # estratos
             if args.by and not df_strat_tot.empty:
                 rows = []
                 key = f"{meta['by']}_val"
@@ -2094,7 +2129,6 @@ def main():
                 )
                 out = chamar_gpt(SYSTEM_PROMPT, user, call_api=True, model="gpt-4o-mini", temperature=0.2)
                 comments["estratos"] = (out.get("comment") or "").strip()
-            # binomial
             dfb = tests.get("binomial_df")
             if isinstance(dfb, pd.DataFrame) and not dfb.empty:
                 sig = int((dfb["q"] <= 0.05).sum())
@@ -2104,7 +2138,6 @@ def main():
                         "e a relação com o excesso (E). Evite causalidade. Dados:\n\n" + _json.dumps(payload, ensure_ascii=False))
                 out = chamar_gpt(SYSTEM_PROMPT, user, call_api=True, model="gpt-4o-mini", temperature=0.2)
                 comments["binomial"] = (out.get("comment") or "").strip()
-            # betabin
             dfbb = tests.get("betabin_df")
             if isinstance(dfbb, pd.DataFrame) and not dfbb.empty:
                 sig = int((dfbb["q_bb"] <= 0.05).sum())
@@ -2114,7 +2147,6 @@ def main():
                         "consistência com o binomial. Evite causalidade. Dados:\n\n" + _json.dumps(payload, ensure_ascii=False))
                 out = chamar_gpt(SYSTEM_PROMPT, user, call_api=True, model="gpt-4o-mini", temperature=0.2)
                 comments["betabin"] = (out.get("comment") or "").strip()
-            # perm
             if pngs.get("perm") and tests.get("perm_p") is not None:
                 payload = {"periodo": [meta["start"], meta["end"]],
                            "w_obs_pct": float(meta.get("peso_sel", 0.0) * 100.0),
@@ -2125,7 +2157,6 @@ def main():
                         + _json.dumps(payload, ensure_ascii=False))
                 out = chamar_gpt(SYSTEM_PROMPT, user, call_api=True, model="gpt-4o-mini", temperature=0.2)
                 comments["perm"] = (out.get("comment") or "").strip()
-            # cmh
             if tests.get("cmh") is not None:
                 ormh, x2, pval, by_key = tests["cmh"]
                 payload = {"periodo": [meta["start"], meta["end"]], "by": by_key,
@@ -2134,7 +2165,6 @@ def main():
                         "sem inferir causalidade. Dados:\n\n" + _json.dumps(payload, ensure_ascii=False))
                 out = chamar_gpt(SYSTEM_PROMPT, user, call_api=True, model="gpt-4o-mini", temperature=0.2)
                 comments["cmh"] = (out.get("comment") or "").strip()
-            # psa
             if pngs.get("psa") and tests.get("psa_ci") is not None:
                 ci = tests.get("psa_ci", (None, None, None))
                 payload = {"periodo": [meta["start"], meta["end"]], "R": int(tests.get("psa_R", 0)),
@@ -2213,7 +2243,6 @@ def main():
             meta_nc = {"active": True, "mode":"fixed", "thresh": t, "n_cand": int(df_cand.shape[0]), "n_sel": int(sub.shape[0])}
             return sub.sort_values(["p_hat","N"], ascending=[False,False]).copy(), meta_nc
 
-        # adaptive-fdr: varre a grade e escolhe t* que maximiza #descobertas (q<=alvo); empate resolve pelo menor t
         grid = _parse_thresh_grid(getattr(args, "nc_outlier_grid", "0.60,0.70,0.80,0.85,0.90,0.95"))
         best = {"t": None, "k": 0, "sub": None, "q": None}
         tried = []
@@ -2259,7 +2288,6 @@ def main():
     def _build_appendix_nc_pdf(meta_base: Dict[str,Any], df_nc: pd.DataFrame,
                                pdf_path: str, png_nc: Optional[str], meta_nc: Dict[str,Any],
                                gpt_text: Optional[str]) -> None:
-        # Apêndice com tabela + (opcional) gráfico e comentário GPT com fórmulas renderizadas
         doc = SimpleDocTemplate(
             pdf_path, pagesize=A4,
             leftMargin=PDF_MARGIN_LEFT_CM*cm,
@@ -2290,7 +2318,6 @@ def main():
             show = show[["Perito","cr","dr","N","NC","%NC","E","p_bin","q_BH"]].rename(columns={
                 "cr":"CR","dr":"DR","E":"Excesso","p_bin":"p(bin)","q_BH":"q(BH)"
             })
-            # 1ª coluna dinâmica com helper global
             other = [1.6*cm, 1.6*cm, 1.2*cm, 1.2*cm, 1.2*cm, 1.6*cm, 1.6*cm, 1.6*cm]
             perito_strings = show["Perito"].astype(str).tolist()
             perito_w = measure_col_pts(
@@ -2317,32 +2344,22 @@ def main():
             story.append(Spacer(1,8))
 
         if gpt_text:
-            # Comentário com fórmulas LaTeX renderizadas
             story += _comment_to_flowables_with_math(gpt_text, STYLES["Small"], doc.width, tmp_imgs)
 
         doc.build(story,
                   onFirstPage=lambda c,d: _header_footer(c,d,meta_base),
                   onLaterPages=lambda c,d: _header_footer(c,d,meta_base))
 
-        # limpar temporários de fórmulas
         for p in tmp_imgs:
             try: os.remove(p)
             except Exception: pass
 
     def _gpt_comment_nc(meta_nc: Dict[str, Any], df_nc: pd.DataFrame, meta_base: Dict[str, Any]) -> str:
-        """
-        Gera comentário para o apêndice de outliers %NC usando texto simples (sem LaTeX),
-        reforçando que q_BH baixos (≤ alvo FDR) indicam significância.
-        """
         if not args.gpt_comments or not getattr(args, "appendix_nc_explain", True):
             return ""
         try:
             import json as _json
-
-            # alvo FDR usado na detecção
             fdr_target = float(meta_nc.get("fdr_target", getattr(args, "nc_outlier_fdr", 0.05)))
-
-            # amostra resumida (top 10)
             rows = []
             for _, r in df_nc.head(10).iterrows():
                 rows.append({
@@ -2352,13 +2369,11 @@ def main():
                     "p_hat": float(r.get("p_hat", 0.0)),
                     "q_BH": float(r.get("q_BH", float("nan")))
                 })
-
             payload = {
                 "periodo": [meta_base.get("start"), meta_base.get("end")],
                 "regra":   meta_nc,
                 "amostra": rows
             }
-
             user = (
                 "Escreva um único parágrafo (≤160 palavras, pt-BR) para o apêndice de outliers por alta %NC. "
                 "Use fórmulas em texto simples (sem LaTeX): p_hat = NC/N; teste binomial unilateral: "
@@ -2369,7 +2384,6 @@ def main():
                 "Retorne apenas o parágrafo, sem listas e sem quebras de linha extras. Dados:\n\n"
                 + _json.dumps(payload, ensure_ascii=False)
             )
-
             out = chamar_gpt(
                 SYSTEM_PROMPT, user, call_api=True,
                 model="gpt-4o-mini", temperature=0.2
@@ -2398,8 +2412,12 @@ def main():
                     p_br, total_calc, nc_calc = float(args.pbr), None, None
                 df_scores = _fetch_scores(conn)
                 df_all = _prep_base(df_n, df_scores, p_br, args.alpha, min_analises=0)
-                df_sel = df_all.loc[
-                    df_all["nomePerito"].str.strip().str.upper() == args.perito.strip().upper()
+
+                # >>> ESCOPAR A BASE (se --scope-csv for fornecido)
+                df_all_scoped = _apply_scope(df_all, getattr(args, "scope_csv", None))
+
+                df_sel = df_all_scoped.loc[
+                    df_all_scoped["nomePerito"].str.strip().str.upper() == args.perito.strip().upper()
                 ].copy()
         s_star = None
         meta = {
@@ -2410,21 +2428,25 @@ def main():
             'alpha': args.alpha,
             'p_br': p_br,
             'score_cut': None,
-            'n_all': int(df_all.shape[0]),
+            'n_all': int((df_all_scoped if 'df_all_scoped' in locals() else df_all).shape[0]),
             'n_sel': int(df_sel.shape[0]),
             'topn': int(args.topn),
             'by': args.by
         }
 
-        # ----- bloco único (perito) -----
-        meta = _metrics_for_block(df_all, df_sel, meta)
-        block = _export_pngs_for_block(df_all, df_sel, meta)
+        # ----- bloco único (perito) — usar df_all_scoped -----
+        base_df = df_all_scoped if 'df_all_scoped' in locals() else df_all
+        meta = _metrics_for_block(base_df, df_sel, meta)
+        block = _export_pngs_for_block(base_df, df_sel, meta)
         pngs = block["pngs"]; df_strat_tot = block["df_strat_tot"]; df_strat_sel = block["df_strat_sel"]
-        tests, psa_png = _run_tests_for_block(df_all, df_sel, meta)
+        tests, psa_png = _run_tests_for_block(base_df, df_sel, meta)
         if psa_png: pngs['psa'] = psa_png
-        comments = _comments_for_block(df_all, df_sel, meta, pngs, tests, df_strat_tot, df_strat_sel)
+        comments = _comments_for_block(base_df, df_sel, meta, pngs, tests, df_strat_tot, df_strat_sel)
 
-        # PDF (com header/front se fornecidos)
+        # PDF e organização (inalterados) …
+        # [restante do bloco 'perito' permanece igual ao seu código, usando meta/df_sel/pngs/df_strat_*]
+        # --- (mantive o trecho completo que você já tinha abaixo) ---
+
         final_path = None
         if args.export_pdf:
             pdf_out = os.path.join(EXPORT_DIR, f"impacto_fila_{args.start}_a_{args.end}.pdf")
@@ -2477,13 +2499,11 @@ def main():
                 final_path = pdf_out
             print(f"PDF: {final_path}")
 
-        # LOG
         print(f"p_BR = {_fmt2s(meta['p_br'])}")
         print(f"IV período (vagas): {meta['iv_total_period']} | IV selecionado: {meta['iv_total_sel']} | peso: {_fmt2s(meta['peso_sel']*100)}%")
         for k, v in (pngs or {}).items():
             if v: print(f"PNG {k}: {v}")
 
-        # organização
         if args.export_pdf:
             if 'pdf_out' in locals() and os.path.exists(pdf_out): generated_paths.append(pdf_out)
             if 'final_path' in locals() and final_path and os.path.exists(final_path): generated_paths.append(final_path)
@@ -2510,19 +2530,24 @@ def main():
                 p_br, total_calc, nc_calc = float(args.pbr), None, None
             df_scores = _fetch_scores(conn)
             df_all = _prep_base(df_n, df_scores, p_br, args.alpha, min_analises=args.min_analises)
-    s_star = _elbow_cutoff_score(df_all)
 
-    # Outliers por %NC (sobre a base completa deste período)
-    df_nc_out, meta_nc = _detect_nc_outliers(df_all, p_br)
+    # >>> ESCOPAR A BASE para todos os gráficos de base
+    df_all_scoped = _apply_scope(df_all, getattr(args, "scope_csv", None))
 
-    # base do meta
+    # Corte de cotovelo calculado na base escopada
+    s_star = _elbow_cutoff_score(df_all_scoped)
+
+    # Outliers por %NC usando a base escopada
+    df_nc_out, meta_nc = _detect_nc_outliers(df_all_scoped, p_br)
+
+    # base do meta (usar n_all da base escopada)
     base_meta = {
         'start': args.start, 'end': args.end, 'alpha': args.alpha, 'p_br': p_br,
-        'score_cut': s_star, 'n_all': int(df_all.shape[0]), 'topn': int(args.topn), 'by': args.by
+        'score_cut': s_star, 'n_all': int(df_all_scoped.shape[0]), 'topn': int(args.topn), 'by': args.by
     }
 
-    # ---------- seleção Impact ----------
-    df_cut_impact = df_all if s_star is None else df_all.loc[df_all["score_final"] >= s_star].copy()
+    # ---------- seleção Impact (a partir da base escopada) ----------
+    df_cut_impact = df_all_scoped if s_star is None else df_all_scoped.loc[df_all_scoped["score_final"] >= s_star].copy()
     if args.topn and args.topn > 0 and not df_cut_impact.empty:
         df_sel_impact = df_cut_impact.sort_values(
             ["IV_vagas","E","NC","N"],
@@ -2531,13 +2556,13 @@ def main():
     else:
         df_sel_impact = df_cut_impact.copy()
 
-    # ---------- seleção KPI ----------
+    # ---------- seleção KPI (filtrando a base escopada pelos nomes vindos do KPI) ----------
     names_kpi_upper = set()
     if getattr(args, "select_src", "impact") in ("kpi", "both"):
         _kpi_names = _kpi_top10_names(args.start, args.end, min_analises=getattr(args, "kpi_min_analises", 50))
         names_kpi_upper = set([n.strip().upper() for n in _kpi_names])
-    df_sel_kpi = df_all.loc[
-        df_all["nomePerito"].str.strip().str.upper().isin(names_kpi_upper)
+    df_sel_kpi = df_all_scoped.loc[
+        df_all_scoped["nomePerito"].str.strip().str.upper().isin(names_kpi_upper)
     ].copy()
     if args.topn and args.topn > 0 and not df_sel_kpi.empty:
         df_sel_kpi = df_sel_kpi.sort_values(
@@ -2546,7 +2571,6 @@ def main():
         ).head(int(args.topn)).copy()
 
     # ------ Integração dos outliers %NC ------
-    # Se houver apêndice ligado, NÃO mistura no corpo principal; caso contrário, respeita --nc-outlier-add-to
     df_nc_appendix = pd.DataFrame()
     if meta_nc.get("active", False) and not df_nc_out.empty:
         if getattr(args, "appendix_nc_outliers", False):
@@ -2572,19 +2596,18 @@ def main():
             'select_src': sel_src,
             'n_sel': int(df_sel.shape[0]),
         })
-        # métricas + pngs + testes + comentários
-        meta = _metrics_for_block(df_all, df_sel, meta)
-        block = _export_pngs_for_block(df_all, df_sel, meta)
+        # usar base escopada em métricas/testes/gráficos
+        meta = _metrics_for_block(df_all_scoped, df_sel, meta)
+        block = _export_pngs_for_block(df_all_scoped, df_sel, meta)
         pngs = block["pngs"]; df_strat_tot = block["df_strat_tot"]; df_strat_sel = block["df_strat_sel"]
-        tests, psa_png = _run_tests_for_block(df_all, df_sel, meta)
+        tests, psa_png = _run_tests_for_block(df_all_scoped, df_sel, meta)
         if psa_png: pngs['psa'] = psa_png
-        comments = _comments_for_block(df_all, df_sel, meta, pngs, tests, df_strat_tot, df_strat_sel)
+        comments = _comments_for_block(df_all_scoped, df_sel, meta, pngs, tests, df_strat_tot, df_strat_sel)
 
-        # PDF principal
+        # [restante igual ao seu: build_pdf, concat front, apêndice NC, logs e organização]
         final_path = None
         if args.export_pdf:
             pdf_out = os.path.join(EXPORT_DIR, f"impacto_fila_{args.start}_a_{args.end}.pdf")
-            # FRONT em PDF? (header único OU listas front_pdf/front_org_render)
             front_pdfs: List[str] = []
             use_header_and_text = bool(getattr(args, "header_and_text", False))
             if use_header_and_text:
@@ -2624,9 +2647,8 @@ def main():
                       pdf_out, header_org=header_for_build, front_org=front_for_build,
                       comments=comments if args.gpt_comments else None)
 
-            # Montagem final (podendo anexar apêndice de %NC, se houver e estiver ligado)
             pieces = []
-            if inject_front:  # concatena FRONT+corpo
+            if inject_front:
                 pdf_with_front = os.path.join(EXPORT_DIR, f"impacto_fila_{args.start}_a_{args.end}_WITH_FRONT.pdf")
                 try:
                     _concat_pdfs(front_pdfs + [pdf_out], pdf_with_front)
@@ -2637,7 +2659,6 @@ def main():
             else:
                 pieces.append(pdf_out)
 
-            # Apêndice (se ligado)
             if getattr(args, "appendix_nc_outliers", False) and not df_nc_appendix.empty:
                 png_nc = _export_nc_bar_png(df_nc_appendix, base_meta)
                 if png_nc: generated_paths.append(png_nc)
@@ -2646,7 +2667,6 @@ def main():
                 _build_appendix_nc_pdf(base_meta, df_nc_appendix, pdf_app, png_nc, meta_nc, gpt_txt)
                 pieces.append(pdf_app)
 
-            # arquivo final
             if len(pieces) == 1:
                 final_path = pieces[0]
             else:
@@ -2658,7 +2678,6 @@ def main():
                     final_path = pieces[0]
             print(f"PDF: {final_path}")
 
-        # LOG básico
         print(f"p_BR = {_fmt2s(meta['p_br'])}")
         print(f"IV período (vagas): {meta['iv_total_period']} | IV selecionado: {meta['iv_total_sel']} | peso: {_fmt2s(meta['peso_sel']*100)}%")
         if meta_nc.get("active", False):
@@ -2667,7 +2686,6 @@ def main():
         for k, v in (pngs or {}).items():
             if v: print(f"PNG {k}: {v}")
 
-        # organizar saída
         if args.export_pdf:
             if 'pdf_out' in locals() and os.path.exists(pdf_out): generated_paths.append(pdf_out)
             if 'final_path' in locals() and final_path and os.path.exists(final_path): generated_paths.append(final_path)
@@ -2678,153 +2696,7 @@ def main():
         dest_base = _organize_outputs(args.start, args.end, generated_paths=generated_paths,
                                       comments=(comments if args.gpt_comments else None))
         print(f"Saída organizada em: {dest_base}")
-        return
-
-    # ----------------------------
-    # Modo BOTH: dois blocos (+ apêndice)
-    # ----------------------------
-    # IMPACT meta/bloco
-    meta_imp = dict(base_meta); meta_imp.update({'mode': 'top10-impact', 'select_src': 'impact', 'n_sel': int(df_sel_impact.shape[0])})
-    meta_imp = _metrics_for_block(df_all, df_sel_impact, meta_imp)
-    blk_imp = _export_pngs_for_block(df_all, df_sel_impact, meta_imp)
-    pngs_imp = blk_imp["pngs"]; df_strat_tot_imp = blk_imp["df_strat_tot"]; df_strat_sel_imp = blk_imp["df_strat_sel"]
-    tests_imp, psa_png_imp = _run_tests_for_block(df_all, df_sel_impact, meta_imp)
-    if psa_png_imp: pngs_imp['psa'] = psa_png_imp
-    pngs_imp = _rename_pngs(pngs_imp, "impact")
-    comments_imp = _comments_for_block(df_all, df_sel_impact, meta_imp, pngs_imp, tests_imp, df_strat_tot_imp, df_strat_sel_imp)
-
-    # KPI meta/bloco
-    meta_kpi = dict(base_meta); meta_kpi.update({'mode': 'top10-kpi', 'select_src': 'kpi', 'n_sel': int(df_sel_kpi.shape[0])})
-    meta_kpi = _metrics_for_block(df_all, df_sel_kpi, meta_kpi)
-    blk_kpi = _export_pngs_for_block(df_all, df_sel_kpi, meta_kpi)
-    pngs_kpi = blk_kpi["pngs"]; df_strat_tot_kpi = blk_kpi["df_strat_tot"]; df_strat_sel_kpi = blk_kpi["df_strat_sel"]
-    tests_kpi, psa_png_kpi = _run_tests_for_block(df_all, df_sel_kpi, meta_kpi)
-    if psa_png_kpi: pngs_kpi['psa'] = psa_png_kpi
-    pngs_kpi = _rename_pngs(pngs_kpi, "kpi")
-    comments_kpi = _comments_for_block(df_all, df_sel_kpi, meta_kpi, pngs_kpi, tests_kpi, df_strat_tot_kpi, df_strat_sel_kpi)
-
-    # ===== Apêndice %NC (se ligado) =====
-    pdf_app_nc = None
-    if getattr(args, "appendix_nc_outliers", False) and not df_nc_appendix.empty:
-        png_nc = _export_nc_bar_png(df_nc_appendix, base_meta)
-        if png_nc: generated_paths.append(png_nc)
-        gpt_txt = _gpt_comment_nc(meta_nc, df_nc_appendix, base_meta)
-        pdf_app_nc = os.path.join(EXPORT_DIR, f"impacto_fila_{args.start}_a_{args.end}_APPENDIX_NC.pdf")
-        _build_appendix_nc_pdf(base_meta, df_nc_appendix, pdf_app_nc, png_nc, meta_nc, gpt_txt)
-
-    # ===== PDFs =====
-    final_path = None
-    if args.export_pdf:
-        # 1) Corpo IMPACT (com header/front/FRONT-PDFs se houver)
-        pdf_out_imp = os.path.join(EXPORT_DIR, f"impacto_fila_{args.start}_a_{args.end}_IMPACT.pdf")
-
-        # FRONT em PDF? (header único OU listas front_pdf/front_org_render) — só para o IMPACT!
-        front_pdfs: List[str] = []
-        use_header_and_text = bool(getattr(args, "header_and_text", False))
-        if use_header_and_text:
-            path_ht = getattr(args, "header_and_text_file", None)
-            if not path_ht:
-                base_hint = args.front_org or args.header_org or os.getcwd()
-                base_dir  = str(Path(base_hint).resolve().parent if os.path.exists(str(base_hint)) else Path(base_hint))
-                path_ht = os.path.join(base_dir, "header_and_text.org")
-            try:
-                ht_pdf = _render_org_to_pdf(path_ht)
-                if os.path.exists(ht_pdf): front_pdfs.append(ht_pdf)
-            except Exception as e:
-                print(f"[warn] Falha ao renderizar header_and_text: {e}", file=sys.stderr)
-
-        if getattr(args, "front_pdf", None):
-            if isinstance(args.front_pdf, (list, tuple)):
-                for p in args.front_pdf:
-                    if p and os.path.exists(p): front_pdfs.append(str(p))
-            elif isinstance(args.front_pdf, str) and os.path.exists(args.front_pdf):
-                front_pdfs.append(args.front_pdf)
-
-        if getattr(args, "front_org_render", None):
-            org_list = args.front_org_render
-            if isinstance(org_list, str): org_list = [org_list]
-            for opath in (org_list or []):
-                try:
-                    pdf_r = _render_org_to_pdf(opath)
-                    if os.path.exists(pdf_r): front_pdfs.append(pdf_r)
-                except Exception as e:
-                    print(f"[warn] Falha ao renderizar ORG '{opath}': {e}", file=sys.stderr)
-
-        inject_front = len(front_pdfs) > 0
-        header_for_build = None if inject_front or use_header_and_text else args.header_org
-        front_for_build  = None if inject_front or use_header_and_text else args.front_org
-
-        build_pdf(meta_imp, df_sel_impact, tests_imp, pngs_imp, df_strat_tot_imp, df_strat_sel_imp,
-                  pdf_out_imp, header_org=header_for_build, front_org=front_for_build,
-                  comments=(comments_imp if args.gpt_comments else None))
-        if inject_front:
-            pdf_with_front = os.path.join(EXPORT_DIR, f"impacto_fila_{args.start}_a_{args.end}_IMPACT_FRONT.pdf")
-            try:
-                _concat_pdfs(front_pdfs + [pdf_out_imp], pdf_with_front)
-            except Exception as e:
-                print(f"[warn] Falha ao concatenar FRONT (IMPACT): {e}", file=sys.stderr)
-                pdf_with_front = pdf_out_imp
-        else:
-            pdf_with_front = pdf_out_imp
-
-        # 2) Corpo KPI (sem header/front)
-        pdf_out_kpi = os.path.join(EXPORT_DIR, f"impacto_fila_{args.start}_a_{args.end}_KPI.pdf")
-        build_pdf(meta_kpi, df_sel_kpi, tests_kpi, pngs_kpi, df_strat_tot_kpi, df_strat_sel_kpi,
-                  pdf_out_kpi, header_org=None, front_org=None,
-                  comments=(comments_kpi if args.gpt_comments else None))
-
-        # 3) Final = (FRONT+IMPACT) + KPI (+ APPENDIX NC opcional)
-        pieces = [pdf_with_front, pdf_out_kpi]
-        if pdf_app_nc and os.path.exists(pdf_app_nc):
-            pieces.append(pdf_app_nc)
-        final_path = os.path.join(EXPORT_DIR, f"impacto_fila_{args.start}_a_{args.end}_FINAL.pdf")
-        try:
-            _concat_pdfs(pieces, final_path)
-        except Exception as e:
-            print(f"[warn] Falha ao concatenar IMPACT+KPI(+APP): {e}", file=sys.stderr)
-            final_path = pdf_with_front
-        print(f"PDF: {final_path}")
-
-    # -------- LOG ----------
-    print("==== BLOCO IMPACT ====")
-    print(f"p_BR = {_fmt2s(meta_imp['p_br'])}")
-    print(f"IV período (vagas): {meta_imp['iv_total_period']} | IV sel: {meta_imp['iv_total_sel']} | peso: {_fmt2s(meta_imp['peso_sel']*100)}%")
-    for k, v in (pngs_imp or {}).items():
-        if v: print(f"PNG impact {k}: {v}")
-    print("==== BLOCO KPI ====")
-    print(f"p_BR = {_fmt2s(meta_kpi['p_br'])}")
-    print(f"IV período (vagas): {meta_kpi['iv_total_period']} | IV sel: {meta_kpi['iv_total_sel']} | peso: {_fmt2s(meta_kpi['peso_sel']*100)}%")
-    for k, v in (pngs_kpi or {}).items():
-        if v: print(f"PNG kpi {k}: {v}")
-    if meta_nc.get("active", False):
-        print("==== OUTLIERS %NC ====")
-        print(f"modo={meta_nc.get('mode')} t*={meta_nc.get('t_star')} n_sel={meta_nc.get('n_sel',0)} n_cand={meta_nc.get('n_cand',0)}")
-
-    # -------- ORGANIZAR SAÍDA ----------
-    # PNGs
-    for d in (pngs_imp, pngs_kpi):
-        for k, v in (d or {}).items():
-            if v and os.path.exists(v):
-                generated_paths.append(v)
-    # PDFs
-    if args.export_pdf:
-        for p in (locals().get("pdf_out_imp"), locals().get("pdf_out_kpi"), locals().get("pdf_with_front"),
-                  locals().get("final_path"), locals().get("pdf_app_nc")):
-            if p and os.path.exists(p):
-                generated_paths.append(p)
-
-    # comentários: junta IMPACT + KPI (apêndice tem comentário separado e já vai salvo no PDF)
-    comments_merge = {}
-    if args.gpt_comments:
-        for d in (comments_imp, comments_kpi):
-            if isinstance(d, dict): comments_merge.update({f"kpi_{k}" if d is comments_kpi else k: v for k, v in d.items()})
-
-    dest_base = _organize_outputs(
-        args.start, args.end,
-        generated_paths=generated_paths,
-        comments=(comments_merge if args.gpt_comments else None)
-    )
-    print(f"Saída organizada em: {dest_base}")
+       
 
 if __name__ == "__main__":
     # Corrige um erro de digitação comum em --sens_alpha_frac

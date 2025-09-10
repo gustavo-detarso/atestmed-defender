@@ -4,23 +4,27 @@
 """
 Compara a porcentagem dos motivos de não conformidade (NC) de:
   a) um PERITO específico (vs Brasil excluindo esse perito), ou
-  b) o GRUPO dos 10 piores peritos por scoreFinal (vs Brasil excluindo o grupo),
-
-usando a DESCRIÇÃO no eixo X (texto em protocolos.motivo, com fallback para o código).
+  b) o GRUPO dos 10 piores peritos por scoreFinal (vs Brasil excluindo o grupo), ou
+  c) um GRUPO a partir de CSV (Fluxo B) com 'nomePerito' (vs Brasil excluindo o grupo, opcionalmente
+     restrito a um ESCOPO fornecido por outro CSV).
 
 Regras IMPORTANTES:
-- A definição de NC é robusta e considera:
-    NC = (conformado = 0)  OU  (motivoNaoConformado, mesmo como TEXTO, não-vazio e CAST(...) <> 0)
-  OBS: O campo protocolos.motivo é usado APENAS como DESCRIÇÃO para o gráfico/tabelas, e não
-       influencia na contagem de NC.
+- NC robusto:
+    NC = (conformado = 0)  OU  (motivoNaoConformado, mesmo TEXTO, não-vazio e CAST(...) <> 0)
+  OBS: protocolos.motivo é apenas DESCRIÇÃO (eixo X), não define NC.
 - Compatibilidade de schema:
-    * Detecta a tabela de análises: analises OU analises_atestmed
+    * Detecta tabela de análises: analises OU analises_atestmed
     * Usa substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
-- Backend Matplotlib = Agg (gera PNG em ambiente headless)
+- Backend Matplotlib = Agg
 
 Saídas:
 --export-org, --export-md (opcional), --export-png, --export-comment (MD legado),
 --export-comment-org (insere comentário no .org), --chart (ASCII)
+
+Fluxo B:
+- --peritos-csv <top10_peritos.csv> : lista exata do grupo
+- --scope-csv   <scope_gate_b.csv>  : restringe o universo “Brasil (excl.)” ao escopo do gate
+- --fluxo A|B (opcional, log)
 
 Parâmetros visuais:
 --label-maxlen (abrevia rótulos do eixo X com “…”)
@@ -324,8 +328,9 @@ def _get_counts_single(conn: sqlite3.Connection, start: str, end: str, perito: s
 
     return df_p, df_b
 
-def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: List[str], schema: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Agrega motivos do grupo (Top10) vs Brasil (excl.)."""
+def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: List[str], schema: Dict[str, Any],
+                      scope_names: Optional[List[str]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Agrega motivos do grupo vs Brasil (excl.). Se scope_names for dado, restringe o universo Brasil ao escopo."""
     if not peritos:
         return pd.DataFrame(columns=['descricao','n']), pd.DataFrame(columns=['descricao','n'])
 
@@ -356,29 +361,56 @@ def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: L
     else:
         cond_nc_total = " 0 "
 
-    placeholders = ",".join(["?"] * len(peritos))
-    where_in  = f"IN ({placeholders})"
-    where_out = f"NOT IN ({placeholders})"
+    peritos_upper = [p.strip().upper() for p in peritos]
+    placeholders  = ",".join(["?"] * len(peritos_upper))
+    where_in      = f"IN ({placeholders})"
+    where_out     = f"NOT IN ({placeholders})"
 
-    base_select = f"""
+    # Grupo (IN)
+    q_grp = f"""
         SELECT {desc_expr}, COUNT(*) AS n
           FROM {t} a
           JOIN peritos p ON p.siapePerito = a.siapePerito
           {join_prot}
-         WHERE TRIM(UPPER(p.nomePerito)) {{cmp}}
+         WHERE TRIM(UPPER(p.nomePerito)) {where_in}
            AND substr(a.{date_col},1,10) BETWEEN ? AND ?
            AND ( {cond_nc_total} )
          GROUP BY descricao
     """
-
-    q_grp = base_select.format(cmp=where_in)
-    q_out = base_select.format(cmp=where_out)
-
-    peritos_upper = [p.strip().upper() for p in peritos]
     df_g = _fetch_df(conn, q_grp, tuple(peritos_upper) + (start, end))
-    df_b = _fetch_df(conn, q_out, tuple(peritos_upper) + (start, end))
-
     if not df_g.empty: df_g['descricao'] = df_g['descricao'].astype(str).str.strip()
+
+    # Brasil (excl.) — com escopo opcional
+    if scope_names:
+        scope_upper = [s.strip().upper() for s in scope_names]
+        scope_ph    = ",".join(["?"] * len(scope_upper))
+        where_scope = f"IN ({scope_ph})"
+        q_out_scoped = f"""
+            SELECT {desc_expr}, COUNT(*) AS n
+              FROM {t} a
+              JOIN peritos p ON p.siapePerito = a.siapePerito
+              {join_prot}
+             WHERE TRIM(UPPER(p.nomePerito)) {where_out}
+               AND TRIM(UPPER(p.nomePerito)) {where_scope}
+               AND substr(a.{date_col},1,10) BETWEEN ? AND ?
+               AND ( {cond_nc_total} )
+             GROUP BY descricao
+        """
+        params = tuple(peritos_upper) + tuple(scope_upper) + (start, end)
+        df_b = _fetch_df(conn, q_out_scoped, params)
+    else:
+        q_out = f"""
+            SELECT {desc_expr}, COUNT(*) AS n
+              FROM {t} a
+              JOIN peritos p ON p.siapePerito = a.siapePerito
+              {join_prot}
+             WHERE TRIM(UPPER(p.nomePerito)) {where_out}
+               AND substr(a.{date_col},1,10) BETWEEN ? AND ?
+               AND ( {cond_nc_total} )
+             GROUP BY descricao
+        """
+        df_b = _fetch_df(conn, q_out, tuple(peritos_upper) + (start, end))
+
     if not df_b.empty: df_b['descricao'] = df_b['descricao'].astype(str).str.strip()
     return df_g, df_b
 
@@ -429,8 +461,9 @@ def _get_nc_rates_single(conn: sqlite3.Connection, start: str, end: str, perito:
     return rate_p, rate_b
 
 
-def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos: List[str], schema: Dict[str, Any]) -> Tuple[float, float]:
-    """Retorna (taxa NC grupo %, taxa NC Brasil-excl-grupo %)."""
+def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos: List[str], schema: Dict[str, Any],
+                        scope_names: Optional[List[str]] = None) -> Tuple[float, float]:
+    """Retorna (taxa NC grupo %, taxa NC Brasil-excl-grupo %). Respeita escopo se fornecido."""
     if not peritos:
         return 0.0, 0.0
 
@@ -459,9 +492,10 @@ def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos:
     else:
         cond_nc_total = " 0 "
 
-    placeholders = ",".join(["?"] * len(peritos))
-    where_in  = f"IN ({placeholders})"
-    where_out = f"NOT IN ({placeholders})"
+    peritos_upper = [p.strip().upper() for p in peritos]
+    placeholders  = ",".join(["?"] * len(peritos_upper))
+    where_in      = f"IN ({placeholders})"
+    where_out     = f"NOT IN ({placeholders})"
 
     q_grp = f"""
         SELECT COUNT(*) AS total,
@@ -472,20 +506,37 @@ def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos:
          WHERE TRIM(UPPER(p.nomePerito)) {where_in}
            AND substr(a.{date_col},1,10) BETWEEN ? AND ?
     """
-    q_out = f"""
-        SELECT COUNT(*) AS total,
-               SUM(CASE WHEN {cond_nc_total} THEN 1 ELSE 0 END) AS nc
-          FROM {t} a
-          JOIN peritos p ON p.siapePerito = a.siapePerito
-          {join_prot}
-         WHERE TRIM(UPPER(p.nomePerito)) {where_out}
-           AND substr(a.{date_col},1,10) BETWEEN ? AND ?
-    """
-    peritos_upper = [p.strip().upper() for p in peritos]
     row_g = conn.execute(q_grp, tuple(peritos_upper) + (start, end)).fetchone()
-    row_b = conn.execute(q_out, tuple(peritos_upper) + (start, end)).fetchone()
-
     total_g = int(row_g[0] or 0); nc_g = int(row_g[1] or 0)
+
+    if scope_names:
+        scope_upper = [s.strip().upper() for s in scope_names]
+        scope_ph    = ",".join(["?"] * len(scope_upper))
+        where_scope = f"IN ({scope_ph})"
+        q_out_scoped = f"""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN {cond_nc_total} THEN 1 ELSE 0 END) AS nc
+              FROM {t} a
+              JOIN peritos p ON p.siapePerito = a.siapePerito
+              {join_prot}
+             WHERE TRIM(UPPER(p.nomePerito)) {where_out}
+               AND TRIM(UPPER(p.nomePerito)) {where_scope}
+               AND substr(a.{date_col},1,10) BETWEEN ? AND ?
+        """
+        params = tuple(peritos_upper) + tuple(scope_upper) + (start, end)
+        row_b = conn.execute(q_out_scoped, params).fetchone()
+    else:
+        q_out = f"""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN {cond_nc_total} THEN 1 ELSE 0 END) AS nc
+              FROM {t} a
+              JOIN peritos p ON p.siapePerito = a.siapePerito
+              {join_prot}
+             WHERE TRIM(UPPER(p.nomePerito)) {where_out}
+               AND substr(a.{date_col},1,10) BETWEEN ? AND ?
+        """
+        row_b = conn.execute(q_out, tuple(peritos_upper) + (start, end)).fetchone()
+
     total_b = int(row_b[0] or 0); nc_b = int(row_b[1] or 0)
 
     rate_g  = (nc_g / total_g * 100.0) if total_g > 0 else 0.0
@@ -610,6 +661,67 @@ def _build_comparativo_top10(start: str, end: str, topn: int = 10, min_analises:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Fluxo B (CSV do grupo + escopo do gate)
+# ──────────────────────────────────────────────────────────────────────
+
+def _load_names_from_csv(path: str) -> List[str]:
+    df = pd.read_csv(path)
+    col = next((c for c in df.columns if c.lower() == "nomeperito"), None)
+    if not col:
+        raise RuntimeError("CSV sem coluna 'nomePerito'.")
+    return df[col].astype(str).str.strip().tolist()
+
+def _build_comparativo_group_from_csv(start: str, end: str,
+                                      peritos_csv: str,
+                                      scope_csv: Optional[str],
+                                      topn: int = 10) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    peritos = _load_names_from_csv(peritos_csv)
+    scope_names = _load_names_from_csv(scope_csv) if scope_csv and os.path.exists(scope_csv) else None
+
+    with sqlite3.connect(DB_PATH) as conn:
+        schema = _detect_schema(conn)
+        df_g, df_b = _get_counts_group(conn, start, end, peritos, schema, scope_names=scope_names)
+
+        total_g = int(df_g['n'].sum()) if not df_g.empty else 0
+        total_b = int(df_b['n'].sum()) if not df_b.empty else 0
+
+        if df_g.empty: df_g = pd.DataFrame(columns=['descricao', 'n'])
+        if df_b.empty: df_b = pd.DataFrame(columns=['descricao', 'n'])
+
+        df = pd.merge(
+            df_b.rename(columns={'n': 'n_brasil'}),
+            df_g.rename(columns={'n': 'n_perito'}),
+            on='descricao', how='outer'
+        ).fillna(0)
+
+        df['n_brasil'] = df['n_brasil'].astype(int)
+        df['n_perito'] = df['n_perito'].astype(int)
+        df['pct_brasil'] = (df['n_brasil'] / total_b * 100.0) if total_b > 0 else 0.0
+        df['pct_perito'] = (df['n_perito'] / total_g * 100.0) if total_g > 0 else 0.0
+
+        nc_rate_g, nc_rate_b = _get_nc_rates_group(conn, start, end, peritos, schema, scope_names=scope_names)
+
+    df = df.sort_values(['pct_brasil', 'n_brasil'], ascending=[False, False]).head(topn).reset_index(drop=True)
+
+    label_lhs = "Top 10 piores" if len(peritos) == 10 else "Grupo"
+    meta = {
+        'mode': 'top10',  # mantém layout “Top 10” nos exports
+        'peritos_lista': peritos,
+        'start': start,
+        'end': end,
+        'total_p': total_g,
+        'total_b': total_b,
+        'nc_rate_p': nc_rate_g,
+        'nc_rate_b': nc_rate_b,
+        'label_lhs': label_lhs,
+        'label_rhs': 'Brasil (excl.)',
+        'safe_stub': 'Top 10 piores' if len(peritos) == 10 else 'Grupo',
+        'scope_aplicado': bool(scope_names),
+    }
+    return df, meta
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Filtros (cuts) e Top-N
 # ──────────────────────────────────────────────────────────────────────
 
@@ -660,9 +772,9 @@ def exportar_md(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any]) ->
 
     if df.empty:
         if meta['mode'] == 'top10':
-            md = (f"# Motivos de NC – Top 10 piores vs Brasil (excl.)\n\n"
+            md = (f"# Motivos de NC – {meta['label_lhs']} vs Brasil (excl.)\n\n"
                   f"**Período:** {meta['start']} a {meta['end']}\n\n"
-                  f"Sem dados de não conformidade no período para o Top 10 e/ou Brasil (excl.).\n")
+                  f"Sem dados de não conformidade no período para o grupo e/ou Brasil (excl.).\n")
         else:
             md = (f"# Motivos de NC – {meta['label_lhs']} vs {meta['label_rhs']}\n\n"
                   f"**Período:** {meta['start']} a {meta['end']}\n\n"
@@ -674,12 +786,12 @@ def exportar_md(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any]) ->
 
     if meta['mode'] == 'top10':
         header = (
-            f"# Motivos de NC – Top 10 piores vs Brasil (excl.)\n\n"
+            f"# Motivos de NC – {meta['label_lhs']} vs Brasil (excl.)\n\n"
             f"**Período:** {meta['start']} a {meta['end']}\n\n"
-            f"**Top 10 piores (scoreFinal):** {', '.join(meta.get('peritos_lista', []))}\n\n"
-            f"**Total NC Top 10:** {meta['total_p']}  "
+            f"**{meta['label_lhs']}:** {', '.join(meta.get('peritos_lista', []))}\n\n"
+            f"**Total NC {meta['label_lhs']}:** {meta['total_p']}  "
             f"**Total NC Brasil (excl.):** {meta['total_b']}\n\n"
-            f"**Taxa NC Top 10:** {meta['nc_rate_p']:.1f}%  "
+            f"**Taxa NC {meta['label_lhs']}:** {meta['nc_rate_p']:.1f}%  "
             f"**Taxa NC Brasil (excl.):** {meta['nc_rate_b']:.1f}%\n\n"
             f"**Cortes aplicados:** {cuts}\n\n"
         )
@@ -716,17 +828,19 @@ def exportar_org(df: pd.DataFrame, meta: Dict[str, Any], cuts: Dict[str, Any],
     path = os.path.join(EXPORT_DIR, fname)
 
     lines = []
-    title = "Motivos de NC – Top 10 piores vs Brasil (excl.)" if meta['mode']=='top10' \
+    title = f"Motivos de NC – {meta['label_lhs']} vs Brasil (excl.)" if meta['mode']=='top10' \
             else f"Motivos de NC – {meta['label_lhs']} vs {meta['label_rhs']}"
     lines.append(f"* {title}")
     lines.append(":PROPERTIES:")
     lines.append(f":PERIODO: {meta['start']} a {meta['end']}")
-    if meta['mode']=='top10' and meta.get('peritos_lista'):
-        lines.append(f":TOP10: {', '.join(meta['peritos_lista'])}")
+    if meta.get('peritos_lista'):
+        lines.append(f":GRUPO: {', '.join(meta['peritos_lista'])}")
     lines.append(f":NC_{meta['label_lhs']}: {meta['nc_rate_p']:.1f}%")
     lines.append(f":NC_{meta['label_rhs']}: {meta['nc_rate_b']:.1f}%")
     cuts_str = ", ".join([f"{k}={v}" for k, v in cuts.items() if v is not None]) or "nenhum"
     lines.append(f":CUTS: {cuts_str}")
+    if meta.get('scope_aplicado', False):
+        lines.append(f":ESCOPO: aplicado ao Brasil (excl.)")
     lines.append(":END:\n")
 
     # Tabela
@@ -788,7 +902,7 @@ def exportar_png(df: pd.DataFrame, meta: Dict[str, Any],
     ax.tick_params(axis='x', labelsize=label_fontsize)
 
     ax.set_ylabel("% dentro dos NC")
-    title_main = "Motivos de NC – Top 10 piores vs Brasil (excl.)" if meta['mode']=='top10' \
+    title_main = f"Motivos de NC – {meta['label_lhs']} vs Brasil (excl.)" if meta['mode']=='top10' \
                  else f"Motivos de NC – {meta['label_lhs']} vs {meta['label_rhs']}"
     ax.set_title(f"{title_main}\n{meta['start']} a {meta['end']}", pad=10)
     ax.grid(axis='y', linestyle='--', alpha=0.5)
@@ -853,7 +967,7 @@ def exibir_chart_ascii(df: pd.DataFrame, meta: Dict[str, Any], label_maxlen: int
         [df['pct_perito'].tolist(), df['pct_brasil'].tolist()],
         labels=[label_lhs, label_rhs]
     )
-    p.title("Motivos de NC – Top 10 piores vs Brasil (excl.)" if meta['mode']=='top10'
+    p.title(f"Motivos de NC – {meta['label_lhs']} vs {meta['label_rhs']}" if meta['mode']=='top10'
             else f"Motivos de NC – {meta['label_lhs']} vs {meta['label_rhs']}")
     p.xlabel("Motivo"); p.ylabel("% nos NC")
     p.plotsize(100, 20)
@@ -1014,7 +1128,8 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=(
             "Compara a porcentagem dos motivos de NC: perito (ou Top 10 piores por scoreFinal) "
-            "versus Brasil (excluindo o(s) perito(s)) no período (X = descrição)."
+            "versus Brasil (excluindo o(s) perito(s)) no período (X = descrição). "
+            "Suporta Fluxo B via --peritos-csv e --scope-csv."
         )
     )
     ap.add_argument('--start', required=True, help='Data inicial YYYY-MM-DD')
@@ -1031,11 +1146,11 @@ def parse_args() -> argparse.Namespace:
 
     # cuts (sem '%' nos textos para evitar crash do argparse)
     ap.add_argument('--min-pct-perito', type=float, default=None,
-                    help='Filtro: porcentagem do perito maior ou igual a X')
+                    help='Filtro: porcentagem do perito/grupo maior ou igual a X')
     ap.add_argument('--min-pct-brasil', type=float, default=None,
                     help='Filtro: porcentagem do Brasil (excl.) maior ou igual a X')
     ap.add_argument('--min-n-perito', type=int, default=None,
-                    help='Filtro: contagem do perito maior ou igual a N')
+                    help='Filtro: contagem do perito/grupo maior ou igual a N')
     ap.add_argument('--min-n-brasil', type=int, default=None,
                     help='Filtro: contagem do Brasil (excl.) maior ou igual a N')
 
@@ -1044,6 +1159,14 @@ def parse_args() -> argparse.Namespace:
                     help='Comprimento máximo dos rótulos do eixo X (abrevia com …)')
     ap.add_argument('--label-fontsize', type=int, default=8,
                     help='Tamanho da fonte dos rótulos do eixo X (px)')
+
+    # Fluxo B
+    ap.add_argument('--peritos-csv', default=None,
+                    help="CSV com coluna nomePerito; se informado, ignora a seleção interna (usa exatamente esses nomes).")
+    ap.add_argument('--scope-csv', default=None,
+                    help="CSV com coluna nomePerito definindo o ESCOPO do Brasil (excl.); se presente, restringe o denominador do Brasil ao escopo.")
+    ap.add_argument('--fluxo', choices=['A','B'], default=None,
+                    help="Somente para log/telemetria.")
 
     # outputs
     ap.add_argument('--chart', action='store_true',
@@ -1075,11 +1198,17 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # monta DF base (sem filtros)
-    if args.top10:
-        df, meta = _build_comparativo_top10(args.start, args.end, args.topn, args.min_analises)
+    # Prioridade Fluxo B: se vier --peritos-csv, usa a lista EXATA (e o escopo opcional)
+    if args.peritos_csv:
+        df, meta = _build_comparativo_group_from_csv(args.start, args.end, args.peritos_csv, args.scope_csv, args.topn)
+        if args.fluxo:
+            print(f"[fluxo={args.fluxo}] peritos_csv={os.path.basename(args.peritos_csv)} scope_csv={os.path.basename(args.scope_csv) if args.scope_csv else '-'}")
     else:
-        df, meta = _build_comparativo_single(args.start, args.end, args.perito, args.topn)
+        # Modos clássicos
+        if args.top10:
+            df, meta = _build_comparativo_top10(args.start, args.end, args.topn, args.min_analises)
+        else:
+            df, meta = _build_comparativo_single(args.start, args.end, args.perito, args.topn)
 
     # aplica cuts + reaplica topn
     df = aplicar_cuts_e_topn(
@@ -1093,7 +1222,8 @@ def main() -> None:
 
     # Saída no console
     if df.empty:
-        print("\n⚠️ Não há dados suficientes para comparação no período informado (após cortes/topN).\n")
+        ttl = meta.get('label_lhs', 'Grupo')
+        print(f"\n⚠️ Não há dados suficientes para comparação no período informado (após cortes/topN). Grupo: {ttl}\n")
     else:
         ttl = "Top 10 piores" if meta['mode']=='top10' else meta['label_lhs']
         print(f"\n📊 Motivos de NC – {ttl} vs {meta['label_rhs']} | {meta['start']} a {meta['end']}")

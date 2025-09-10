@@ -9,7 +9,7 @@ import sqlite3
 import argparse
 import re
 import json
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Set
 import pandas as pd
 
 import matplotlib
@@ -247,6 +247,12 @@ def parse_args():
     ap.add_argument('--min-analises', type=int, default=50,
                     help='Elegibilidade para Top 10 (mínimo de análises no período)')
 
+    # NOVO: integra Fluxo B (manifests) e escopo
+    ap.add_argument('--peritos-csv', default=None,
+                    help='CSV com a lista de peritos a usar no grupo (coluna nomePerito). Prioriza Fluxo B.')
+    ap.add_argument('--scope-csv', default=None,
+                    help='CSV com peritos que definem o ESCOPO do comparativo (ex.: coorte do gate do Fluxo B).')
+
     ap.add_argument('--mode', choices=['perito-share', 'task-share', 'time-share'],
                     default='task-share',
                     help=("Métrica de comparação: "
@@ -450,6 +456,29 @@ def _aggregate_group(stats: pd.DataFrame, names_set: set[str] | None, mode: str)
     return num, den, pct, detail
 
 # ────────────────────────────────────────────────────────────────────────────────
+# CSV helpers (Fluxo B / escopo)
+# ────────────────────────────────────────────────────────────────────────────────
+def _load_names_from_csv(path: Optional[str]) -> Optional[Set[str]]:
+    """Lê um CSV com coluna 'nomePerito' e retorna conjunto (case-insensitive)."""
+    if not path:
+        return None
+    try:
+        df = pd.read_csv(path)
+        if "nomePerito" not in df.columns:
+            return None
+        return {str(x).strip() for x in df["nomePerito"].dropna().astype(str).tolist()}
+    except Exception:
+        return None
+
+def _apply_scope_if_any(stats: pd.DataFrame, scope_csv: Optional[str]) -> pd.DataFrame:
+    """Se escopo for dado, limita stats aos peritos listados no CSV (gate do Fluxo B)."""
+    names = _load_names_from_csv(scope_csv)
+    if not names or stats.empty:
+        return stats
+    names_up = {n.strip().upper() for n in names}
+    return stats[stats["nomePerito"].str.upper().isin(names_up)].copy()
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Exportações (gráfico/markdown/org/comentário)
 # ────────────────────────────────────────────────────────────────────────────────
 def _unit_labels(mode: str) -> tuple[str, str]:
@@ -603,7 +632,8 @@ def _safe(name: str) -> str:
 def run_perito(start: str, end: str, perito: str, mode: str,
                export_md: bool, export_png: bool, export_org: bool,
                chart: bool, want_comment: bool, save_comment_md: bool, call_api: bool,
-               model: str, max_words: int, temperature: float) -> None:
+               model: str, max_words: int, temperature: float,
+               scope_csv: Optional[str]) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, _ = _detect_tables(conn)
         df = _load_period_intervals(conn, tbl, start, end)
@@ -615,12 +645,15 @@ def run_perito(start: str, end: str, perito: str, mode: str,
     # Calcula stats por perito
     stats = _compute_all_peritos_stats(df)
 
+    # (Opcional) aplica ESCOPO (gate B) também no individual — “Demais” fica restrito ao escopo
+    stats = _apply_scope_if_any(stats, scope_csv)
+
     if perito not in set(stats["nomePerito"]):
         similares = stats[stats["nomePerito"].str.contains(perito, case=False, na=False)]["nomePerito"].unique().tolist()
         sugest = f" Peritos semelhantes: {', '.join(similares)}." if similares else ""
-        raise ValueError(f"Perito '{perito}' não encontrado no período.{sugest}")
+        raise ValueError(f"Perito '{perito}' não encontrado no período (após escopo, se aplicado).{sugest}")
 
-    # Esquerda: somente o perito; Direita: todos exceto o perito
+    # Esquerda: somente o perito; Direita: todos exceto o perito (dentro do escopo, se houver)
     left_set  = {perito}
     right_set = set(stats["nomePerito"]) - left_set
 
@@ -702,12 +735,17 @@ def run_perito(start: str, end: str, perito: str, mode: str,
 def run_top10(start: str, end: str, min_analises: int, mode: str,
               export_md: bool, export_png: bool, export_org: bool,
               chart: bool, want_comment: bool, save_comment_md: bool, call_api: bool,
-              model: str, max_words: int, temperature: float) -> None:
+              model: str, max_words: int, temperature: float,
+              peritos_csv: Optional[str], scope_csv: Optional[str]) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, has_ind = _detect_tables(conn)
-        if not has_ind:
-            raise RuntimeError("Tabela 'indicadores' não encontrada — calcule indicadores antes de usar --top10.")
-        names = _top10_names(conn, tbl, start, end, min_analises)
+        # 1) Preferir lista externa (Fluxo B via manifests)
+        names = list(_load_names_from_csv(peritos_csv) or [])
+        # 2) Fallback → indicadores (Fluxo A)
+        if not names:
+            if not has_ind:
+                raise RuntimeError("Tabela 'indicadores' não encontrada — calcule indicadores ou passe --peritos-csv.")
+            names = _top10_names(conn, tbl, start, end, min_analises)
         if not names:
             print("⚠️ Nenhum perito elegível para Top 10 nesse período.")
             return
@@ -719,7 +757,13 @@ def run_top10(start: str, end: str, min_analises: int, mode: str,
 
     stats = _compute_all_peritos_stats(df)
 
-    left_set  = set(names)
+    # (Opcional) aplica ESCOPO (gate B) antes de formar os grupos
+    stats = _apply_scope_if_any(stats, scope_csv)
+
+    left_set  = {n for n in names if n in set(stats["nomePerito"])}
+    if not left_set:
+        print("⚠️ Nenhum dos peritos do Top 10 possui tarefas no período (após escopo, se aplicado).")
+        return
     right_set = set(stats["nomePerito"]) - left_set
 
     left_num, left_den, left_pct, _    = _aggregate_group(stats, left_set, mode)
@@ -774,7 +818,7 @@ def run_top10(start: str, end: str, min_analises: int, mode: str,
     if export_org or want_comment:
         _export_org(title, start, end, left_label, right_label,
                     left_num, left_den, left_pct, right_num, right_den, right_pct,
-                    mode, png, org, top_names=names, comment_text=comment_text)
+                    mode, png, org, top_names=sorted(left_set), comment_text=comment_text)
 
     if comment_text:
         _write_comment_org(stem, comment_text)
@@ -801,13 +845,15 @@ def main():
         run_top10(args.start, args.end, args.min_analises, args.mode,
                   args.export_md, args.export_png, args.export_org,
                   args.chart, want_comment, save_comment_md, auto_call_api,
-                  args.model, args.max_words, args.temperature)
+                  args.model, args.max_words, args.temperature,
+                  args.peritos_csv, args.scope_csv)
     else:
         perito = args.perito or args.nome
         run_perito(args.start, args.end, perito, args.mode,
                    args.export_md, args.export_png, args.export_org,
                    args.chart, want_comment, save_comment_md, auto_call_api,
-                   args.model, args.max_words, args.temperature)
+                   args.model, args.max_words, args.temperature,
+                   args.scope_csv)
 
 if __name__ == "__main__":
     main()

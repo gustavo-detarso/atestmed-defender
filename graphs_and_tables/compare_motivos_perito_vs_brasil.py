@@ -38,6 +38,11 @@ Cortes (cuts) para filtrar motivos antes do Top-N:
 --min-n-perito N       → descarta motivos com n do perito < N
 --min-n-brasil N       → descarta motivos com n do Brasil (excl.) < N
 
+Integrações Fluxo B (make_kpi_report):
+--fluxo {A,B}         → B (padrão) não altera lógica aqui, apenas para compatibilidade de CLI
+--peritos-csv PATH    → substitui a seleção Top 10 por uma lista explícita (coluna nomePerito)
+--scope-csv PATH      → limita o universo (Brasil e LHS) aos peritos do CSV (coluna nomePerito)
+
 Exemplo:
 python3 graphs_and_tables/compare_nc_rate.py \
   --start 2025-07-01 --end 2025-07-31 \
@@ -314,7 +319,8 @@ def _detect_schema(conn: sqlite3.Connection) -> Dict[str, Any]:
 def _fetch_df(conn: sqlite3.Connection, sql: str, params: Tuple) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn, params=params)
 
-def _get_counts_single(conn: sqlite3.Connection, start: str, end: str, perito: str, schema: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _get_counts_single(conn: sqlite3.Connection, start: str, end: str, perito: str, schema: Dict[str, Any],
+                       scope_upper: Optional[List[str]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Retorna (df_perito, df_brasil_excl) com colunas: ['descricao', 'n'].
     Descrição: COALESCE(NULLIF(TRIM(pr.motivo), ''), CAST(código AS TEXT))
@@ -350,6 +356,12 @@ def _get_counts_single(conn: sqlite3.Connection, start: str, end: str, perito: s
     else:
         cond_nc_total = " 0 "
 
+    # cláusula opcional de ESCOPO
+    scope_clause = ""
+    if scope_upper:
+        placeholders_scope = ",".join(["?"] * len(scope_upper))
+        scope_clause = f" AND TRIM(UPPER(p.nomePerito)) IN ({placeholders_scope}) "
+
     base_select = f"""
         SELECT {desc_expr},
                COUNT(*) AS n
@@ -357,6 +369,7 @@ def _get_counts_single(conn: sqlite3.Connection, start: str, end: str, perito: s
           JOIN peritos p ON p.siapePerito = a.siapePerito
           {join_prot}
          WHERE TRIM(UPPER(p.nomePerito)) {{cmp}}
+           {scope_clause}
            AND substr(a.{date_col},1,10) BETWEEN ? AND ?
            AND ( {cond_nc_total} )
          GROUP BY descricao
@@ -365,8 +378,13 @@ def _get_counts_single(conn: sqlite3.Connection, start: str, end: str, perito: s
     q_perito = base_select.format(cmp="= TRIM(UPPER(?))")
     q_outros = base_select.format(cmp="<> TRIM(UPPER(?))")
 
-    df_p = _fetch_df(conn, q_perito, (perito, start, end))
-    df_b = _fetch_df(conn, q_outros, (perito, start, end))
+    params_common: List[Any] = []
+    if scope_upper:
+        params_common.extend(scope_upper)
+    params_tail = [start, end]
+
+    df_p = _fetch_df(conn, q_perito, tuple([perito] + params_common + params_tail))
+    df_b = _fetch_df(conn, q_outros, tuple([perito] + params_common + params_tail))
 
     if not df_p.empty:
         df_p['descricao'] = df_p['descricao'].astype(str).str.strip()
@@ -375,9 +393,10 @@ def _get_counts_single(conn: sqlite3.Connection, start: str, end: str, perito: s
 
     return df_p, df_b
 
-def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: List[str], schema: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: List[str], schema: Dict[str, Any],
+                      scope_upper: Optional[List[str]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Agrega motivos do grupo de peritos (Top10) vs Brasil (excluindo o grupo).
+    Agrega motivos do grupo de peritos (Top10 ou lista CSV) vs Brasil (excluindo o grupo).
     Retorna (df_grupo, df_brasil_excl) com ['descricao', 'n'].
     """
     if not peritos:
@@ -414,6 +433,11 @@ def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: L
     where_in  = f"IN ({placeholders})"
     where_out = f"NOT IN ({placeholders})"
 
+    scope_clause = ""
+    if scope_upper:
+        placeholders_scope = ",".join(["?"] * len(scope_upper))
+        scope_clause = f" AND TRIM(UPPER(p.nomePerito)) IN ({placeholders_scope}) "
+
     base_select = f"""
         SELECT {desc_expr},
                COUNT(*) AS n
@@ -421,6 +445,7 @@ def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: L
           JOIN peritos p ON p.siapePerito = a.siapePerito
           {join_prot}
          WHERE TRIM(UPPER(p.nomePerito)) {{cmp}}
+           {scope_clause}
            AND substr(a.{date_col},1,10) BETWEEN ? AND ?
            AND ( {cond_nc_total} )
          GROUP BY descricao
@@ -429,9 +454,9 @@ def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: L
     q_grp = base_select.format(cmp=where_in)
     q_out = base_select.format(cmp=where_out)
 
-    peritos_upper = [p.strip().upper() for p in peritos]
-    params_grp = tuple(peritos_upper) + (start, end)
-    params_out = tuple(peritos_upper) + (start, end)
+    peritos_upper = [pname.strip().upper() for pname in peritos]
+    params_grp = tuple(peritos_upper) + tuple(scope_upper or []) + (start, end)
+    params_out = tuple(peritos_upper) + tuple(scope_upper or []) + (start, end)
 
     df_g = _fetch_df(conn, q_grp, params_grp)
     df_b = _fetch_df(conn, q_out, params_out)
@@ -440,7 +465,8 @@ def _get_counts_group(conn: sqlite3.Connection, start: str, end: str, peritos: L
     if not df_b.empty: df_b['descricao'] = df_b['descricao'].astype(str).str.strip()
     return df_g, df_b
 
-def _get_nc_rates_single(conn: sqlite3.Connection, start: str, end: str, perito: str, schema: Dict[str, Any]) -> Tuple[float, float]:
+def _get_nc_rates_single(conn: sqlite3.Connection, start: str, end: str, perito: str, schema: Dict[str, Any],
+                         scope_upper: Optional[List[str]] = None) -> Tuple[float, float]:
     t            = schema['table']
     date_col     = schema['date_col']
     motivo_col   = schema['motivo_col']
@@ -466,6 +492,11 @@ def _get_nc_rates_single(conn: sqlite3.Connection, start: str, end: str, perito:
     else:
         cond_nc_total = " 0 "
 
+    scope_clause = ""
+    if scope_upper:
+        placeholders_scope = ",".join(["?"] * len(scope_upper))
+        scope_clause = f" AND TRIM(UPPER(p.nomePerito)) IN ({placeholders_scope}) "
+
     q_base = f"""
         SELECT COUNT(*) AS total,
                SUM(CASE WHEN {cond_nc_total} THEN 1 ELSE 0 END) AS nc
@@ -473,18 +504,24 @@ def _get_nc_rates_single(conn: sqlite3.Connection, start: str, end: str, perito:
           JOIN peritos p ON p.siapePerito = a.siapePerito
           {join_prot}
          WHERE TRIM(UPPER(p.nomePerito)) {{cmp}} TRIM(UPPER(?))
+           {scope_clause}
            AND substr(a.{date_col},1,10) BETWEEN ? AND ?
     """
-    row_p = conn.execute(q_base.format(cmp="="), (perito, start, end)).fetchone()
+    params_common: List[Any] = []
+    if scope_upper:
+        params_common.extend(scope_upper)
+
+    row_p = conn.execute(q_base.format(cmp="="), tuple([perito] + params_common + [start, end])).fetchone()
     total_p = int(row_p[0] or 0); nc_p = int(row_p[1] or 0)
     rate_p  = (nc_p / total_p * 100.0) if total_p > 0 else 0.0
 
-    row_b = conn.execute(q_base.format(cmp="<>"), (perito, start, end)).fetchone()
+    row_b = conn.execute(q_base.format(cmp="<>"), tuple([perito] + params_common + [start, end])).fetchone()
     total_b = int(row_b[0] or 0); nc_b = int(row_b[1] or 0)
     rate_b  = (nc_b / total_b * 100.0) if total_b > 0 else 0.0
     return rate_p, rate_b
 
-def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos: List[str], schema: Dict[str, Any]) -> Tuple[float, float]:
+def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos: List[str], schema: Dict[str, Any],
+                        scope_upper: Optional[List[str]] = None) -> Tuple[float, float]:
     if not peritos:
         return 0.0, 0.0
 
@@ -517,6 +554,11 @@ def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos:
     where_in  = f"IN ({placeholders})"
     where_out = f"NOT IN ({placeholders})"
 
+    scope_clause = ""
+    if scope_upper:
+        placeholders_scope = ",".join(["?"] * len(scope_upper))
+        scope_clause = f" AND TRIM(UPPER(p.nomePerito)) IN ({placeholders_scope}) "
+
     q_grp = f"""
         SELECT COUNT(*) AS total,
                SUM(CASE WHEN {cond_nc_total} THEN 1 ELSE 0 END) AS nc
@@ -524,6 +566,7 @@ def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos:
           JOIN peritos p ON p.siapePerito = a.siapePerito
           {join_prot}
          WHERE TRIM(UPPER(p.nomePerito)) {where_in}
+           {scope_clause}
            AND substr(a.{date_col},1,10) BETWEEN ? AND ?
     """
     q_out = f"""
@@ -533,11 +576,12 @@ def _get_nc_rates_group(conn: sqlite3.Connection, start: str, end: str, peritos:
           JOIN peritos p ON p.siapePerito = a.siapePerito
           {join_prot}
          WHERE TRIM(UPPER(p.nomePerito)) {where_out}
+           {scope_clause}
            AND substr(a.{date_col},1,10) BETWEEN ? AND ?
     """
     peritos_upper = [p.strip().upper() for p in peritos]
-    row_g = conn.execute(q_grp, tuple(peritos_upper) + (start, end)).fetchone()
-    row_b = conn.execute(q_out, tuple(peritos_upper) + (start, end)).fetchone()
+    row_g = conn.execute(q_grp, tuple(peritos_upper) + tuple(scope_upper or []) + (start, end)).fetchone()
+    row_b = conn.execute(q_out, tuple(peritos_upper) + tuple(scope_upper or []) + (start, end)).fetchone()
 
     total_g = int(row_g[0] or 0); nc_g = int(row_g[1] or 0)
     total_b = int(row_b[0] or 0); nc_b = int(row_b[1] or 0)
@@ -567,10 +611,11 @@ def _get_top10_peritos(conn: sqlite3.Connection, start: str, end: str, min_anali
     rows = conn.execute(sql, (start, end, min_analises)).fetchall()
     return [r[0] for r in rows]
 
-def _build_comparativo_single(start: str, end: str, perito: str, topn: int = 10) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def _build_comparativo_single(start: str, end: str, perito: str, topn: int = 10,
+                              scope_upper: Optional[List[str]] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     with sqlite3.connect(DB_PATH) as conn:
         schema = _detect_schema(conn)
-        df_p, df_b = _get_counts_single(conn, start, end, perito, schema)
+        df_p, df_b = _get_counts_single(conn, start, end, perito, schema, scope_upper=scope_upper)
 
         total_p = int(df_p['n'].sum()) if not df_p.empty else 0
         total_b = int(df_b['n'].sum()) if not df_b.empty else 0
@@ -589,7 +634,7 @@ def _build_comparativo_single(start: str, end: str, perito: str, topn: int = 10)
         df['pct_brasil'] = (df['n_brasil'] / total_b * 100.0) if total_b > 0 else 0.0
         df['pct_perito'] = (df['n_perito'] / total_p * 100.0) if total_p > 0 else 0.0
 
-        nc_rate_p, nc_rate_b = _get_nc_rates_single(conn, start, end, perito, schema)
+        nc_rate_p, nc_rate_b = _get_nc_rates_single(conn, start, end, perito, schema, scope_upper=scope_upper)
 
     df = df.sort_values(['pct_brasil', 'n_brasil'], ascending=[False, False]).head(topn).reset_index(drop=True)
     meta = {
@@ -602,23 +647,28 @@ def _build_comparativo_single(start: str, end: str, perito: str, topn: int = 10)
         'nc_rate_p': nc_rate_p,
         'nc_rate_b': nc_rate_b,
         'label_lhs': perito,
-        'label_rhs': 'Brasil (excl.)',
+        'label_rhs': 'Brasil (excl.)' if not scope_upper else 'Brasil (excl., escopo)',
         'safe_stub': perito,
     }
     return df, meta
 
-def _build_comparativo_top10(start: str, end: str, topn: int = 10, min_analises: int = 50) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def _build_comparativo_top10(start: str, end: str, topn: int = 10, min_analises: int = 50,
+                             peritos_csv_upper: Optional[List[str]] = None,
+                             scope_upper: Optional[List[str]] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     with sqlite3.connect(DB_PATH) as conn:
         schema = _detect_schema(conn)
-        peritos = _get_top10_peritos(conn, start, end, min_analises, schema)
+        if peritos_csv_upper:
+            peritos = peritos_csv_upper
+        else:
+            peritos = _get_top10_peritos(conn, start, end, min_analises, schema)
         if not peritos:
             return pd.DataFrame(columns=['descricao','n_brasil','n_perito','pct_brasil','pct_perito']), {
                 'mode': 'top10', 'peritos_lista': [], 'start': start, 'end': end,
                 'total_p': 0, 'total_b': 0, 'nc_rate_p': 0.0, 'nc_rate_b': 0.0,
-                'label_lhs': 'Top 10 piores', 'label_rhs': 'Brasil (excl.)', 'safe_stub': 'Top 10 piores'
+                'label_lhs': 'Top 10 piores', 'label_rhs': ('Brasil (excl.)' if not scope_upper else 'Brasil (excl., escopo)'), 'safe_stub': 'Top 10 piores'
             }
 
-        df_g, df_b = _get_counts_group(conn, start, end, peritos, schema)
+        df_g, df_b = _get_counts_group(conn, start, end, peritos, schema, scope_upper=scope_upper)
 
         total_g = int(df_g['n'].sum()) if not df_g.empty else 0
         total_b = int(df_b['n'].sum()) if not df_b.empty else 0
@@ -637,7 +687,7 @@ def _build_comparativo_top10(start: str, end: str, topn: int = 10, min_analises:
         df['pct_brasil'] = (df['n_brasil'] / total_b * 100.0) if total_b > 0 else 0.0
         df['pct_perito'] = (df['n_perito'] / total_g * 100.0) if total_g > 0 else 0.0
 
-        nc_rate_g, nc_rate_b = _get_nc_rates_group(conn, start, end, peritos, schema)
+        nc_rate_g, nc_rate_b = _get_nc_rates_group(conn, start, end, peritos, schema, scope_upper=scope_upper)
 
     df = df.sort_values(['pct_brasil', 'n_brasil'], ascending=[False, False]).head(topn).reset_index(drop=True)
     meta = {
@@ -650,7 +700,7 @@ def _build_comparativo_top10(start: str, end: str, topn: int = 10, min_analises:
         'nc_rate_p': nc_rate_g,
         'nc_rate_b': nc_rate_b,
         'label_lhs': 'Top 10 piores',
-        'label_rhs': 'Brasil (excl.)',
+        'label_rhs': 'Brasil (excl.)' if not scope_upper else 'Brasil (excl., escopo)',
         'safe_stub': 'Top 10 piores',
     }
     return df, meta
@@ -956,6 +1006,30 @@ def exportar_comment(df: pd.DataFrame, meta: Dict[str, Any], cuts: Optional[Dict
 # CLI
 # ============================
 
+def _load_names_csv(path: Optional[str]) -> Optional[List[str]]:
+    """Lê um CSV com coluna 'nomePerito' e retorna lista de nomes (ou None)."""
+    if not path:
+        return None
+    try:
+        df = pd.read_csv(path)
+        col = next((c for c in df.columns if c.strip().lower() == "nomeperito"), None)
+        if not col:
+            return None
+        names = (
+            df[col]
+            .astype(str)
+            .map(lambda s: s.strip())
+            .replace({"": None})
+            .dropna()
+            .tolist()
+        )
+        return names or None
+    except Exception:
+        return None
+
+def _to_upper_list(xs: Optional[List[str]]) -> Optional[List[str]]:
+    return [x.strip().upper() for x in xs] if xs else None
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=(
@@ -1009,17 +1083,40 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--call-api', action='store_true',
                     help='Usa a API (se disponível) para gerar o comentário')
 
+    # Integração com make_kpi_report (Fluxo B)
+    ap.add_argument('--fluxo', choices=['A', 'B'], default='B',
+                    help="Fluxo do relatório (A ou B). Padrão: B.")
+    ap.add_argument('--peritos-csv', default=None,
+                    help="CSV com nomes de peritos (coluna 'nomePerito') para definir o grupo explicitamente.")
+    ap.add_argument('--scope-csv', default=None,
+                    help="CSV com peritos (coluna 'nomePerito') que definem o ESCOPO (coorte) da base no período.")
+
     return ap.parse_args()
 
 def main() -> None:
     args = parse_args()
     call_api = bool(args.call_api or os.getenv("OPENAI_API_KEY"))
 
+    # CSVs opcionais
+    peritos_csv = _load_names_csv(args.peritos_csv)
+    scope_csv   = _load_names_csv(args.scope_csv)
+    peritos_csv_upper = _to_upper_list(peritos_csv)
+    scope_upper       = _to_upper_list(scope_csv)
+
     # monta DF base (sem filtros)
-    if args.top10:
-        df, meta = _build_comparativo_top10(args.start, args.end, args.topn, args.min_analises)
+    if args.top10 or peritos_csv_upper:
+        # Se peritos-csv vier, usa esse grupo (independe de --top10)
+        df, meta = _build_comparativo_top10(
+            args.start, args.end,
+            args.topn, args.min_analises,
+            peritos_csv_upper=peritos_csv_upper,
+            scope_upper=scope_upper
+        )
     else:
-        df, meta = _build_comparativo_single(args.start, args.end, args.perito, args.topn)
+        df, meta = _build_comparativo_single(
+            args.start, args.end, args.perito, args.topn,
+            scope_upper=scope_upper
+        )
 
     # aplica cuts + reaplica topn
     df = aplicar_cuts_e_topn(

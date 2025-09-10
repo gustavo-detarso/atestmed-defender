@@ -36,14 +36,14 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 # Args
 # ────────────────────────────────────────────────────────────────────────────────
 def parse_args():
-    ap = argparse.ArgumentParser(description="Produtividade acima de um limiar/h (Perito ou Top 10) versus Brasil (excl.)")
+    ap = argparse.ArgumentParser(description="Produtividade ≥ limiar/h (Perito ou Top 10) versus Brasil (excl.) — com suporte ao fluxo B (escopo)")
     ap.add_argument('--start',     required=True, help='Data inicial YYYY-MM-DD')
     ap.add_argument('--end',       required=True, help='Data final   YYYY-MM-DD')
 
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument('--perito', help='Nome do perito a destacar (exato)')
     g.add_argument('--nome',   help='Nome do perito a destacar (alias)')
-    g.add_argument('--top10',  action='store_true', help='Comparar os 10 piores por scoreFinal no período')
+    g.add_argument('--top10',  action='store_true', help='Comparar o Top 10 vs Brasil (excl.)')
 
     ap.add_argument('--min-analises', type=int, default=50,
                     help='Elegibilidade para Top 10 (mínimo de análises no período)')
@@ -56,6 +56,16 @@ def parse_args():
                     help=("Métrica: 'perito-share' = proporção de peritos acima do limiar; "
                           "'task-share' = proporção de tarefas produzidas por peritos acima do limiar; "
                           "'time-share' = proporção do tempo trabalhado por peritos acima do limiar."))
+
+    # Fluxo A/B + integração com manifestos externos
+    ap.add_argument('--fluxo', choices=['A', 'B'], default='B',
+                    help="Seleção Top 10: A = direto por score; B = usa escopo (gate) informado via --scope-csv e, opcionalmente, --peritos-csv.")
+    ap.add_argument('--peritos-csv', default=None,
+                    help="(Opcional) CSV com coluna 'nomePerito' listando o grupo esquerdo (ex.: Top 10) — útil no fluxo B.")
+    ap.add_argument('--scope-csv', default=None,
+                    help="(Opcional) CSV com coluna 'nomePerito' definindo o ESCOPO da base (ex.: coorte do gate do fluxo B).")
+    ap.add_argument('--save-manifests', action='store_true',
+                    help="Salvar, em exports/, os CSVs com peritos usados e escopo aplicado neste run.")
 
     # Exportações
     ap.add_argument('--export-md',      action='store_true', help='Exporta tabela em Markdown')
@@ -258,6 +268,37 @@ def _aggregate_group(agg: pd.DataFrame, names: Optional[Set[str]], mode: str) ->
     return num, den, pct
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Fluxo B – escopo/top10 via CSV
+# ────────────────────────────────────────────────────────────────────────────────
+def _load_names_from_csv(path: Optional[str]) -> Optional[Set[str]]:
+    if not path:
+        return None
+    try:
+        df = pd.read_csv(path)
+        if "nomePerito" not in df.columns:
+            return None
+        return set(df["nomePerito"].astype(str).str.strip())
+    except Exception:
+        return None
+
+def _apply_scope_df(df: pd.DataFrame, scope_csv: Optional[str]) -> pd.DataFrame:
+    """Limita o DF às linhas do escopo, se fornecido (fluxo B)."""
+    if not scope_csv:
+        return df
+    names = _load_names_from_csv(scope_csv)
+    if not names:
+        return df
+    return df[df["nomePerito"].isin(names)].copy()
+
+def _save_manifest_csv(names: List[str], path: str):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pd.DataFrame({"nomePerito": names}).to_csv(path, index=False, encoding="utf-8")
+        print(f"🗂️  Manifest salvo: {path}")
+    except Exception as e:
+        print(f"[WARN] Falha salvando manifest {path}: {e}")
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Helpers de UI/Export
 # ────────────────────────────────────────────────────────────────────────────────
 def _safe(name: str) -> str:
@@ -356,7 +397,7 @@ def _export_org(title: str, start: str, end: str,
     lines.append(f"| Categoria | {a_name} | {b_name} | % |")
     lines.append("|-")
     if mode == "time-share":
-        lines.append(f"| {left_label}  | {left_num:.0f} | {right_den:.0f} | {left_pct:.2f}% |")
+        lines.append(f"| {left_label}  | {left_num:.0f} | {left_den:.0f} | {left_pct:.2f}% |")
         lines.append(f"| {right_label} | {right_num:.0f} | {right_den:.0f} | {right_pct:.2f}% |\n")
     else:
         lines.append(f"| {left_label}  | {int(left_num)} | {int(left_den)} | {left_pct:.2f}% |")
@@ -412,53 +453,8 @@ def _build_parsed_from_values(mode: str,
         "right": {"label": right_label, "num": float(right_num), "den": float(right_den), "pct": float(right_pct)},
     }
 
-def _comment_from_values(start: str, end: str, threshold: float, mode: str,
-                         a_name: str, b_name: str,
-                         left_label: str, right_label: str,
-                         left_num: float, left_den: float, left_pct: float,
-                         right_num: float, right_den: float, right_pct: float,
-                         ascii_chart: str,
-                         *, call_api: bool, debug: bool,
-                         model: str, max_words: int, temperature: float) -> str:
-    """Gera o comentário usando diretamente os números já calculados (sem parse de Markdown)."""
-    parsed = _build_parsed_from_values(mode, a_name, b_name,
-                                       left_label, right_label,
-                                       left_num, left_den, left_pct,
-                                       right_num, right_den, right_pct)
-
-    # 1) Tenta API (se habilitada)
-    if call_api:
-        try:
-            msgs = _build_messages_produtividade(start, end, threshold, mode, parsed, ascii_chart, max_words)
-            api_txt = _call_openai_chat(msgs, model=model, temperature=temperature)
-            if api_txt:
-                if debug:
-                    print("ℹ️ comentários: usando API com valores diretos (sem parse).")
-                return _sanitize_org_text(api_txt, max_words)
-        except Exception:
-            if debug:
-                print("⚠️ comentários: falha API; usando heurística.")
-
-    # 2) Fallback heurístico com os valores diretos
-    if mode == "time-share":
-        esq = f"{left_pct:.1f}% (n={left_num:.0f}/{left_den:.0f} s)"
-        dir = f"{right_pct:.1f}% (n={right_num:.0f}/{right_den:.0f} s)"
-    else:
-        esq = f"{left_pct:.1f}% (n={int(left_num)}/{int(left_den)})"
-        dir = f"{right_pct:.1f}% (n={int(right_num)}/{int(right_den)})"
-
-    diff = left_pct - right_pct
-    txt = (
-        f"No período {start} a {end}, considerando o limiar de {threshold}/h, "
-        f"{left_label} registrou {esq}, enquanto {right_label} apresentou {dir}. "
-        f"A diferença é de {abs(diff):.1f} p.p., "
-        f"{'acima' if diff > 0 else 'abaixo' if diff < 0 else 'em linha'} do comparativo. "
-        "Os percentuais refletem a participação relativa dos profissionais que atingem o limiar e podem variar conforme o mix de casos e janelas de pico."
-    )
-    return _sanitize_org_text(txt, max_words)
-
 # ────────────────────────────────────────────────────────────────────────────────
-# Comentários (integra utils/comentarios + API direta + fallback) → texto para .org
+# Comentários (integra utils/comentarios + API direta + fallback) → texto p/ .org
 # ────────────────────────────────────────────────────────────────────────────────
 
 # utils.comentarios
@@ -551,49 +547,7 @@ def _sanitize_org_text(text: str, max_words: int) -> str:
         text = " ".join(words[:max_words]).rstrip() + "…"
     return text
 
-# Parsing e prompts
-def _parse_prod_md_table(md_table: str) -> Dict[str, Any]:
-    lines = [ln for ln in md_table.splitlines() if ln.strip().startswith("|")]
-    if not lines:
-        return {}
-    hdr = re.sub(r"\s*\|\s*", " | ", lines[0].strip())
-    hcols = [c.strip() for c in hdr.strip("|").split("|")]
-    if len(hcols) < 4:
-        return {}
-    a_label = hcols[1]
-    b_label = hcols[2]
-    data_rows: List[List[str]] = []
-    for ln in lines[1:]:
-        if set(ln.replace("|", "").strip()) <= set("-: "):
-            continue
-        cols = [c.strip() for c in re.sub(r"\s*\|\s*", " | ", ln.strip()).strip("|").split("|")]
-        if len(cols) == 4:
-            data_rows.append(cols)
-
-    def _row(cols: List[str]):
-        label = cols[0]
-        try:    num = float(cols[1].replace("s",""))
-        except: num = 0.0
-        try:    den = float(cols[2].replace("s",""))
-        except: den = 0.0
-        try:    pct = float(str(cols[3]).replace("%", "").strip())
-        except: pct = 0.0
-        return {"label": label, "num": num, "den": den, "pct": pct}
-
-    left  = _row(data_rows[0]) if len(data_rows) >= 1 else {"label":"A","num":0,"den":0,"pct":0.0}
-    right = _row(data_rows[1]) if len(data_rows) >= 2 else {"label":"B","num":0,"den":0,"pct":0.0}
-    # Inferência simples do modo
-    hint = (a_label + " " + b_label).lower()
-    if "perito" in hint:
-        mode = "perito-share"
-    elif "tarefa" in hint:
-        mode = "task-share"
-    elif "tempo" in hint or "(s)" in hint or "segundo" in hint:
-        mode = "time-share"
-    else:
-        mode = "task-share"
-    return {"a_label": a_label, "b_label": b_label, "left": left, "right": right, "mode": mode}
-
+# Prompts e geradores
 def _build_messages_produtividade(start: str, end: str, threshold: float, mode: str,
                                   parsed: Dict[str, Any], ascii_chart: str, max_words: int) -> List[Dict[str, str]]:
     human_metric = {
@@ -622,68 +576,50 @@ def _build_messages_produtividade(start: str, end: str, threshold: float, mode: 
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
-def _heuristic_prod_comment(start: str, end: str, threshold: float, mode: str, parsed: Dict[str, Any]) -> str:
-    left = parsed["left"]; right = parsed["right"]
-    diff = float(left["pct"]) - float(right["pct"])
-    if mode == "time-share":
-        esq = f"{left['pct']:.1f}% (n={left['num']:.0f}/{left['den']:.0f} s)"
-        dir = f"{right['pct']:.1f}% (n={right['num']:.0f}/{right['den']:.0f} s)"
-    else:
-        esq = f"{left['pct']:.1f}% (n={int(left['num'])}/{int(left['den'])})"
-        dir = f"{right['pct']:.1f}% (n={int(right['num'])}/{int(right['den'])})"
-    return (
-        f"No período {start} a {end}, considerando o limiar de {threshold}/h, "
-        f"{left['label']} registrou {esq}, enquanto {right['label']} apresentou {dir}. "
-        f"A diferença é de {abs(diff):.1f} p.p., "
-        f"{'acima' if diff > 0 else 'abaixo' if diff < 0 else 'em linha'} do comparativo. "
-        "Os percentuais refletem a participação relativa dos profissionais que atingem o limiar e podem variar conforme mix de casos e janelas de pico."
-    )
+def _comment_from_values(start: str, end: str, threshold: float, mode: str,
+                         a_name: str, b_name: str,
+                         left_label: str, right_label: str,
+                         left_num: float, left_den: float, left_pct: float,
+                         right_num: float, right_den: float, right_pct: float,
+                         ascii_chart: str,
+                         *, call_api: bool, debug: bool,
+                         model: str, max_words: int, temperature: float) -> str:
+    """Gera o comentário usando diretamente os números já calculados (sem parse de Markdown)."""
+    parsed = _build_parsed_from_values(mode, a_name, b_name,
+                                       left_label, right_label,
+                                       left_num, left_den, left_pct,
+                                       right_num, right_den, right_pct)
 
-def _generate_comment_text(md_table: str, ascii_chart: str, start: str, end: str,
-                           threshold: float, mode: str, call_api: bool, debug: bool,
-                           model: str, max_words: int, temperature: float) -> str:
-    """
-    1) tenta utils.comentarios (comentar_produtividade/comentar_overlap)
-    2) se falhar, chama API direta
-    3) fallback heurístico
-    """
-    parsed = _parse_prod_md_table(md_table)
-
-    # (1) utils.comentarios
-    for fn in _COMENT_FUNCS:
+    # 1) Tenta API (se habilitada)
+    if call_api:
         try:
-            out = None
-            try:
-                out = fn(md_table, ascii_chart, start, end, threshold, call_api=call_api, model=model)  # type: ignore
-            except TypeError:
-                try:
-                    out = fn(md_table, ascii_chart, start, end, call_api=call_api, model=model)  # type: ignore
-                except TypeError:
-                    out = fn(md_table, ascii_chart, start, end)  # type: ignore
-            text = (out.get("comment") if isinstance(out, dict) else str(out or "")).strip()
-            if text:
-                if debug:
-                    print(f"ℹ️ comentários: usando {fn.__name__} (call_api={call_api and bool(os.getenv('OPENAI_API_KEY'))})")
-                return _sanitize_org_text(text, max_words)
-        except Exception:
-            continue
-
-    # (2) API direta
-    if call_api and parsed:
-        try:
-            _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
             msgs = _build_messages_produtividade(start, end, threshold, mode, parsed, ascii_chart, max_words)
             api_txt = _call_openai_chat(msgs, model=model, temperature=temperature)
             if api_txt:
+                if debug:
+                    print("ℹ️ comentários: usando API com valores diretos (sem parse).")
                 return _sanitize_org_text(api_txt, max_words)
         except Exception:
-            pass
+            if debug:
+                print("⚠️ comentários: falha API; usando heurística.")
 
-    # (3) fallback heurístico
-    if not parsed:
-        basic = f"No período {start} a {end}, compara-se a proporção relacionada ao limiar {threshold}/h entre dois grupos. "
-        return _sanitize_org_text(basic + "Tabela-base: " + re.sub(r"\s+", " ", md_table.strip()), max_words)
-    return _sanitize_org_text(_heuristic_prod_comment(start, end, threshold, mode, parsed), max_words)
+    # 2) Fallback heurístico com os valores diretos
+    if mode == "time-share":
+        esq = f"{left_pct:.1f}% (n={left_num:.0f}/{left_den:.0f} s)"
+        dir = f"{right_pct:.1f}% (n={right_num:.0f}/{right_den:.0f} s)"
+    else:
+        esq = f"{left_pct:.1f}% (n={int(left_num)}/{int(left_den)})"
+        dir = f"{right_pct:.1f}% (n={int(right_num)}/{int(right_den)})"
+
+    diff = left_pct - right_pct
+    txt = (
+        f"No período {start} a {end}, considerando o limiar de {threshold}/h, "
+        f"{left_label} registrou {esq}, enquanto {right_label} apresentou {dir}. "
+        f"A diferença é de {abs(diff):.1f} p.p., "
+        f"{'acima' if diff > 0 else 'abaixo' if diff < 0 else 'em linha'} do comparativo. "
+        "Os percentuais refletem a participação relativa dos profissionais que atingem o limiar e podem variar conforme o mix de casos e janelas de pico."
+    )
+    return _sanitize_org_text(txt, max_words)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Execução por modo
@@ -692,10 +628,16 @@ def run_perito(start: str, end: str, perito: str, threshold: float, mode: str,
                export_md: bool, export_png: bool, export_org: bool,
                chart: bool, want_comment: bool,
                call_api: bool, debug_comments: bool,
-               model: str, max_words: int, temperature: float) -> None:
+               model: str, max_words: int, temperature: float,
+               fluxo: str, scope_csv: Optional[str], save_manifests: bool) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, _ = _detect_tables(conn)
-        df = _load_period_df(conn, tbl, start, end)
+        df_raw = _load_period_df(conn, tbl, start, end)
+
+    # Fluxo B (opcional): restringe universo ao escopo informado
+    df = _apply_scope_df(df_raw, scope_csv)
+    if scope_csv and len(df) != len(df_raw):
+        print(f"ℹ️ Fluxo {fluxo}: escopo aplicado via --scope-csv ({len(df)} / {len(df_raw)} linhas).")
 
     agg = _perito_productivity(df)
     agg = _mark_meets(agg, threshold)
@@ -703,7 +645,7 @@ def run_perito(start: str, end: str, perito: str, threshold: float, mode: str,
     if perito not in set(agg["nomePerito"]):
         similares = agg[agg["nomePerito"].str.contains(perito, case=False, na=False)]["nomePerito"].unique().tolist()
         sugest = f" Peritos semelhantes: {', '.join(similares)}." if similares else ""
-        raise ValueError(f"Perito '{perito}' não encontrado no período.{sugest}")
+        raise ValueError(f"Perito '{perito}' não encontrado no período (após escopo, se aplicado).{sugest}")
 
     left_set  = {perito}
     right_set = set(agg["nomePerito"]) - left_set
@@ -712,9 +654,12 @@ def run_perito(start: str, end: str, perito: str, threshold: float, mode: str,
     right_num, right_den, right_pct = _aggregate_group(agg, right_set, mode)
 
     y_label, a_name, b_name = _labels_for_mode(mode)
-    title = _title_for_mode(mode, threshold, "Perito vs Demais")
+    scope_txt = "Perito vs Demais" + (" — escopo" if scope_csv else "")
+    title = _title_for_mode(mode, threshold, scope_txt)
     safe  = _safe(perito)
     stem  = f"produtividade_{mode}_{int(threshold)}h_{safe}"
+    if scope_csv:
+        stem += "_escopo"
     png   = os.path.join(EXPORT_DIR, f"{stem}.png")
     org   = f"{stem}.org"
 
@@ -780,8 +725,16 @@ def run_perito(start: str, end: str, perito: str, threshold: float, mode: str,
                     left_num, left_den, left_pct, right_num, right_den, right_pct,
                     a_name, b_name, png, org, mode=mode, comment_text=comment_text)
 
+    # Manifest (individual não salva peritos; mas salva escopo se pedido)
+    if save_manifests and scope_csv:
+        try:
+            escopo = sorted(set(pd.read_csv(scope_csv)["nomePerito"].astype(str)))
+            _save_manifest_csv(escopo, os.path.join(EXPORT_DIR, f"{stem}_scope.csv"))
+        except Exception:
+            pass
+
     # log
-    print(f"\n📊 {perito}: {left_pct:.1f}%  |  Demais: {right_pct:.1f}%  [{mode}, threshold={threshold}/h]")
+    print(f"\n📊 {perito}: {left_pct:.1f}%  |  Demais: {right_pct:.1f}%  [{mode}, threshold={threshold}/h, fluxo={fluxo}{', escopo' if scope_csv else ''}]")
     if mode == "time-share":
         print(f"   n={left_num:.0f}/{left_den:.0f} (esq.)  |  n={right_num:.0f}/{right_den:.0f} (dir.)\n")
     else:
@@ -792,29 +745,48 @@ def run_top10(start: str, end: str, min_analises: int, threshold: float, mode: s
               export_md: bool, export_png: bool, export_org: bool,
               chart: bool, want_comment: bool,
               call_api: bool, debug_comments: bool,
-              model: str, max_words: int, temperature: float) -> None:
+              model: str, max_words: int, temperature: float,
+              fluxo: str, peritos_csv: Optional[str], scope_csv: Optional[str], save_manifests: bool) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         tbl, has_ind = _detect_tables(conn)
-        if not has_ind:
-            raise RuntimeError("Tabela 'indicadores' não encontrada — calcule indicadores antes de usar --top10.")
-        names = _top10_names(conn, tbl, start, end, min_analises)
-        if not names:
-            print("⚠️ Nenhum perito elegível para Top 10 nesse período.")
-            return
-        df = _load_period_df(conn, tbl, start, end)
+        if not has_ind and not peritos_csv:
+            raise RuntimeError("Tabela 'indicadores' não encontrada — para --top10 sem --peritos-csv, é necessário 'indicadores'.")
+        df_raw = _load_period_df(conn, tbl, start, end)
+
+        # Seleção do lado esquerdo (Top 10)
+        csv_names = _load_names_from_csv(peritos_csv)
+        if csv_names:
+            names = sorted(csv_names)
+            print(f"ℹ️ Top10/Grupo fornecido por --peritos-csv ({len(names)} nomes).")
+        else:
+            # Fluxo A: Top10 direto por scoreFinal; Fluxo B sem CSV → cai no mesmo Top10 padrão
+            names = _top10_names(conn, tbl, start, end, min_analises)
+            print(f"ℹ️ Top10 via DB (fluxo {fluxo}): {len(names)} nomes.")
+
+    # Fluxo B (opcional): restringe universo ao escopo informado
+    df = _apply_scope_df(df_raw, scope_csv)
+    if scope_csv and len(df) != len(df_raw):
+        print(f"ℹ️ Fluxo {fluxo}: escopo aplicado via --scope-csv ({len(df)} / {len(df_raw)} linhas).")
+
+    if not names:
+        print("⚠️ Nenhum perito elegível para Top 10 nesse período.")
+        return
 
     agg = _perito_productivity(df)
     agg = _mark_meets(agg, threshold)
 
-    left_set  = set(names)
+    left_set  = set([n for n in names if n in set(agg['nomePerito'])])
     right_set = set(agg["nomePerito"]) - left_set
 
     left_num, left_den, left_pct    = _aggregate_group(agg, left_set,  mode)
     right_num, right_den, right_pct = _aggregate_group(agg, right_set, mode)
 
     y_label, a_name, b_name = _labels_for_mode(mode)
-    title = _title_for_mode(mode, threshold, "Top 10 vs Brasil (excl.)")
+    scope_txt = "Top 10 vs Brasil (excl.)" + (" — escopo" if scope_csv else "")
+    title = _title_for_mode(mode, threshold, scope_txt)
     stem  = f"produtividade_{mode}_{int(threshold)}h_top10"
+    if scope_csv:
+        stem += "_escopo"
     png   = os.path.join(EXPORT_DIR, f"{stem}.png")
     org   = f"{stem}.org"
 
@@ -860,8 +832,7 @@ def run_top10(start: str, end: str, min_analises: int, threshold: float, mode: s
             except Exception:
                 ascii_chart = ""
 
-        # [FIX] Comentário gerado diretamente dos VALORES (sem parse de tabela),
-        # garantindo que os rótulos e denominadores corretos sejam usados.
+        # Comentário a partir dos VALORES (sem parse de tabela)
         comment_text = None
         if want_comment:
             _load_openai_key_from_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -879,10 +850,21 @@ def run_top10(start: str, end: str, min_analises: int, threshold: float, mode: s
 
         _export_org(title, start, end, "Top 10 piores", "Brasil (excl.)",
                     left_num, left_den, left_pct, right_num, right_den, right_pct,
-                    a_name, b_name, png, org, top_names=names, mode=mode,
+                    a_name, b_name, png, org, top_names=sorted(list(left_set)), mode=mode,
                     comment_text=comment_text)
 
-    print(f"\n📊 Top 10: {left_pct:.1f}%  |  Brasil (excl.): {right_pct:.1f}%  [{mode}, threshold={threshold}/h]")
+    # Manifests (útil p/ pipeline do relatório)
+    if save_manifests:
+        if names:
+            _save_manifest_csv(sorted(names), os.path.join(EXPORT_DIR, f"{stem}_peritos.csv"))
+        if scope_csv:
+            try:
+                escopo = sorted(set(pd.read_csv(scope_csv)["nomePerito"].astype(str)))
+                _save_manifest_csv(escopo, os.path.join(EXPORT_DIR, f"{stem}_scope.csv"))
+            except Exception:
+                pass
+
+    print(f"\n📊 Top 10: {left_pct:.1f}%  |  Brasil (excl.): {right_pct:.1f}%  [{mode}, threshold={threshold}/h, fluxo={fluxo}{', escopo' if scope_csv else ''}]")
     if mode == "time-share":
         print(f"   n={left_num:.0f}/{left_den:.0f} (grupo)  |  n={right_num:.0f}/{right_den:.0f} (Brasil excl.)\n")
     else:
@@ -896,19 +878,22 @@ def main():
     args = parse_args()
     # normaliza aliases
     want_comment = args.export_comment or args.add_comments or args.export_comment_org
+
     if args.top10:
         run_top10(args.start, args.end, args.min_analises, args.threshold, args.mode,
                   args.export_md, args.export_png, args.export_org,
                   args.chart, want_comment,
                   call_api=args.call_api, debug_comments=args.debug_comments,
-                  model=args.model, max_words=args.max_words, temperature=args.temperature)
+                  model=args.model, max_words=args.max_words, temperature=args.temperature,
+                  fluxo=args.fluxo, peritos_csv=args.peritos_csv, scope_csv=args.scope_csv, save_manifests=args.save_manifests)
     else:
         perito = args.perito or args.nome
         run_perito(args.start, args.end, perito, args.threshold, args.mode,
                    args.export_md, args.export_png, args.export_org,
                    args.chart, want_comment,
                    call_api=args.call_api, debug_comments=args.debug_comments,
-                   model=args.model, max_words=args.max_words, temperature=args.temperature)
+                   model=args.model, max_words=args.max_words, temperature=args.temperature,
+                   fluxo=args.fluxo, scope_csv=args.scope_csv, save_manifests=args.save_manifests)
 
 if __name__ == '__main__':
     main()

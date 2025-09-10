@@ -1,9 +1,94 @@
 #!/usr/bin/env Rscript
+# ---- Auto-normalized header (injected by run_r_checks_autofix.py) ----
+options(stringsAsFactors = FALSE)
+options(encoding = "UTF-8")
+options(warn = 1)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+Sys.setlocale(category = "LC_ALL", locale = "C.UTF-8")
+# ----------------------------------------------------------------------
 
 suppressPackageStartupMessages({
+
+# --- hardening: garanta am_resolve_export_dir mesmo sem _common.R ---
+if (!exists("am_resolve_export_dir", mode = "function", inherits = TRUE)
+
+) {
+  `%||%` <- function(a,b) if (is.null(a)) b else a
+  am_resolve_export_dir <- function(out_dir = NULL) {
+    od <- if (!is.null(out_dir) && nzchar(out_dir)) {
+      normalizePath(out_dir, mustWork = FALSE)
+    } else {
+      dbp <- tryCatch(am_args[["db"]], error = function(e) NULL) %||% ""
+      base_dir <- if (nzchar(dbp)) normalizePath(file.path(dirname(dbp), ".."), mustWork = FALSE) else getwd()
+      file.path(base_dir, "graphs_and_tables", "exports")
+    }
+    if (!dir.exists(od)) dir.create(od, recursive = TRUE, showWarnings = FALSE)
+    od
+  }
+}
   library(DBI); library(RSQLite)
-  library(ggplot2); library(dplyr); library(lubridate); library(scales); library(stringr)
+  library(ggplot2); library(dplyr); library(scales); library(stringr)
 })
+
+# --- begin: am_db_reconnect_helpers ---
+if (!exists("am_safe_disconnect", mode="function", inherits=TRUE)) {
+  am_safe_disconnect <- function(con) {
+    try({
+      if (inherits(con, "DBIConnection") && DBI::dbIsValid(con)) DBI::dbDisconnect(con)
+    }, silent=TRUE)
+  }
+}
+if (!exists("am__db_path_guess", mode="function", inherits=TRUE)) {
+  am__db_path_guess <- function() {
+    tryCatch({
+      if (exists("am_args", inherits=TRUE)) {
+        p <- tryCatch(am_args[["db"]], error=function(e) NULL)
+        if (!is.null(p) && nzchar(p)) return(p)
+      }
+      if (exists("opt", inherits=TRUE)) {
+        p <- tryCatch(opt$db, error=function(e) NULL)
+        if (!is.null(p) && nzchar(p)) return(p)
+      }
+      NULL
+    }, error=function(e) NULL)
+  }
+}
+if (!exists("am_ensure_con", mode="function", inherits=TRUE)) {
+  am_ensure_con <- function(con) {
+    if (inherits(con, "DBIConnection") && DBI::dbIsValid(con)) return(con)
+    dbp <- am__db_path_guess()
+    if (is.null(dbp) || !nzchar(dbp)) stop("am_ensure_con: caminho do DB desconhecido")
+    DBI::dbConnect(RSQLite::SQLite(), dbname = dbp)
+  }
+}
+if (!exists("am_dbGetQuery", mode="function", inherits=TRUE)) {
+  am_dbGetQuery <- function(con, ...) { con <- am_ensure_con(con); DBI::dbGetQuery(con, ...) }
+}
+if (!exists("am_dbReadTable", mode="function", inherits=TRUE)) {
+  am_dbReadTable <- function(con, ...) { con <- am_ensure_con(con); DBI::dbReadTable(con, ...) }
+}
+if (!exists("am_dbListFields", mode="function", inherits=TRUE)) {
+  am_dbListFields <- function(con, ...) { con <- am_ensure_con(con); DBI::dbListFields(con, ...) }
+}
+# --- fix: am_dbQuoteIdentifier sem recursão ---
+if (!exists("am_dbQuoteIdentifier", mode="function", inherits=TRUE)) {
+  am_dbQuoteIdentifier <<- (function(.f){
+    force(.f)
+    function(con, ...) {
+      con <- am_ensure_con(con)
+      as.character(.f(con, ...))
+    }
+  })(DBI::dbQuoteIdentifier)
+}
+# --- fim do fix ---
+
+# --- end: am_db_reconnect_helpers ---
+
+
+
+
+
+
 
 # ==== ATESTMED PROLOGO (INICIO) ====
 local({
@@ -12,16 +97,11 @@ local({
     if (file.exists(pp)) { source(pp, local=TRUE); .am_loaded <- TRUE; break }
   }
   if (!.am_loaded) message("[prolog] _common.R não encontrado — usando fallbacks internos.")
-
   `%||%` <- function(a,b) if (is.null(a)) b else a
-
-  # ---- Fallbacks essenciais (se _common.R não definiu) ----
-  if (!exists("am_normalize_cli", mode="function", inherits=TRUE)) {
-    am_normalize_cli <<- function(x) as.character(x)
-  }
+  if (!exists("am_normalize_cli", mode="function", inherits=TRUE)) am_normalize_cli <<- function(x) as.character(x)
   if (!exists("am_parse_args", mode="function", inherits=TRUE)) {
     am_parse_args <<- function() {
-      a <- am_normalize_cli(commandArgs(trailingOnly=TRUE))
+      a <- am_normalize_cli(base::commandArgs(TRUE))
       kv <- list(); i <- 1L; n <- length(a)
       while (i <= n) {
         k <- a[[i]]
@@ -35,31 +115,23 @@ local({
     }
   }
   if (!exists("am_open_db", mode="function", inherits=TRUE)) {
-    am_open_db <<- function(path) {
-      p <- normalizePath(path, mustWork=TRUE)
-      DBI::dbConnect(RSQLite::SQLite(), dbname=p)
-    }
+    am_open_db <<- function(path) { p <- normalizePath(path, mustWork=TRUE); DBI::dbConnect(RSQLite::SQLite(), dbname=p) }
   }
   if (!exists("am_resolve_export_dir", mode="function", inherits=TRUE)) {
     am_resolve_export_dir <<- function(out_dir=NULL) {
-      if (!is.null(out_dir) && nzchar(out_dir)) {
-        od <- normalizePath(out_dir, mustWork=FALSE)
-      } else {
+      if (!is.null(out_dir) && nzchar(out_dir)) od <- normalizePath(out_dir, mustWork=FALSE) else {
         dbp <- am_args[["db"]] %||% ""
         base_dir <- if (nzchar(dbp)) normalizePath(file.path(dirname(dbp), ".."), mustWork=FALSE) else getwd()
         od <- file.path(base_dir, "graphs_and_tables", "exports")
       }
-      if (!dir.exists(od)) dir.create(od, recursive=TRUE, showWarnings=FALSE)
-      od
+      if (!dir.exists(od)) dir.create(od, recursive=TRUE, showWarnings=FALSE); od
     }
   }
   if (!exists("am_detect_analises_table", mode="function", inherits=TRUE)) {
     am_detect_analises_table <<- function(con) {
-      has <- function(nm) {
-        nrow(am_dbGetQuery(con,
-          "SELECT 1 FROM sqlite_master WHERE type in ('table','view') AND name=? LIMIT 1",
-          params=list(nm))) > 0
-      }
+      has <- function(nm) nrow(am_dbGetQuery(con,
+        "SELECT 1 FROM sqlite_master WHERE type in ('table','view') AND name=? LIMIT 1",
+        params=list(nm))) > 0
       for (t in c("analises","analises_atestmed")) if (has(t)) return(t)
       stop("Não encontrei 'analises' nem 'analises_atestmed'.")
     }
@@ -70,13 +142,8 @@ local({
       am_dbGetQuery(con, sprintf("PRAGMA table_info(%s)", tbl))$name
     }
   }
-
-  # 1) args → lista nomeada (sem rebind de objetos bloqueados)
   .raw <- NULL
-  if (exists("args", inherits=TRUE)) {
-    .cand <- get("args", inherits=TRUE)
-    if (!is.function(.cand)) .raw <- .cand
-  }
+  if (exists("args", inherits=TRUE)) { .cand <- get("args", inherits=TRUE); if (!is.function(.cand)) .raw <- .cand }
   .kv <- tryCatch(am_parse_args(), error=function(e) list())
   if (is.character(.raw)) {
     .kv2 <- list(); i <- 1L; n <- length(.raw)
@@ -89,99 +156,65 @@ local({
       } else i <- i + 1L
     }
     if (length(.kv2)) .kv <- utils::modifyList(.kv, .kv2)
-  } else if (is.environment(.raw)) {
-    .kv <- utils::modifyList(.kv, as.list(.raw))
-  } else if (is.list(.raw)) {
-    .kv <- utils::modifyList(.kv, .raw)
-  }
+  } else if (is.environment(.raw)) .kv <- utils::modifyList(.kv, as.list(.raw))
+  else if (is.list(.raw))          .kv <- utils::modifyList(.kv, .raw)
   am_args <<- .kv
 
-  # 2) Conexão ao DB
   db_path <- am_args[["db"]]
   if (is.null(db_path) || !nzchar(db_path)) stop("Faltou --db <path>")
   con <<- am_open_db(db_path)
+  # (patch) removido on.exit de desconexão precoce
 
-  # Fecha TODAS as conexões SQLite ao sair (remove avisos)
-  on.exit({
-    try({
-      if (exists("con", inherits=TRUE)) try(DBI::dbDisconnect(con), silent=TRUE)
-      conns <- try(DBI::dbListConnections(RSQLite::SQLite()), silent=TRUE)
-      if (!inherits(conns, "try-error")) for (cc in conns) try(DBI::dbDisconnect(cc), silent=TRUE)
-    }, silent=TRUE)
-  }, add=TRUE)
-
-  # 3) Paths e schema
   export_dir <<- am_resolve_export_dir(am_args[["out-dir"]])
-  a_tbl <<- tryCatch(am_detect_analises_table(con), error=function(e) NA_character_)
-  cols  <<- tryCatch(am_detect_columns(con, a_tbl), error=function(e) character(0))
+  a_tbl     <<- tryCatch(am_detect_analises_table(con), error=function(e) NA_character_)
+  cols <- tryCatch(am_detect_columns(con, a_tbl), error=function(e) character(0))
 
-  # 4) Args derivados
-  start_d   <<- am_args[["start"]]
-  end_d     <<- am_args[["end"]]
-  min_n     <<- suppressWarnings(as.integer(am_args[["min-analises"]]))
-  threshold <<- suppressWarnings(as.numeric(am_args[["threshold"]]))
-  measure   <<- as.character(am_args[["measure"]] %||% NA_character_); if (!is.na(measure)) measure <<- measure[[1L]]
-  top10     <<- isTRUE(am_args[["top10"]])
-  perito    <<- as.character(am_args[["perito"]] %||% NA_character_); if (!is.na(perito)) perito <<- perito[[1L]]
-
-  # 5) Wrapper seguro para consultas (evita "Expected string vector of length 1")
-  am_dbGetQuery <<- (function(.f) {
-    force(.f)
-    function(con, statement, ...) {
-      st <- statement
-      if (length(st) != 1L) st <- paste(st, collapse=" ")
-      .f(con, st, ...)
-    }
-  })(DBI::dbGetQuery)
+  am_dbGetQuery <<- (function(.f) { force(.f); function(con, statement, ...) {
+    st <- statement; if (length(st) != 1L) st <- paste(st, collapse=" "); .f(con, st, ...) } })(DBI::dbGetQuery)
 })
 # ==== ATESTMED PROLOGO (FIM) ====
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 `%||%` <- function(a,b) if (is.null(a)) b else a
 
 parse_args <- function() {
-  args <- am_normalize_cli(commandArgs(trailingOnly=TRUE))
+  args <- am_normalize_cli(base::commandArgs(TRUE))
   kv <- list(); i <- 1
   while (i <= length(args)) {
     k <- args[[i]]
     if (startsWith(k, "--")) {
       v <- if (i + 1 <= length(args) && !startsWith(args[[i+1]], "--")) args[[i+1]] else TRUE
-      kv[[substr(k, 3, nchar(k))]] <- v; i <- i + if (isTRUE(v) || identical(v, TRUE)) 1 else 2
+      kv[[substr(k, 3, nchar(k))]] <- v
+      i <- i + if (isTRUE(v) || identical(v, TRUE)) 1 else 2
     } else i <- i + 1
   }
   kv
 }
 
-ensure_dir <- function(p) if (!dir.exists(p)) dir.create(p, recursive = TRUE, showWarnings = FALSE)
-fail_plot <- function(msg) ggplot() + annotate("text", x=0, y=0, label=msg, size=5) + theme_void()
-safe_slug <- function(x){ x <- gsub("[^A-Za-z0-9\\-_]+","_", x); x <- gsub("_+","_", x); x <- gsub("^_|_$","", x); ifelse(nchar(x)>0, x, "output") }
-percent_s <- function(x, acc=.1) ifelse(is.finite(x), percent(x, accuracy=acc), "NA")
+ensure_dir <- function(p) if (!dir.exists(p)) dir.create(p, recursive=TRUE, showWarnings=FALSE)
+fail_plot  <- function(msg) ggplot() + annotate("text", x=0, y=0, label=msg, size=5) + theme_void()
+percent_s  <- function(x, acc=.1) ifelse(is.finite(x), percent(x, accuracy=acc), "NA")
+to_upper   <- function(xs) unique(toupper(trimws(xs)))
 
 # ───────────────────────── Args/paths ─────────────────────────
-args     <- parse_args()
-db_path  <- args$db
-start_d  <- args$start
-end_d    <- args$end
-min_n    <- as.integer(args[["min-analises"]] %||% "50")
-thr_prod <- as.numeric(args[["threshold"]] %||% "50") # análises/h
-out_dir  <- args[["out-dir"]]
+args <- parse_args()
+db_path     <- args$db
+start_d     <- args$start
+end_d       <- args$end
+min_n       <- as.integer(args[["min-analises"]] %||% "50")
+thr_prod    <- as.numeric(args[["threshold"]] %||% "50") # análises/h
+out_dir     <- args[["out-dir"]]
+peritos_csv <- args[["peritos-csv"]] %||% NULL
+scope_csv   <- args[["scope-csv"]]   %||% NULL
+flow_opt    <- toupper(args[["flow"]] %||% "")      # "A" ou "B"
+rank_by_opt <- tolower(args[["rank-by"]] %||% "")   # "scorefinal" ou "harm"
 
 if (is.null(db_path) || is.null(start_d) || is.null(end_d)) {
-  stop("Uso: --db <path> --start YYYY-MM-DD --end YYYY-MM-DD [--min-analises 50] [--threshold 50] [--out-dir <dir>]")
+  stop("Uso: --db <path> --start YYYY-MM-DD --end YYYY-MM-DD [--min-analises 50] [--threshold 50] [--peritos-csv <csv>] [--scope-csv <csv>] [--flow A|B] [--rank-by scoreFinal|harm] [--out-dir <dir>]")
 }
+
+# mapeia flow→rank-by (fallback)
+rank_by <- if (nzchar(rank_by_opt)) rank_by_opt else if (identical(flow_opt, "B")) "harm" else "scorefinal"
 
 base_dir   <- normalizePath(file.path(dirname(db_path), ".."))
 export_dir <- if (!is.null(out_dir)) normalizePath(out_dir, mustWork = FALSE) else
@@ -194,46 +227,101 @@ org_comm <- file.path(export_dir, "rcheck_top10_productivity_comment.org")
 
 # ───────────────────────── Conexão/schema ─────────────────────
 con <- dbConnect(RSQLite::SQLite(), db_path)
-# (patched) # (patched) on.exit(dbDisconnect(con), add = TRUE)
+on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
 
 table_exists <- function(con, name) {
-  nrow(am_dbGetQuery(con,
-                  "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1",
-                  params=list(name))) > 0
+  nrow(am_dbGetQuery(con, "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1", params=list(name))) > 0
 }
-detect_analises_table <- function(con) {
-  for (t in c("analises","analises_atestmed")) if (table_exists(con, t)) return(t)
-  stop("Não encontrei 'analises' nem 'analises_atestmed'.")
-}
+detect_analises_table <- function(con) { for (t in c("analises","analises_atestmed")) if (table_exists(con, t)) return(t); stop("Não encontrei 'analises' nem 'analises_atestmed'.") }
 
 a_tbl <- detect_analises_table(con)
-if (!table_exists(con, "indicadores")) {
-  ggsave(png_file, fail_plot("Tabela 'indicadores' não encontrada"), width=9, height=5, dpi=150)
-  quit(save="no")
+
+# 'indicadores' só é obrigatório quando NÃO vier manifesto
+need_indicadores <- is.null(peritos_csv)
+if (need_indicadores && !table_exists(con, "indicadores")) {
+  ggsave(png_file, fail_plot("Tabela 'indicadores' não encontrada"), width=9, height=5, dpi=150); quit(save="no")
+}
+
+# Checa coluna necessária apenas se for usar seleção interna
+if (need_indicadores) {
+  ind_cols <- am_dbGetQuery(con, "PRAGMA table_info(indicadores)")$name
+  need_col <- if (rank_by == "harm") "harm" else "scoreFinal"
+  if (!(need_col %in% ind_cols)) {
+    ggsave(png_file, fail_plot(sprintf("Coluna '%s' não encontrada em 'indicadores'.", need_col)), width=9, height=5, dpi=150)
+    quit(save="no")
+  }
+}
+
+load_names_csv <- function(path) {
+  if (is.null(path) || !nzchar(path) || !file.exists(path)) return(NULL)
+  df <- tryCatch(read.csv(path, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM"), error=function(e) NULL)
+  if (is.null(df) || !nrow(df)) return(NULL)
+  key <- if ("nomePerito" %in% names(df)) "nomePerito" else names(df)[1]
+  out <- trimws(as.character(df[[key]])); out <- out[nzchar(out)]
+  if (length(out)) unique(out) else NULL
+}
+
+# ───────────────────────── ESCOPO (coorte) ────────────────────
+scope_names <- to_upper(load_names_csv(scope_csv))
+scope_clause <- ""
+scope_params <- list()
+if (length(scope_names)) {
+  placeholders_scope <- paste(rep("?", length(scope_names)), collapse = ",")
+  scope_clause <- sprintf(" AND TRIM(UPPER(p.nomePerito)) IN (%s) ", placeholders_scope)
+  scope_params <- as.list(scope_names)
 }
 
 # ───────────────────────── Seleção Top 10 ─────────────────────
-qry_top10 <- sprintf("
-SELECT p.nomePerito, i.scoreFinal, COUNT(a.protocolo) AS total_analises
-  FROM indicadores i
-  JOIN peritos   p ON i.perito = p.siapePerito
-  JOIN %s  a ON a.siapePerito = i.perito
- WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
- GROUP BY p.nomePerito, i.scoreFinal
-HAVING total_analises >= ?
- ORDER BY i.scoreFinal DESC, total_analises DESC
- LIMIT 10
-", a_tbl)
+sel_caption <- NULL
+top_names_raw <- load_names_csv(peritos_csv)
 
-top10 <- am_dbGetQuery(con, qry_top10, params = list(start_d, end_d, min_n))
-if (nrow(top10) == 0) {
-  ggsave(png_file, fail_plot("Sem Top 10 para o período/critério"), width=9, height=5, dpi=150); quit(save="no")
+if (!is.null(top_names_raw)) {
+  # Revalida elegibilidade (n ≥ min_n) preservando a ordem do CSV (aplica ESCOPO se fornecido)
+  in_list <- paste(sprintf("'%s'", gsub("'", "''", top_names_raw)), collapse=",")
+  qry_cnt <- sprintf("
+    SELECT p.nomePerito AS nomePerito, COUNT(a.protocolo) AS total_analises
+      FROM %s a
+      JOIN peritos p ON a.siapePerito = p.siapePerito
+     WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
+       AND p.nomePerito IN (%s) %s
+     GROUP BY p.nomePerito
+  ", am_dbQuoteIdentifier(con, a_tbl), in_list, scope_clause)
+  cnt  <- do.call(am_dbGetQuery, c(list(con, qry_cnt), list(params = c(list(start_d, end_d), scope_params))))
+  elig <- cnt %>% filter(total_analises >= min_n) %>% arrange(match(nomePerito, top_names_raw)) %>% pull(nomePerito)
+  top10 <- tibble::tibble(nomePerito = head(elig, 10L))
+  if (nrow(top10) == 0) {
+    ggsave(png_file, fail_plot("Manifesto sem peritos elegíveis (após escopo/min-analises)."), width=9, height=5, dpi=150); quit(save="no")
+  }
+  sel_caption <- sprintf("Seleção: manifesto (revalidado: n ≥ %d%s).",
+                         min_n, if (length(scope_names)) "; escopo aplicado" else "")
+} else {
+  # Seleção interna — Fluxo A/B (aplica ESCOPO se fornecido)
+  order_col <- if (rank_by == "harm") "i.harm" else "i.scoreFinal"
+  qry_top10 <- sprintf("
+    SELECT p.nomePerito, %s AS rank_metric, COUNT(a.protocolo) AS total_analises
+      FROM indicadores i
+      JOIN peritos   p ON i.perito = p.siapePerito
+      JOIN %s        a ON a.siapePerito = i.perito
+     WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ? %s
+     GROUP BY p.nomePerito, rank_metric
+    HAVING total_analises >= ?
+     ORDER BY rank_metric DESC, total_analises DESC
+     LIMIT 10
+  ", order_col, am_dbQuoteIdentifier(con, a_tbl), scope_clause)
+  params_top10 <- c(list(start_d, end_d), scope_params, list(min_n))
+  top10 <- do.call(am_dbGetQuery, c(list(con, qry_top10), list(params = params_top10)))
+  if (nrow(top10) == 0) {
+    ggsave(png_file, fail_plot("Sem Top 10 elegível para o período/critério (após escopo)."), width=9, height=5, dpi=150); quit(save="no")
+  }
+  sel_caption <- sprintf("Seleção: %s (n ≥ %d%s).",
+                         ifelse(rank_by == "harm", "harm (Fluxo B)", "scoreFinal (Fluxo A)"),
+                         min_n, if (length(scope_names)) "; escopo aplicado" else "")
 }
+
 peritos_in <- paste(sprintf("'%s'", gsub("'", "''", top10$nomePerito)), collapse=",")
 
 # ───────────────────────── Durações e produtividade ───────────
-# Tenta coluna de duração; fallback julianday(fim) - julianday(início)
-cols <- am_dbGetQuery(con, sprintf("PRAGMA table_info(%s)", a_tbl))$name
+cols <- am_dbGetQuery(con, sprintf("PRAGMA table_info(%s)", am_dbQuoteIdentifier(con, a_tbl)))$name
 cand <- intersect(cols, c("tempoAnaliseSeg","tempoAnalise","duracaoSegundos","duracao_seg","tempo_seg"))
 dur_col <- if (length(cand) > 0) cand[[1]] else NA_character_
 
@@ -246,25 +334,25 @@ if (is.na(dur_col)) {
      WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
        AND a.dataHoraIniPericia IS NOT NULL
        AND a.dataHoraFimPericia   IS NOT NULL
-       AND p.nomePerito IN (%s)
-  ", a_tbl, peritos_in)
-  df <- am_dbGetQuery(con, qry, params = list(start_d, end_d))
+       AND p.nomePerito IN (%s) %s
+  ", am_dbQuoteIdentifier(con, a_tbl), peritos_in, scope_clause)
+  df <- do.call(am_dbGetQuery, c(list(con, qry), list(params = c(list(start_d, end_d), scope_params))))
 } else {
   qry <- sprintf("
     SELECT p.nomePerito AS nomePerito, CAST(a.%s AS REAL) AS dur
       FROM %s a
       JOIN peritos  p ON a.siapePerito = p.siapePerito
      WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
-       AND p.nomePerito IN (%s)
-  ", dur_col, a_tbl, peritos_in)
-  df <- am_dbGetQuery(con, qry, params = list(start_d, end_d))
+       AND p.nomePerito IN (%s) %s
+  ", dur_col, am_dbQuoteIdentifier(con, a_tbl), peritos_in, scope_clause)
+  df <- do.call(am_dbGetQuery, c(list(con, qry), list(params = c(list(start_d, end_d), scope_params))))
 }
 
 if (nrow(df) == 0) {
-  ggsave(png_file, fail_plot("Sem dados de duração para o Top 10"), width=9, height=5, dpi=150); quit(save="no")
+  ggsave(png_file, fail_plot("Sem dados de duração para os selecionados (após escopo)."), width=9, height=5, dpi=150)
+  quit(save="no")
 }
 
-# Válidas: 0 < dur ≤ 3600; Produtividade = total_válidas / (soma_dur/3600)
 prod <- df %>%
   mutate(dur = suppressWarnings(as.numeric(dur))) %>%
   group_by(nomePerito) %>%
@@ -291,16 +379,16 @@ p <- ggplot(prod, aes(x = nomePerito, y = prod_h, fill = flag)) +
   scale_fill_manual(values = c("#999999", "#cc0000"), guide = "none") +
   labs(
     title    = "Top 10 — Produtividade (análises/h)",
-    subtitle = sprintf("%s a %s | threshold: %.0f/h", start_d, end_d, thr_prod),
+    subtitle = sprintf("%s a %s | %s", start_d, end_d, sel_caption),
     x = "Perito", y = "análises/h",
-    caption = "Produtividade = total de perícias válidas / (soma das durações válidas em horas). Duração válida: 0 < dur ≤ 3600s. Fallback de duração via (julianday(fim)−julianday(início))*86400."
+    caption  = "Produtividade = perícias válidas / (soma das durações válidas em horas). Duração válida: 0 < dur ≤ 3600s."
   ) +
   theme_minimal(base_size = 11) +
   theme(axis.text.x = element_text(angle=45, hjust=1))
 
 ymax <- suppressWarnings(max(prod$prod_h, na.rm = TRUE)); if (!is.finite(ymax)) ymax <- 1
 ggsave(png_file, p + coord_cartesian(ylim = c(0, ymax * 1.15)), width=9, height=5, dpi=150)
-cat(sprintf("✅ Figura salva: %s\n", png_file))
+base::cat(sprintf("✅ Figura salva: %s\n", png_file))
 
 # ───────────────────────── Comentários (.org) ─────────────────
 ord  <- prod %>% arrange(desc(prod_h))
@@ -311,35 +399,32 @@ rng     <- range(prod$prod_h, na.rm = TRUE)
 media   <- mean(prod$prod_h, na.rm = TRUE)
 mediana <- median(prod$prod_h, na.rm = TRUE)
 
+escopo_txt <- if (length(scope_names)) {
+  paste0("\n*Escopo.* Coorte com ", length(scope_names), " peritos; primeiros: ",
+         paste(head(scope_names, 5), collapse = ", "),
+         if (length(scope_names) > 5) ", …" else "", ".")
+} else ""
+
 metodo_txt <- paste0(
-  "*Método.* Selecionamos os *10 piores* peritos no período (", start_d, " a ", end_d,
-  ") pelo *ScoreFinal* em `indicadores`, exigindo ao menos *", min_n, "* análises. ",
-  "Para cada um, calculamos a *produtividade* como *total de perícias válidas* (0<dur≤3600) ",
-  "dividido pelo *tempo total válido* (soma das durações) em horas. ",
-  "Quando não há coluna de duração em ", shQuote(a_tbl), ", usa-se ",
-  "(julianday(fim)−julianday(início))*86400."
+  "*Método.* Seleção de peritos: ", sel_caption, " ",
+  "Para cada selecionado, calculamos a *produtividade* como *perícias válidas* (0<dur≤3600) ",
+  "dividido pelo *tempo total válido* (soma das durações) em horas, no período ", start_d, " a ", end_d, ".", escopo_txt
 )
 
 interpreta_txt <- paste0(
-  "*Interpretação.* Entre os Top 10, a produtividade variou de ",
+  "*Interpretação.* Entre os selecionados, a produtividade variou de ",
   sprintf("%.1f", min(rng)), " a ", sprintf("%.1f", max(rng)),
   " análises/h; média=", sprintf("%.1f", media), ", mediana=", sprintf("%.1f", mediana), ".\n",
   if (nrow(top3)) paste0("- Maiores produtividades: ", paste(top3$txt, collapse = "; "), ".\n") else "",
-  "Valores muito altos podem sinalizar *execuções excessivamente rápidas* e merecem auditoria; ",
-  "sempre considere o volume (n) e o contexto das tarefas."
+  "Valores muito altos podem sinalizar *execuções excessivamente rápidas*; avalie também o volume (n) e o contexto."
 )
 
 org_main_txt <- paste(
   "#+CAPTION: Top 10 — Produtividade (análises/h)",
   sprintf("[[file:%s]]", basename(png_file)),
-  "",
-  metodo_txt, "",
-  interpreta_txt, "",
-  sep = "\n"
+  "", metodo_txt, "", interpreta_txt, "", sep = "\n"
 )
-writeLines(org_main_txt, org_main)
-cat(sprintf("✅ Org salvo: %s\n", org_main))
+writeLines(org_main_txt, org_main); base::cat(sprintf("✅ Org salvo: %s\n", org_main))
 
 org_comm_txt <- paste(metodo_txt, "", interpreta_txt, "", sep = "\n")
-writeLines(org_comm_txt, org_comm)
-cat(sprintf("✅ Org(comment) salvo: %s\n", org_comm))
+writeLines(org_comm_txt, org_comm); base::cat(sprintf("✅ Org(comment) salvo: %s\n", org_comm))

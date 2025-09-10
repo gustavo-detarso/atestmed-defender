@@ -1,0 +1,6 @@
+# reports/r_checks/.Rprofile_utils
+try({
+  s <- Sys.getenv("RCHECK_UTILS")
+  if (nzchar(s) && file.exists(s)) source(s, chdir = TRUE)
+}, silent = TRUE)
+
