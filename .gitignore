@@ -14,6 +14,9 @@ lista*
 /reports/outputs/**
 !/reports/outputs/.gitkeep
 
+/graphs_and_tables/exports/**
+!/graphs_and_tables/exports/.gitkeep
+
 # Pastas de db
 /db/**
 !/db/.gitkeep
