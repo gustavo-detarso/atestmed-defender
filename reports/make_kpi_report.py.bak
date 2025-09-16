@@ -211,11 +211,6 @@ def parse_args():
     who = p.add_mutually_exclusive_group(required=True)
     who.add_argument('--perito')
     who.add_argument('--top10', action='store_true')
-    # NOVO: Top-K variável
-    who.add_argument('--topk', type=int, help="Seleciona Top-K (ex.: --topk 15, 20, 30). Se ausente e --top10 não for passado, usa fluxo normal.")
-    # NOVO: todos os que se enquadram no fluxo
-    who.add_argument('--all-matching', action='store_true',
-                     help="Seleciona todos os peritos que se enquadram no algoritmo do fluxo (ex.: Fluxo B = gate %NC ≥ 2× Brasil e N ≥ min).")
 
     p.add_argument('--min-analises', type=int, default=50)
 
@@ -231,22 +226,13 @@ def parse_args():
     p.add_argument('--high-nc-min-tasks', type=int, default=50)
     p.add_argument('--r-bin', default='Rscript')
     p.add_argument('--plan-only', action='store_true', help='Apenas listar o plano de execução (dry-run) e sair.')
-    p.add_argument('--fluxo', choices=['A','B'], default='B',
-                   help="B (padrão): gate %NC ≥ 2× Brasil (válidas) e ranking por scoreFinal; A: ranking direto por scoreFinal.")
-    # corrigindo as aspas quebradas do arquivo original
-    p.add_argument('--rank-by', dest='rank_by', choices=["scoreFinal", "harm"], default=None,
-                   help=("Critério de ranking p/ seleção quando não houver --peritos-csv. "
-                         "Se omitido: Fluxo A => scoreFinal; Fluxo B => harm."))
-
-    p.add_argument('--kpi-base', choices=['full', 'nc-only'], default='full',
-                   help="Base para os KPI: 'full' (comportamento atual) ou 'nc-only' (recalcula score_final a partir de NC).")
+    p.add_argument('--fluxo', choices=['A','B'], default='B', help="B (padrão): gate %NC ≥ 2× Brasil (válidas) e ranking por scoreFinal; A: Top 10 direto por scoreFinal.")
+    p.add_argument('--rank-by", dest="rank_by', choices=["scoreFinal", "harm"], default=None, help=("Critério de ranking p/ Top 10 quando não houver --peritos-csv. " "Se omitido: Fluxo A => scoreFinal; Fluxo B => harm."))
+    p.add_argument('--kpi-base', choices=['full', 'nc-only'], default='full', help="Base para os KPI: 'full' (comportamento atual) ou 'nc-only' (recalcula score_final a partir de NC).")
     
-    p.add_argument('--peritos-csv', default=None,
-                   help="(Opcional) CSV com a lista de peritos a usar (nomePerito,...). Se informado, ignora seleção interna.")
-    p.add_argument('--scope-csv', default=None,
-                   help="(Opcional) CSV com peritos que definem o ESCOPO da base para gráficos/curvas (ex.: coorte do gate do fluxo B).")
-    p.add_argument('--save-manifests', action='store_true',
-                   help="Salvar CSVs com TopK e escopo (gate) usados neste run.")
+    p.add_argument('--peritos-csv', default=None, help="(Opcional) CSV com a lista de peritos a usar (nomePerito,...). " "Se informado, ignora seleção interna.")
+    p.add_argument('--scope-csv', default=None, help="(Opcional) CSV com peritos que definem o ESCOPO da base para gráficos/curvas " "(ex.: coorte do gate do fluxo B).")
+    p.add_argument('--save-manifests', action='store_true', help="Salvar CSVs com Top10 e escopo (gate) usados neste run.")
     
     # impacto
     p.add_argument('--with-impact', action='store_true')
@@ -258,193 +244,6 @@ def parse_args():
     p.add_argument('--assemble-only', dest='reuse_kpi', action='store_true',
                    help='Atalho para --reuse-kpi.')
     return p.parse_args()
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Helpers de esquema/DB (mínimos para seleção TopK/All-matching)
-# ────────────────────────────────────────────────────────────────────────────────
-def _detect_schema(conn) -> dict:
-    """
-    Inspeciona as tabelas e retorna um dict com os nomes de colunas a usar.
-    Espera encontrar tabelas: peritos, analises, indicadores (opcional).
-    """
-    def cols(tbl):
-        try:
-            return {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()}
-        except Exception:
-            return set()
-
-    cols_analises  = cols("analises")
-    cols_peritos   = cols("peritos")
-    cols_scores    = cols("indicadores")  # opcional
-
-    # candidatos comuns nas bases ATESTMED
-    ini_cands = ["dataHoraIniPericia", "dataHoraIniAnalise", "dataHoraIni"]
-    fim_cands = ["dataHoraFimPericia", "dataHoraFimAnalise", "dataHoraFim"]
-    ini_col = next((c for c in ini_cands if c in cols_analises), None)
-    fim_col = next((c for c in fim_cands if c in cols_analises), None)
-
-    # chaves/joins
-    perito_fk = "siapePerito" if "siapePerito" in cols_analises else (
-                "perito" if "perito" in cols_analises else None)
-
-    schema = {
-        "analises": {
-            "table": "analises",
-            "ini_col": ini_col,
-            "fim_col": fim_col,
-            "perito_fk": perito_fk,
-            "conformado_col": "conformado" if "conformado" in cols_analises else None,
-            "motivo_nc_col":  "motivoNaoConformado" if "motivoNaoConformado" in cols_analises else None,
-            "protocolo_col":  "protocolo" if "protocolo" in cols_analises else None,
-        },
-        "peritos": {
-            "table": "peritos",
-            "id_col": "siapePerito" if "siapePerito" in cols_peritos else None,
-            "nome_col": "nomePerito" if "nomePerito" in cols_peritos else None,
-            "cr_col": "cr" if "cr" in cols_peritos else None,
-            "dr_col": "dr" if "dr" in cols_peritos else None,
-        },
-        "indicadores": {
-            "table": "indicadores" if cols_scores else None,
-            "perito_fk": "perito" if "perito" in cols_scores else (
-                         "siapePerito" if "siapePerito" in cols_scores else None),
-            "score_col": "scoreFinal" if "scoreFinal" in cols_scores else None,
-            "harm_col":  "harm" if "harm" in cols_scores else None,
-        }
-    }
-    return schema
-
-def _fetch_perito_n_nc(conn, start: str, end: str, schema: dict) -> pd.DataFrame:
-    a = schema["analises"]; p = schema["peritos"]
-    ini, per_fk = a["ini_col"], a["perito_fk"]
-    nome = p["nome_col"]; pid = p["id_col"]
-    if not ini or not per_fk or not nome or not pid:
-        return pd.DataFrame(columns=["nomePerito","N","NC","cr","dr"])
-
-    # regra de NC robusta: (conformado=0) OU (motivoNaoConformado != '' e != 0)
-    conf = a["conformado_col"]; motivo = a["motivo_nc_col"]
-    nc_expr = "0"
-    if conf:
-        nc_expr = f"CASE WHEN CAST(IFNULL(a.{conf},1) AS INTEGER)=0 THEN 1 ELSE 0 END"
-    if motivo:
-        # soma às condições
-        nc_expr = f"""( {nc_expr} 
-                        OR (TRIM(IFNULL(a.{motivo},'')) <> '' 
-                            AND CAST(IFNULL(a.{motivo},'0') AS INTEGER) <> 0) )"""
-
-    sql = f"""
-        SELECT 
-            p.{nome}  AS nomePerito,
-            p.{p.get('cr_col','cr') or 'cr'} AS cr,
-            p.{p.get('dr_col','dr') or 'dr'} AS dr,
-            COUNT(*)  AS N,
-            SUM(CASE WHEN {nc_expr} THEN 1 ELSE 0 END) AS NC
-        FROM analises a
-        JOIN peritos  p ON a.{per_fk} = p.{pid}
-        WHERE date(a.{ini}) BETWEEN ? AND ?
-        GROUP BY p.{nome}, p.{p.get('cr_col','cr') or 'cr'}, p.{p.get('dr_col','dr') or 'dr'}
-    """
-    try:
-        df = pd.read_sql(sql, conn, params=(start, end))
-    except Exception:
-        return pd.DataFrame(columns=["nomePerito","N","NC","cr","dr"])
-
-    # normaliza colunas
-    for c in ["cr","dr"]:
-        if c not in df.columns: df[c] = "-"
-    return df[["nomePerito","N","NC","cr","dr"]]
-
-def _compute_p_br_and_totals(conn, start: str, end: str, schema: dict) -> tuple[float,int,int]:
-    a = schema["analises"]; ini = a["ini_col"]
-    if not ini:
-        return 0.0, 0, 0
-    conf = a["conformado_col"]; motivo = a["motivo_nc_col"]
-    nc_expr = "0"
-    if conf:
-        nc_expr = f"CASE WHEN CAST(IFNULL({conf},1) AS INTEGER)=0 THEN 1 ELSE 0 END"
-    if motivo:
-        nc_expr = f"( {nc_expr} OR (TRIM(IFNULL({motivo},'')) <> '' AND CAST(IFNULL({motivo},'0') AS INTEGER) <> 0) )"
-    sql = f"""
-        SELECT COUNT(*) AS N, SUM(CASE WHEN {nc_expr} THEN 1 ELSE 0 END) AS NC
-        FROM analises WHERE date({ini}) BETWEEN ? AND ?
-    """
-    N, NC = 0, 0
-    try:
-        row = conn.execute(sql, (start, end)).fetchone()
-        if row:
-            N = int(row[0] or 0); NC = int(row[1] or 0)
-    except Exception:
-        pass
-    p_br = (NC / N) if N else 0.0
-    return float(p_br), N, NC
-
-def _fetch_scores(conn, start: str, end: str, schema: dict) -> pd.DataFrame:
-    t = schema["indicadores"]["table"]
-    per_fk = schema["indicadores"]["perito_fk"]
-    score_col = schema["indicadores"]["score_col"]
-    harm_col  = schema["indicadores"]["harm_col"]
-    p = schema["peritos"]; pid = p["id_col"]; nome = p["nome_col"]
-    if not t or not per_fk or not score_col or not pid or not nome:
-        return pd.DataFrame(columns=["nomePerito","scoreFinal","harm"])
-
-    # Indicadores costumam não ter data; agregamos pelo período via analises.
-    a = schema["analises"]; ini = a["ini_col"]
-    if not ini:
-        return pd.DataFrame(columns=["nomePerito","scoreFinal","harm"])
-    sql = f"""
-        SELECT p.{nome} AS nomePerito,
-               MAX(i.{score_col}) AS scoreFinal,
-               MAX({('i.'+harm_col) if harm_col else 'NULL'}) AS harm
-        FROM analises a
-        JOIN peritos p     ON a.{a['perito_fk']} = p.{pid}
-        JOIN {t} i         ON i.{per_fk} = p.{pid}
-        WHERE date(a.{ini}) BETWEEN ? AND ?
-        GROUP BY p.{nome}
-    """
-    try:
-        df = pd.read_sql(sql, conn, params=(start, end))
-        if "harm" not in df.columns: df["harm"] = np.nan
-        return df
-    except Exception:
-        return pd.DataFrame(columns=["nomePerito","scoreFinal","harm"])
-
-def perito_tem_dados(perito: str, start: str, end: str) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
-        schema = _detect_schema(conn)
-        a, p = schema["analises"], schema["peritos"]
-        ini = a["ini_col"]; per_fk = a["perito_fk"]; pid = p["id_col"]; nome = p["nome_col"]
-        if not all([ini, per_fk, pid, nome]):
-            return False
-        sql = f"""
-            SELECT 1
-            FROM analises a
-            JOIN peritos p ON a.{per_fk}=p.{pid}
-            WHERE p.{nome} = ? AND date(a.{ini}) BETWEEN ? AND ?
-            LIMIT 1
-        """
-        row = conn.execute(sql, (perito, start, end)).fetchone()
-        return bool(row)
-
-
-def gerar_scope_gate_b(start: str, end: str, min_analises: int = 50, factor_nc: float = 2.0) -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as conn:
-        schema = _detect_schema(conn)
-        df_n = _fetch_perito_n_nc(conn, start, end, schema)
-        if df_n.empty: return df_n
-        p_br, _, _ = _compute_p_br_and_totals(conn, start, end, schema)
-    df = df_n.copy()
-    df["p_hat"] = df["NC"] / df["N"].replace(0, np.nan)
-    gate = df.loc[(df["N"] >= int(min_analises)) & (df["p_hat"] >= float(factor_nc) * float(p_br))].copy()
-    return gate[["nomePerito"]]
-
-def _mover_markdowns_de_exports(markdown_dir: str):
-    os.makedirs(markdown_dir, exist_ok=True)
-    for src in glob(os.path.join(EXPORT_DIR, "*.md")):
-        try:
-            shutil.copy2(src, os.path.join(markdown_dir, os.path.basename(src)))
-            os.remove(src)
-        except Exception:
-            pass
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Helpers gerais
@@ -475,23 +274,13 @@ def rscript_path(name: str) -> str:
         raise FileNotFoundError(f"R script não encontrado: {path}")
     return path
 
-def introspect_script(script_file: str, timeout_sec: int = 6) -> dict:
-    """Descobre flags e modos de um script via --help, com timeout e fallback seguro."""
+def introspect_script(script_file: str) -> dict:
+    """Executa --help do script para descobrir flags e modos disponíveis."""
     info = {"flags": set(), "modes": []}
-    name = os.path.basename(script_file)
-
-    # Fast path opcional: pule introspecção se quiser (export ATESTMED_FAST_INTROSPECT=1)
-    if os.getenv("ATESTMED_FAST_INTROSPECT", "").strip() == "1":
-        info["flags"] = set(ASSUME_FLAGS.get(name, []))
-        info["modes"] = DEFAULT_MODES.get(name, [])
-        return info
-
     try:
         out = subprocess.run(
             [sys.executable, script_file, "--help"],
-            capture_output=True, text=True,
-            env=_env_with_project_path(), cwd=SCRIPTS_DIR,
-            timeout=timeout_sec
+            capture_output=True, text=True, env=_env_with_project_path(), cwd=SCRIPTS_DIR
         )
         text = (out.stdout or "") + "\n" + (out.stderr or "")
         for m in re.finditer(r"(--[a-zA-Z0-9][a-zA-Z0-9\-]*)", text):
@@ -499,24 +288,9 @@ def introspect_script(script_file: str, timeout_sec: int = 6) -> dict:
         mm = re.search(r"--mode[^\n]*\{([^}]+)\}", text)
         if mm:
             info["modes"] = [x.strip() for x in mm.group(1).split(",") if x.strip()]
-
-        # Fallback complementar caso o --help não liste nada útil
-        if not info["flags"]:
-            info["flags"] = set(ASSUME_FLAGS.get(name, []))
-        if not info["modes"]:
-            info["modes"] = DEFAULT_MODES.get(name, [])
-        return info
-
-    except subprocess.TimeoutExpired:
-        print(f"[WARN] introspect_script: timeout ({timeout_sec}s) em {name}; usando ASSUME_FLAGS/DEFAULT_MODES.")
-    except Exception as e:
-        print(f"[WARN] introspect_script: falha em {name}: {e}; usando ASSUME_FLAGS/DEFAULT_MODES.")
-
-    # Fallback total
-    info["flags"] = set(ASSUME_FLAGS.get(name, []))
-    info["modes"] = DEFAULT_MODES.get(name, [])
+    except Exception:
+        pass
     return info
-
 
 def detect_modes(script_file: str, help_info: dict) -> list:
     """Retorna a lista de modos suportados pelo script (via --help ou DEFAULT_MODES)."""
@@ -862,151 +636,6 @@ def _build_gate_fluxo_b(start: str, end: str, min_analises: int = 50) -> pd.Data
     # mantenha colunas úteis
     keep = [c for c in ["nomePerito", "cr", "dr", "N", "NC", "p_hat"] if c in gate.columns]
     return gate.loc[:, keep]
-
-def _select_candidates(args) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
-    """
-    Retorna (df_sel, df_scope) com a seleção de peritos para o run.
-      - df_sel tem pelo menos 'nomePerito'; df_scope é usado como ESCOPO (Fluxo B).
-    Regras:
-      1) Se --peritos-csv vier, lê diretamente e retorna (peritos_csv, scope_csv|None).
-      2) Se --all-matching:
-         - Fluxo B: todos do gate (%NC ≥ 2× p_BR) com N ≥ min_analises.
-         - Fluxo A: todos com N ≥ min_analises (ordenados por scoreFinal, mas sem cortar).
-      3) Se --topk:
-         - Fluxo B: ordena pela métrica de impacto (harm/E/IV_vagas se disponível; fallback scoreFinal) e corta K.
-         - Fluxo A: ordena por scoreFinal e corta K.
-      4) Se --top10:
-         - mantém comportamento legacy (pode retornar None; usaremos --top10 nos scripts que suportam).
-      5) Caso nenhum: retorna DataFrame vazio para que a pipeline trate como “individual” ou “legacy top10”.
-    """
-    # 1) CSV explícito
-    if args.peritos_csv:
-        try:
-            df = pd.read_csv(args.peritos_csv)
-            if "nomePerito" not in df.columns:
-                print(f"❌ {args.peritos_csv} sem coluna 'nomePerito'.")
-                return pd.DataFrame(columns=["nomePerito"]), None
-            scope = None
-            if args.scope_csv:
-                try:
-                    scope = pd.read_csv(args.scope_csv)
-                except Exception as e:
-                    print(f"[WARN] Falha lendo scope_csv: {e}")
-            return df[["nomePerito"]].drop_duplicates(), (scope if scope is not None else None)
-        except Exception as e:
-            print(f"[WARN] Falha lendo peritos_csv: {e}")
-            return pd.DataFrame(columns=["nomePerito"]), None
-
-    # 2/3/4) Precisamos calcular base N/NC e scores
-    with sqlite3.connect(DB_PATH) as conn:
-        schema = _detect_schema(conn)
-        df_n = _fetch_perito_n_nc(conn, args.start, args.end, schema)
-        if df_n.empty:
-            return pd.DataFrame(columns=["nomePerito"]), None
-        p_br, _, _ = _compute_p_br_and_totals(conn, args.start, args.end, schema)
-        df_scores = _fetch_scores(conn, args.start, args.end, schema) if '_fetch_scores' in globals() else pd.DataFrame()
-
-    rank_key = (args.rank_by or ("scoreFinal" if args.fluxo == "A" else "harm"))
-    base = _prep_base(df_n, df_scores, p_br, alpha=1.0, min_analises=args.min_analises, kpi_base=args.kpi_base).copy()
-    # normalizações de coluna
-    for col_pair in [("scoreFinal", "score_final"), ("harm", "harm")]:
-        a, b = col_pair
-        if a in base.columns and b not in base.columns:
-            base = base.rename(columns={a: b})
-    # harm/impacto: preferir IV_vagas (derivado) > E > harm > score_final
-    if "IV_vagas" in base.columns:
-        base["__rank_metric__"] = base["IV_vagas"].astype(float)
-    elif "E" in base.columns:
-        base["__rank_metric__"] = base["E"].astype(float)
-    elif "harm" in base.columns:
-        base["__rank_metric__"] = base["harm"].astype(float)
-    else:
-        base["__rank_metric__"] = base.get("score_final", pd.Series(0, index=base.index)).astype(float)
-
-    # Gate do fluxo B para construir escopo (para --all-matching e --topk B)
-    scope_b = _build_gate_fluxo_b(args.start, args.end, args.min_analises) if str(args.fluxo).upper() == "B" else None
-
-    # 2) all-matching
-    if args.all_matching:
-        if args.fluxo.upper() == "B":
-            if scope_b is None or scope_b.empty:
-                return pd.DataFrame(columns=["nomePerito"]), None
-            # todos do gate, sem cortar
-            return scope_b[["nomePerito"]].drop_duplicates().reset_index(drop=True), scope_b
-        else:
-            # Fluxo A: todos com N ≥ min_analises
-            full = base.loc[base["N"] >= int(args.min_analises)].copy()
-            if full.empty:
-                return pd.DataFrame(columns=["nomePerito"]), None
-            full = full.sort_values(["__rank_metric__", "score_final", "NC", "N"], ascending=[False, False, False, True])
-            return full[["nomePerito"]].drop_duplicates().reset_index(drop=True), None
-
-    # 3) topk
-    if args.topk and args.topk > 0:
-        if args.fluxo.upper() == "B":
-            # cortar dentro do gate
-            if scope_b is None or scope_b.empty:
-                return pd.DataFrame(columns=["nomePerito"]), None
-            # junta métrica de rank
-            b2 = base.merge(scope_b[["nomePerito"]], on="nomePerito", how="inner")
-            b2 = b2.sort_values(["__rank_metric__", "score_final", "NC", "N"], ascending=[False, False, False, True])
-            b2 = b2.head(int(args.topk))
-            return b2[["nomePerito"]].reset_index(drop=True), scope_b
-        else:
-            # Fluxo A: ranking direto por score/impacto
-            b2 = base.loc[base["N"] >= int(args.min_analises)].copy()
-            if b2.empty:
-                return pd.DataFrame(columns=["nomePerito"]), None
-            b2 = b2.sort_values(["__rank_metric__", "score_final", "NC", "N"], ascending=[False, False, False, True])
-            b2 = b2.head(int(args.topk))
-            return b2[["nomePerito"]].reset_index(drop=True), None
-
-    # 4) top10 legacy: retorna vazio para que a pipeline use --top10 nos scripts que suportam
-    if args.top10:
-        return pd.DataFrame(columns=["nomePerito"]), (scope_b if args.fluxo.upper()=="B" else None)
-
-    # 5) nenhum caso — volta vazio
-    return pd.DataFrame(columns=["nomePerito"]), None
-
-
-def _materialize_selection_to_csvs(df_sel: pd.DataFrame,
-                                   scope_df: Optional[pd.DataFrame],
-                                   relatorio_dir: str,
-                                   fluxo: str,
-                                   start: str, end: str,
-                                   save_manifests: bool) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Salva os CSVs com a seleção e o escopo (se houver), retornando (peritos_csv, scope_csv).
-    Em caso de Top10 legacy (df_sel vazio), retorna (None, scope.csv|None).
-    """
-    os.makedirs(relatorio_dir, exist_ok=True)
-
-    peritos_csv = None
-    scope_csv = None
-
-    if df_sel is not None and not df_sel.empty:
-        peritos_csv = os.path.join(relatorio_dir, "topk_peritos.csv")
-        df_sel[["nomePerito"]].drop_duplicates().to_csv(peritos_csv, index=False, encoding="utf-8")
-
-    if scope_df is not None and not scope_df.empty:
-        scope_csv = os.path.join(relatorio_dir, "scope_gate_b.csv")
-        scope_df[["nomePerito"]].drop_duplicates().to_csv(scope_csv, index=False, encoding="utf-8")
-
-    if save_manifests:
-        # mantém compat com rotina antiga de salvar top10 e scope
-        try:
-            if df_sel is not None and not df_sel.empty:
-                tmp = df_sel.copy().reset_index(drop=True)
-                tmp["rank"] = tmp.index + 1
-                tmp["fluxo"] = fluxo
-                tmp["start"] = start
-                tmp["end"] = end
-                man_path = os.path.join(relatorio_dir, "topk_manifest.csv")
-                tmp.to_csv(man_path, index=False, encoding="utf-8")
-        except Exception as e:
-            print(f"[WARN] Falha salvando manifest topk: {e}")
-
-    return peritos_csv, scope_csv
 
 # --- helpers manifest/scope (drop-in) ---
 def _save_top10_manifests(peritos_df: "pd.DataFrame",
@@ -1799,40 +1428,6 @@ def _detect_r_out_flag(r_file_path: str):
         pass
     return None
 
-def _run_or_dry(cmd: list, plan_only: bool = False) -> int:
-    """
-    Executa `cmd` ou apenas imprime (dry-run) mantendo o mesmo prefixo [R]/[PY].
-    Usa RCHECK_DIR para scripts R e SCRIPTS_DIR para Python, e injeta PYTHONPATH
-    quando for Python.
-    """
-    try:
-        tag = "[R]" if _is_r_cmd(cmd) else "[PY]"
-    except Exception:
-        tag = "[?]"
-
-    # Imprime o comando “bonito” no modo plano
-    if plan_only:
-        try:
-            line = " ".join(shlex.quote(str(x)) for x in cmd)
-        except Exception:
-            line = " ".join(map(str, cmd))
-        print(f"{tag} {line}")
-        return 0
-
-    # Execução
-    try:
-        if _is_r_cmd(cmd):
-            print(f"{tag} {' '.join(map(str, cmd))}")
-            r_env = os.environ.copy()  # (se precisar, injete variáveis extras antes de chamar aqui)
-            subprocess.run(cmd, check=False, cwd=RCHECK_DIR, env=r_env)
-        else:
-            print(f"{tag} {' '.join(map(str, cmd))}")
-            subprocess.run(cmd, check=False, cwd=SCRIPTS_DIR, env=_env_with_project_path())
-        return 0
-    except Exception as e:
-        print(f"[ERRO] Falha executando: {' '.join(map(str, cmd))}\n  -> {e}")
-        return 1
-
 def _r_deps_bootstrap_cmd(r_bin: str):
     """Gera script R para checar/instalar dependências básicas e retorna o comando para rodá-lo."""
     os.makedirs(RCHECK_DIR, exist_ok=True)
@@ -1861,14 +1456,7 @@ message(capture.output(sessionInfo()), sep = "\n")
     return [r_bin, deps_path]
 
 def build_commands_for_script(script_file: str, context: dict) -> list:
-    """
-    Monta comandos p/ um script Python de gráfico, dado o contexto.
-    Ordem de preferência da seleção:
-      (1) --peritos-csv / --scope-csv
-      (2) --perito / --nome   (execução individual)
-      (3) --top10             (apenas quando kind==group/top10 e top_k==10)
-    Caso nenhum dos três seja possível, o script é pulado.
-    """
+    """Monta comandos de execução para um script Python de gráfico, dado o contexto (perito/top10)."""
     cmds = []
     name = os.path.basename(script_file)
     help_info = introspect_script(script_file)
@@ -1877,47 +1465,36 @@ def build_commands_for_script(script_file: str, context: dict) -> list:
 
     base = ["--start", context["start"], "--end", context["end"]]
 
-    # Fluxo
+    # Fluxo (B é o padrão se não vier no context)
     fluxo = context.get("fluxo", "B")
     if "--fluxo" in flags:
         base += ["--fluxo", str(fluxo)]
 
-    # ===== Seleção (grupo/individual) =====
-    sel: list[str] = []
+    # Manifests: lista final (Top10) e escopo (gate do B)
+    if context.get("peritos_csv") and "--peritos-csv" in flags:
+        base += ["--peritos-csv", context["peritos_csv"]]
+    if context.get("scope_csv") and "--scope-csv" in flags:
+        base += ["--scope-csv", context["scope_csv"]]
 
-    peritos_csv = context.get("peritos_csv")
-    scope_csv   = context.get("scope_csv")
-    top_k       = int(context.get("top_k") or 0)
-    kind        = (context.get("kind") or "").lower()
-
-    # (1) Manifesto (grupo TopK/All-matching)
-    if peritos_csv and "--peritos-csv" in flags:
-        sel += ["--peritos-csv", peritos_csv]
-        if scope_csv and "--scope-csv" in flags:
-            sel += ["--scope-csv", scope_csv]
-
-    # (2) Execução individual
-    elif context.get("perito"):
-        perito = str(context["perito"])
+    # Seleção: perito ou top10
+    if context["kind"] == "perito":
+        perito = context["perito"]
         if "--perito" in flags:
-            sel += ["--perito", perito]
+            base += ["--perito", perito]
         elif "--nome" in flags:
-            sel += ["--nome", perito]
+            base += ["--nome", perito]
         else:
-            print(f"[INFO] {name} não expõe --perito/--nome; exige --peritos-csv. Pulando este script para execução individual.")
+            base += ["--perito", perito]
+    else:
+        if ("--top10" in flags) or (name in ASSUME_FLAGS and "--top10" in ASSUME_FLAGS[name]):
+            base += ["--top10"]
+            if "--min-analises" in flags and "min_analises" in context:
+                base += ["--min-analises", str(context["min_analises"])]
+        else:
+            print(f"[INFO] {name} não suporta --top10; pulando no grupo.")
             return []
 
-    # (3) Top10 legacy (só se K==10 e for grupo)
-    elif kind in ("group", "top10") and top_k == 10 and "--top10" in flags:
-        sel += ["--top10"]
-        if "--min-analises" in flags and "min_analises" in context:
-            sel += ["--min-analises", str(context["min_analises"])]
-
-    else:
-        print(f"[INFO] {name} exige --peritos-csv para K≠10/all-matching; pulando este script.")
-        return []
-
-    # ===== Exportações / comentários =====
+    # Exportações e comentários
     if "--export-org" in flags and context.get("export_org"):
         base += ["--export-org"]
     if "--export-pdf" in flags and context.get("export_pdf"):
@@ -1934,21 +1511,49 @@ def build_commands_for_script(script_file: str, context: dict) -> list:
     if "--export-md" in flags:
         base += ["--export-md"]
 
-    # ===== Modos (quando aplicável) =====
-    if modes:
-        for m in modes:
-            cmd = [sys.executable, script_file] + base + sel + ["--mode", m]
-            ex = EXTRA_ARGS.get(name, [])
-            if ex:
-                cmd += ex
-            cmds.append(cmd)
-    else:
-        cmd = [sys.executable, script_file] + base + sel
-        ex = EXTRA_ARGS.get(name, [])
-        if ex:
-            cmd += ex
-        cmds.append(cmd)
+    # Ajustes específicos por script (mantidos)
+    if name == "compare_productivity.py" and "--threshold" in flags:
+        base += ["--threshold", PRODUCTIVITY_THRESHOLD]
+    if name == "compare_fifteen_seconds.py":
+        if "--threshold" in flags:
+            base += ["--threshold", FIFTEEN_THRESHOLD]
+        if "--cut-n" in flags:
+            base += ["--cut-n", FIFTEEN_CUT_N]
 
+    # Pass-through opcional de outras chaves conhecidas, se o script suportar
+    passthrough = (
+        ("kpi_base", "--kpi-base"),
+        ("select_src", "--select-src"),
+    )
+    for key, flag in passthrough:
+        if key in context and flag in flags:
+            val = context[key]
+            if isinstance(val, bool):
+                if val:
+                    base += [flag]
+            else:
+                base += [flag, str(val)]
+
+    def _apply_extra(cmd_list):
+        extra = EXTRA_ARGS.get(name, [])
+        i = 0
+        while i < len(extra):
+            tok = extra[i]
+            if isinstance(tok, str) and tok.startswith("--") and tok in flags:
+                cmd_list.append(tok)
+                if i + 1 < len(extra) and not (isinstance(extra[i+1], str) and extra[i+1].startswith("--")):
+                    cmd_list.append(str(extra[i+1]))
+                    i += 1
+            i += 1
+        return cmd_list
+
+    if "--mode" in flags and modes:
+        for m in modes:
+            cmd = [sys.executable, script_file] + base + ["--mode", m]
+            cmds.append(_apply_extra(cmd))
+    else:
+        cmd = [sys.executable, script_file] + base
+        cmds.append(_apply_extra(cmd))
     return cmds
 
 
@@ -2113,80 +1718,7 @@ def pretty_print_plan(
             line = " ".join(map(str, cmd))
         print(f"{i:02d}. {tag} {line}")
     print("-- fim do plano --\n")
-
-def _run_rchecks_for_selection(args, peritos_csv: Optional[str], plan_only: bool = False):
-    """
-    Executa os R checks conforme a seleção:
-      - Top10 legacy (sem peritos_csv): roda SOMENTE os R checks de GRUPO (RCHECK_GROUP_SCRIPTS).
-      - Caso geral (peritos_csv presente OU perito único via CLI): roda os R checks INDIVIDUAIS (RCHECK_SCRIPTS) 1x por perito.
-    Evita duplicação: nunca dispara grupo e individuais no mesmo ciclo.
-    """
-    if not getattr(args, "r_appendix", False):
-        return
-
-    _preflight_r(args.r_bin)
-
-    # Se não recebemos peritos_csv por parâmetro, tenta usar o do CLI (quando existir)
-    if not peritos_csv and getattr(args, "peritos_csv", None):
-        peritos_csv = args.peritos_csv
-
-    # ─────────────────────────── Modo Top10 legacy (sem peritos_csv) ───────────────────────────
-    # Mantém apenas os checks de GRUPO. Não roda os individuais aqui.
-    if getattr(args, "top10", False) and not peritos_csv:
-        for rname, opts in RCHECK_GROUP_SCRIPTS:
-            rfile = rscript_path(rname)
-            outflag = _detect_r_out_flag(rfile) or "--out-dir"
-            cmd = [
-                args.r_bin, rfile,
-                "--db", DB_PATH,
-                "--start", args.start, "--end", args.end,
-                outflag, EXPORT_DIR
-            ]
-            # defaults opcionais do script (ex.: thresholds)
-            for k, v in (opts.get("defaults") or {}).items():
-                cmd += [k, str(v)]
-            _run_or_dry(cmd, plan_only)
-        return  # encerra aqui para não duplicar com individuais
-
-    # ─────────────────────────── Caso geral: por perito ───────────────────────────
-    peritos: list[str] = []
-
-    # Lista a partir do CSV materializado (TopK, all-matching, etc.)
-    if peritos_csv and os.path.exists(peritos_csv):
-        try:
-            dfp = pd.read_csv(peritos_csv)
-            if "nomePerito" in dfp.columns:
-                peritos = sorted(dfp["nomePerito"].dropna().astype(str).unique().tolist())
-            else:
-                print(f"[WARN] {peritos_csv} não possui coluna 'nomePerito'; nenhum perito carregado.")
-        except Exception as e:
-            print(f"[WARN] Falha lendo {peritos_csv}: {e}")
-
-    # Fallback: perito único via CLI
-    if not peritos and getattr(args, "perito", None):
-        peritos = [args.perito]
-
-    if not peritos:
-        print("[INFO] Sem peritos para R-checks em seleção.")
-        return
-
-    # Executa os checks INDIVIDUAIS (01..08) para cada perito selecionado
-    for nome in peritos:
-        for rname, opts in RCHECK_SCRIPTS:
-            rfile = rscript_path(rname)
-            outflag = _detect_r_out_flag(rfile) or "--out-dir"
-            cmd = [
-                args.r_bin, rfile,
-                "--db", DB_PATH,
-                "--start", args.start, "--end", args.end,
-                outflag, EXPORT_DIR,
-                "--perito", nome
-            ]
-            for k, v in (opts.get("defaults") or {}).items():
-                cmd += [k, str(v)]
-            _run_or_dry(cmd, plan_only)
-
-
+    
 # ────────────────────────────────────────────────────────────────────────────────
 # Coleta de saídas R (fallback)
 # ────────────────────────────────────────────────────────────────────────────────
@@ -3135,52 +2667,39 @@ def gerar_org_individual_consolidado_com_panorama_depois(perito: str, start: str
 # ────────────────────────────────────────────────────────────────────────────────
 # Seleção Top 10 & Coorte Extra (funções auxiliares usadas no main)
 # ────────────────────────────────────────────────────────────────────────────────
+
 def pegar_10_piores_peritos(start: str, end: str, min_analises: int = 50) -> pd.DataFrame:
     """
-    Fluxo A: ordena por scoreFinal (desc). Considera apenas quem tem N >= min_analises.
-    Retorna: nomePerito (Top 10).
+    Retorna os 10 piores peritos no período (start..end) de acordo com 'scoreFinal',
+    considerando apenas peritos com pelo menos 'min_analises' tarefas.
+
+    Tabelas esperadas:
+      - indicadores (coluna: perito = siapePerito, scoreFinal)
+      - peritos     (colunas: siapePerito, nomePerito)
+      - analises    (colunas: siapePerito, protocolo, dataHoraIniPericia)
+
+    Obs.: 'scoreFinal' maior = pior (ordena DESC).
     """
-    with sqlite3.connect(DB_PATH) as conn:
-        schema = _detect_schema(conn)
-        df_n = _fetch_perito_n_nc(conn, start, end, schema)   # colunas: nomePerito, N, NC
-        df_s = _fetch_scores(conn, start, end, schema)        # colunas: nomePerito, scoreFinal, harm
-
-    base = df_n.merge(df_s, on="nomePerito", how="left")
-    base = base.loc[base["N"].fillna(0).astype(int) >= int(min_analises)].copy()
-    base["scoreFinal"] = base["scoreFinal"].astype(float).fillna(0.0)
-
-    out = base.sort_values(["scoreFinal", "NC", "N"], ascending=[False, False, True]).head(10)
-    return out[["nomePerito"]].reset_index(drop=True)
-
-
-def pegar_top10_harm_first(start: str, end: str, min_analises: int = 50, factor_nc: float = 2.0) -> pd.DataFrame:
-    """
-    Fluxo B (harm-first):
-      1) Gate: %NC perito >= factor_nc × p_BR e N >= min_analises
-      2) Ordena por 'harm' (se houver) com fallback em scoreFinal, depois NC desc, N asc.
-    Retorna: nomePerito (Top 10).
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        schema = _detect_schema(conn)
-        df_n = _fetch_perito_n_nc(conn, start, end, schema)             # nomePerito, N, NC
-        p_br, _, _ = _compute_p_br_and_totals(conn, start, end, schema) # média nacional %NC
-        df_s = _fetch_scores(conn, start, end, schema)                  # nomePerito, scoreFinal, harm
-
-    df = df_n.copy()
-    df["p_hat"] = df["NC"] / df["N"].replace(0, np.nan)
-
-    gate = df.loc[
-        (df["N"].astype(float) >= float(min_analises)) &
-        (df["p_hat"].astype(float) >= float(factor_nc) * float(p_br or 0.0))
-    ].copy()
-
-    sel = gate.merge(df_s, on="nomePerito", how="left")
-    sel["__rank__"] = sel.get("harm", np.nan).astype(float).fillna(
-        sel.get("scoreFinal", 0.0).astype(float)
-    )
-
-    sel = sel.sort_values(["__rank__", "NC", "N"], ascending=[False, False, True]).head(10)
-    return sel[["nomePerito"]].reset_index(drop=True)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        query = """
+        SELECT
+            p.nomePerito,
+            i.scoreFinal,
+            COUNT(a.protocolo) AS total_analises
+        FROM indicadores i
+        JOIN peritos     p ON i.perito      = p.siapePerito
+        JOIN analises    a ON a.siapePerito = i.perito
+        WHERE date(a.dataHoraIniPericia) BETWEEN ? AND ?
+        GROUP BY p.nomePerito, i.scoreFinal
+        HAVING total_analises >= ?
+        ORDER BY i.scoreFinal DESC
+        LIMIT 10
+        """
+        df = pd.read_sql(query, conn, params=(start, end, min_analises))
+        return df
+    finally:
+        conn.close()
 
 
 def pegar_peritos_nc_altissima(start: str, end: str,
@@ -3395,6 +2914,139 @@ def selecionar_top10_fluxo_b(start: str, end: str, min_analises: int = 50, fator
         """
         df = pd.read_sql(sql_per, conn, params=(start, end, int(min_analises), float(limiar)))
     return df
+
+def pegar_top10_harm_first(start: str, end: str, min_analises: int = 50, factor_nc: float = 2.0) -> pd.DataFrame:
+    """
+    Top 10 'Harm-first':
+      1) filtra peritos com %NC >= factor_nc × média nacional e total >= min_analises
+      2) calcula flags dos outros KPI (≤15s≥10; produtividade≥50/h; sobreposição)
+      3) aplica Score v2 e ordena (score desc, pct_nc desc, total desc)
+
+    Retorna colunas:
+      nomePerito, CR, DR, total, pct_nc, le15_n, le15_flag, prod_h, prod_flag, overlap_flag, score_v2
+    """
+    nat_pct = _nat_nc_pct_valid(start, end)
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        # Detecta colunas de tempo
+        ini_col = None
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(analises)").fetchall()]
+        for cand in ("dataHoraIniPericia", "dataHoraIniAnalise", "dataHoraIni"):
+            if cand in cols:
+                ini_col = cand; break
+        fim_col = _detect_end_datetime_column(conn)
+        if not ini_col or not fim_col:
+            raise RuntimeError("Não foi possível detectar colunas de início/fim em 'analises'.")
+
+        # CTE 'base' com duração válida em segundos (0 < dur ≤ 3600)
+        # Flags calculadas por perito:
+        #  - le15_n: contagem de tarefas com dur ≤ 15s
+        #  - hours_eff: soma(dur)/3600
+        #  - prod_h: total_valid / hours_eff
+        #  - overlap_flag: existência de intervalos que se cruzam para o mesmo perito
+        #  - nc_count/total → pct_nc
+        sql = f"""
+        WITH base AS (
+            SELECT
+                p.siapePerito         AS siape,
+                p.nomePerito          AS nomePerito,
+                p.cr                  AS CR,
+                p.dr                  AS DR,
+                a.protocolo           AS protocolo,
+                a.{ini_col}           AS ini,
+                a.{fim_col}           AS fim,
+                CAST(
+                    (julianday(a.{fim_col}) - julianday(a.{ini_col})) * 86400.0
+                    AS REAL
+                )                      AS dur_s,
+                CASE
+                    WHEN CAST(IFNULL(a.conformado, 1) AS INTEGER) = 0 THEN 1
+                    WHEN TRIM(IFNULL(a.motivoNaoConformado, '')) <> ''
+                         AND CAST(IFNULL(a.motivoNaoConformado, '0') AS INTEGER) <> 0 THEN 1
+                    ELSE 0
+                END                    AS nc_flag
+            FROM analises a
+            JOIN peritos p ON p.siapePerito = a.siapePerito
+            WHERE date(a.{ini_col}) BETWEEN ? AND ?
+        ),
+        valid AS (
+            SELECT *
+            FROM base
+            WHERE dur_s IS NOT NULL AND dur_s > 0 AND dur_s <= 3600
+        ),
+        agg AS (
+            SELECT
+                siape, nomePerito, CR, DR,
+                COUNT(*)                              AS total,
+                SUM(nc_flag)                          AS nc_count,
+                (SUM(nc_flag) * 100.0) / COUNT(*)     AS pct_nc,
+                SUM(CASE WHEN dur_s <= ? THEN 1 ELSE 0 END) AS le15_n,
+                SUM(dur_s) / 3600.0                   AS hours_eff
+            FROM valid
+            GROUP BY siape, nomePerito, CR, DR
+        ),
+        prod_flag AS (
+            SELECT
+                a.siape,
+                CASE WHEN (a.total / NULLIF(a.hours_eff, 0)) >= ? THEN 1 ELSE 0 END AS prod_flag,
+                (a.total / NULLIF(a.hours_eff, 0)) AS prod_h
+            FROM agg a
+        ),
+        overlap_flag AS (
+            SELECT v1.siape,
+                   CASE WHEN EXISTS (
+                       SELECT 1
+                       FROM valid v2
+                       WHERE v2.siape = v1.siape
+                         AND v2.protocolo <> v1.protocolo
+                         AND datetime(v1.ini) < datetime(v2.fim)
+                         AND datetime(v2.ini) < datetime(v1.fim)
+                   ) THEN 1 ELSE 0 END AS overlap_flag
+            FROM valid v1
+            GROUP BY v1.siape
+        ),
+        joined AS (
+            SELECT
+                a.siape, a.nomePerito, a.CR, a.DR, 
+                a.total, a.nc_count, a.pct_nc, a.le15_n, a.hours_eff,
+                pf.prod_h,
+                pf.prod_flag,
+                of.overlap_flag,
+                CASE WHEN a.le15_n >= ? THEN 1 ELSE 0 END AS le15_flag
+            FROM agg a
+            LEFT JOIN prod_flag   pf ON pf.siape = a.siape
+            LEFT JOIN overlap_flag of ON of.siape = a.siape
+        )
+        SELECT
+            nomePerito, CR, DR, total, pct_nc,
+            le15_n, le15_flag, prod_h, prod_flag, overlap_flag
+        FROM joined
+        WHERE total >= ?
+          AND pct_nc >= ?
+        """
+        df = pd.read_sql(
+            sql, conn,
+            params=(start, end, int(FIFTEEN_THRESHOLD), float(PRODUCTIVITY_THRESHOLD),
+                    int(FIFTEEN_CUT_N), int(min_analises), float(factor_nc * nat_pct))
+        )
+
+        if df.empty:
+            return df
+
+        # Score v2 (mantendo 1.0 para o critério NC≥2×, já que o filtro garante que todos valem 1 nesse item)
+        df["score_v2"] = (
+            3.0  * df["prod_flag"].fillna(0).astype(int) +
+            2.5  * df["overlap_flag"].fillna(0).astype(int) +
+            2.0  * df["le15_flag"].fillna(0).astype(int) +
+            1.0  * 1
+        )
+        # Ordenação: Score desc → %NC desc → total desc
+        df = df.sort_values(["score_v2", "pct_nc", "total"], ascending=[False, False, False]).reset_index(drop=True)
+        # Limita Top 10
+        return df.head(10)
+    finally:
+        conn.close()
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -3726,11 +3378,10 @@ def main():
     """
     Orquestração principal:
       1) Parse de argumentos e preflight (env, R).
-      2) Seleção de peritos (Top10 legacy | TopK | all-matching | perito único).
-      3) Planejamento e execução dos gráficos (Python e R).
-      4) Coleta e cópia dos artefatos para pastas do relatório.
-      5) Geração do(s) arquivo(s) .org consolidado(s) e, opcionalmente, PDF com capa.
-      6) Organização dos arquivos '.md' remanescentes em 'markdown/'.
+      2) Planejamento e execução dos gráficos (Python e R).
+      3) Coleta e cópia dos artefatos para pastas do relatório.
+      4) Geração do(s) arquivo(s) .org consolidado(s) e, opcionalmente, PDF com capa.
+      5) Organização dos arquivos '.md' remanescentes em 'markdown/'.
     """
     t0 = time.time()
     args = parse_args()
@@ -3743,94 +3394,99 @@ def main():
     if args.r_appendix:
         _preflight_r(args.r_bin)
 
-    # --- Deriva o "tipo de execução" (grupo vs individual) e rótulo da pasta ---
-    is_group_run = bool(args.top10 or getattr(args, "topk", None) or getattr(args, "all_matching", False) or getattr(args, "peritos_csv", None))
-    fluxo = str(getattr(args, "fluxo", "B")).upper()
-
-    # Diretórios base do período
+    # Estrutura de diretórios por período e tipo (Top10 ou Individual)
     PERIODO_DIR = os.path.join(OUTPUTS_DIR, f"{args.start}_a_{args.end}")
-    os.makedirs(PERIODO_DIR, exist_ok=True)
-
-    # Vars p/ manifests e caminhos
-    peritos_csv_path: Optional[str] = None
-    scope_csv_path: Optional[str]   = None
-    lista_selecionados: list[str]   = []   # lista final de nomes para rodar individuais
-    set_top10: set[str]             = set()
-
-    # =========================
-    # SELEÇÃO
-    # =========================
-    # Top10 legacy: deixamos df_sel vazio e usamos --top10 nos scripts que suportam.
-    legacy_top10 = bool(args.top10)
-
-    # Se houver qualquer uma das novas formas (topk / all-matching / peritos-csv), usamos _select_candidates
-    df_sel, scope_df = _select_candidates(args)  # pode retornar vazio no caso Top10 legacy
-
-    # Define rótulo da pasta de relatório de GRUPO (quando aplicável)
-    if is_group_run:
-        if legacy_top10 and (df_sel is None or df_sel.empty):
-            group_label = "top10"
-        elif getattr(args, "topk", None):
-            group_label = f"top{int(args.topk)}"
-        elif getattr(args, "all_matching", False):
-            group_label = "all_matching"
-        else:
-            group_label = "selecionados"
-        RELATORIO_DIR = os.path.join(PERIODO_DIR, group_label)
+    if args.top10:
+        RELATORIO_DIR = os.path.join(PERIODO_DIR, "top10")
     else:
         safe_perito = _safe(args.perito.strip())
         RELATORIO_DIR = os.path.join(PERIODO_DIR, "individual", safe_perito)
 
-    # Pastas de saída
     IMGS_DIR      = os.path.join(RELATORIO_DIR, "imgs")
     COMMENTS_DIR  = os.path.join(RELATORIO_DIR, "comments")
     ORGS_DIR      = os.path.join(RELATORIO_DIR, "orgs")
     MARKDOWN_DIR  = os.path.join(RELATORIO_DIR, "markdown")
-    for d in (RELATORIO_DIR, IMGS_DIR, COMMENTS_DIR, ORGS_DIR, MARKDOWN_DIR):
+
+    for d in (PERIODO_DIR, RELATORIO_DIR, IMGS_DIR, COMMENTS_DIR, ORGS_DIR, MARKDOWN_DIR):
         os.makedirs(d, exist_ok=True)
 
-    planned_cmds: list[list[str]] = []
+    planned_cmds: list = []
+
+    # Vars globais p/ manifests (precisam existir antes do loop de execução)
+    peritos_csv_path: Optional[str] = None
+    scope_csv_path: Optional[str] = None  # opcional; pode ser preenchido por gerar_scope_gate_b
 
     # =========================
-    # PLANEJAMENTO — GRUPO
+    # PLANEJAMENTO — TOP 10 / INDIVIDUAL
     # =========================
-    if is_group_run:
-        # Limpa exports antigos de grupo
+    lista_top10: list = []
+    set_top10: set = set()
+    fluxo = getattr(args, "fluxo", "B")  # PADRÃO = B
+
+    if args.top10:
+        # Seleção conforme fluxo
+        if fluxo == "B":
+            print("🔀 Fluxo B (padrão): gate %NC ≥ 2× Brasil (válidas) + ranking por harm/score.")
+            peritos_df = pegar_top10_harm_first(
+                args.start, args.end,
+                min_analises=args.min_analises,
+                factor_nc=2.0
+            )
+            if peritos_df.empty:
+                print("Fluxo B: ninguém atingiu %NC ≥ 2× Brasil (válidas) com o mínimo de análises.")
+                return
+        else:
+            print("🔀 Fluxo A: Top 10 direto por scoreFinal (sem gate).")
+            peritos_df = pegar_10_piores_peritos(
+                args.start, args.end,
+                min_analises=args.min_analises
+            )
+            if peritos_df.empty:
+                print("Fluxo A: Top 10 por scoreFinal não encontrado com o mínimo de análises.")
+                return
+
+        lista_top10 = peritos_df['nomePerito'].astype(str).tolist()
+        set_top10   = set(lista_top10)
+        print(f"Gerando para os 10 selecionados (fluxo {fluxo}): {lista_top10}")
+
+        # Limpa exports "top10" antigos
         _cleanup_exports_top10()
 
-        # Materializa seleção/escopo quando houver (TopK/all-matching/peritos-csv)
-        # No Top10 legacy (df_sel vazio), não gera peritos_csv para manter fallback --top10
-        if df_sel is not None and not df_sel.empty:
-            peritos_csv_path, scope_csv_path = _materialize_selection_to_csvs(
-                df_sel, scope_df, RELATORIO_DIR, fluxo, args.start, args.end, save_manifests=bool(getattr(args, "save_manifests", False))
-            )
-            # lista para rodar apêndices/individuais
-            lista_selecionados = sorted(df_sel["nomePerito"].astype(str).unique().tolist())
-        else:
-            peritos_csv_path, scope_csv_path = None, (scope_df if scope_df is not None else None)
-            if legacy_top10:
-                print("ℹ️  Top 10 legacy (sem peritos_csv): scripts de grupo que suportam --top10 serão chamados com --top10.")
-                # Para gerar individuais no consolidado, calculamos a lista do Top 10 (como no seu fluxo atual)
-                if fluxo == "B":
-                    peritos_df = pegar_top10_harm_first(args.start, args.end, min_analises=args.min_analises, factor_nc=2.0)
-                else:
-                    peritos_df = pegar_10_piores_peritos(args.start, args.end, min_analises=args.min_analises)
-                if not peritos_df.empty:
-                    lista_selecionados = peritos_df['nomePerito'].astype(str).tolist()
-                    set_top10 = set(lista_selecionados)
-                else:
-                    print("⚠️  Nenhum perito elegível para o Top 10 no período/fluxo informados.")
-                    # Seguimos só com os gráficos de grupo/top10 (se houver) e saídas globais
+        # --------- Manifests (robusto) ----------
+        if getattr(args, "save_manifests", False):
+            try:
+                # top10_peritos.csv com ordem/rank e metadados
+                out = peritos_df.reset_index(drop=True).copy()
+                out["rank"]  = out.index + 1
+                out["fluxo"] = str(fluxo)
+                out["start"] = args.start
+                out["end"]   = args.end
+                peritos_csv_path = os.path.join(RELATORIO_DIR, "top10_peritos.csv")
+                out[["nomePerito", "rank", "fluxo", "start", "end"]].to_csv(
+                    peritos_csv_path, index=False, encoding="utf-8"
+                )
+                print(f"[manifest] salvo: {peritos_csv_path}")
+            except Exception as e:
+                print(f"[WARN] Falha salvando top10_peritos.csv: {e}")
 
-        # Scripts globais (por período) — execute antes para garantir orgs auxiliares
-        for script in GLOBAL_SCRIPTS:
-            script_file = script_path(script)
-            planned_cmds[:0] = build_commands_for_global(script_file, args.start, args.end)
+            # scope_gate_b.csv (somente no B, se disponível)
+            if fluxo == "B":
+                try:
+                    if 'gerar_scope_gate_b' in globals():
+                        scope_df = gerar_scope_gate_b(args.start, args.end,
+                                                      min_analises=args.min_analises, factor_nc=2.0)
+                        if isinstance(scope_df, pd.DataFrame) and not scope_df.empty and "nomePerito" in scope_df.columns:
+                            scope_csv_path = os.path.join(RELATORIO_DIR, "scope_gate_b.csv")
+                            scope_df[["nomePerito"]].drop_duplicates().to_csv(
+                                scope_csv_path, index=False, encoding="utf-8"
+                            )
+                            print(f"[manifest] salvo: {scope_csv_path}")
+                except Exception as e:
+                    print(f"[WARN] Falha salvando scope_gate_b.csv: {e}")
 
-        # Contexto de GRUPO para os scripts Python
+        # Contexto de grupo (propaga fluxo/kpi-base/export flags)
         group_ctx = {
-            "kind": "group",
-            "top_k": (10 if legacy_top10 and not peritos_csv_path else int(getattr(args, "topk", 0) or 0)),
+            "kind": "top10",
             "start": args.start,
             "end":   args.end,
             "min_analises": args.min_analises,
@@ -3843,19 +3499,28 @@ def main():
             "scope_csv": scope_csv_path,
         }
 
-        # Agenda scripts Python de GRUPO
+        # Agenda scripts de grupo (Python)
         for script in SCRIPT_ORDER:
             script_file = script_path(script)
             planned_cmds.extend(build_commands_for_script(script_file, group_ctx))
 
-        # Agenda R checks (grupo ou por perito conforme a seleção)
-        _run_rchecks_for_selection(args, peritos_csv=peritos_csv_path, plan_only=bool(args.plan_only))
+        # Agenda R checks do grupo (g01..g07)
+        if args.r_appendix:
+            planned_cmds.extend(
+                build_r_commands_for_top10(
+                    start=args.start, end=args.end, r_bin=args.r_bin, min_analises=args.min_analises,
+                    fluxo=fluxo,
+                    peritos_csv=peritos_csv_path,
+                    rank_by=getattr(args, "rank_by", None)   # opcional
+                )
+            )
 
-        # Agenda scripts INDIVIDUAIS para cada perito selecionado
-        for perito in lista_selecionados:
+        # Agenda scripts individuais (para cada perito do Top10)
+        for perito in lista_top10:
             if not perito_tem_dados(perito, args.start, args.end):
                 print(f"⚠️  Perito '{perito}' sem análises no período! Pulando.")
                 continue
+
             safe = _safe(perito)
             _cleanup_exports_for_perito(safe)
 
@@ -3877,21 +3542,31 @@ def main():
             if args.r_appendix:
                 planned_cmds.extend(build_r_commands_for_perito(perito, args.start, args.end, args.r_bin))
 
-        # Coorte extra %NC altíssima (opcional) — mantém sua lógica
+        # Coorte extra de %NC altíssima (opcional)
         extras_list = []
         if args.include_high_nc:
-            df_high = pegar_peritos_nc_altissima(args.start, args.end, nc_threshold=args.high_nc_threshold, min_tasks=args.high_nc_min_tasks)
-            if not df_high.empty:
-                base_set = set(lista_selecionados) if lista_selecionados else set_top10
-                extras_list = [n for n in df_high['nomePerito'].astype(str).tolist() if n not in base_set]
+            df_high = pegar_peritos_nc_altissima(
+                args.start, args.end,
+                nc_threshold=args.high_nc_threshold,
+                min_tasks=args.high_nc_min_tasks
+            )
+            if df_high.empty:
+                print("Nenhum perito com %NC acima do limiar e mínimo de tarefas.")
+            else:
+                extras_list = [n for n in df_high['nomePerito'].astype(str).tolist() if n not in set_top10]
                 if extras_list:
                     print(f"Incluindo coorte extra (%NC ≥ {args.high_nc_threshold} e ≥ {args.high_nc_min_tasks} tarefas): {extras_list}")
+                else:
+                    print("Coorte extra presente, mas todos já estão no Top 10 — sem novos peritos.")
         else:
             print("Coorte extra de %NC alta desativada (--no-high-nc).")
 
+        # Agenda scripts para a coorte extra
         for perito in extras_list:
             if not perito_tem_dados(perito, args.start, args.end):
+                print(f"⚠️  Perito '{perito}' sem análises no período! Pulando.")
                 continue
+
             safe = _safe(perito)
             _cleanup_exports_for_perito(safe)
 
@@ -3909,13 +3584,22 @@ def main():
             for script in SCRIPT_ORDER:
                 script_file = script_path(script)
                 planned_cmds.extend(build_commands_for_script(script_file, indiv_ctx))
+
             if args.r_appendix:
                 planned_cmds.extend(build_r_commands_for_perito(perito, args.start, args.end, args.r_bin))
 
-    # =========================
-    # PLANEJAMENTO — INDIVIDUAL
-    # =========================
+        # Scripts globais (por período) — executar uma única vez ANTES
+        try:
+            for script in GLOBAL_SCRIPTS:
+                script_file = script_path(script)
+                planned_cmds[:0] = build_commands_for_global(script_file, args.start, args.end)
+        except NameError:
+            pass
+
     else:
+        # =========================
+        # PLANEJAMENTO — INDIVIDUAL
+        # =========================
         perito = args.perito.strip()
         if not perito_tem_dados(perito, args.start, args.end):
             print(f"⚠️  Perito '{perito}' sem análises no período.")
@@ -3923,11 +3607,6 @@ def main():
 
         safe = _safe(perito)
         _cleanup_exports_for_perito(safe)
-
-        # Scripts globais (por período) — ainda executa para obter orgs-base do W→WE
-        for script in GLOBAL_SCRIPTS:
-            script_file = script_path(script)
-            planned_cmds[:0] = build_commands_for_global(script_file, args.start, args.end)
 
         indiv_ctx = {
             "kind": "perito",
@@ -3937,7 +3616,7 @@ def main():
             "add_comments": args.add_comments,
             "export_org": bool(getattr(args, "export_org", False)),
             "export_pdf": bool(getattr(args, "export_pdf", False)),
-            "fluxo": fluxo,
+            "fluxo": fluxo,  # irrelevante p/ Individual, mas inofensivo
             "kpi_base": getattr(args, "kpi_base", None),
         }
         for script in SCRIPT_ORDER:
@@ -3946,6 +3625,14 @@ def main():
 
         if args.r_appendix:
             planned_cmds.extend(build_r_commands_for_perito(perito, args.start, args.end, args.r_bin))
+
+        # Scripts globais (por período) — ainda executa para obter orgs-base
+        try:
+            for script in GLOBAL_SCRIPTS:
+                script_file = script_path(script)
+                planned_cmds[:0] = build_commands_for_global(script_file, args.start, args.end)
+        except NameError:
+            pass
 
     # Bootstrap de dependências R (entra antes de tudo)
     if args.r_appendix:
@@ -3957,19 +3644,19 @@ def main():
 
     # Apenas listar plano?
     if args.plan_only:
-        pretty_print_plan(planned_cmds, args, peritos_csv_path=peritos_csv_path, scope_csv_path=scope_csv_path)
+        pretty_print_plan(planned_cmds, args)  # <- sem kwargs extras
         return 0
 
     # ===== Injeção de ambiente para TODOS os R checks =====
     R_EXTRA_ENV: dict = {}
-    if is_group_run:
+    if args.top10:
         R_EXTRA_ENV["FLUXO"] = str(fluxo)
         if peritos_csv_path:
             R_EXTRA_ENV["PERITOS_CSV"] = peritos_csv_path
         if scope_csv_path:
             R_EXTRA_ENV["SCOPE_CSV"] = scope_csv_path
 
-    # Execução (Python e R)
+    # Execução dos comandos (Python e R) — sem wrapper
     for cmd in planned_cmds:
         try:
             if _is_r_cmd(cmd):
@@ -3991,12 +3678,13 @@ def main():
     # --------------------------------------------------------------------------
     org_paths = []
     extras_org_paths = []
-    org_grupo_top = None
+    org_grupo_top10 = None
     org_to_export = None
 
-    if is_group_run:
-        # Copia artefatos de grupo e panorama global W→WE
-        copiar_artefatos_top10(IMGS_DIR, COMMENTS_DIR, ORGS_DIR, MARKDOWN_DIR)
+    if args.top10:
+        # Copia artefatos de grupo (inclui conversão de comments .md → .org)
+        copiar_artefatos_top10(IMGS_DIR, COMMENTS_DIR, ORGS_DIR)
+        # Copia artefatos do panorama W→WE (global)
         try:
             copiar_artefatos_weekday2weekend(IMGS_DIR, COMMENTS_DIR, ORGS_DIR)
         except NameError:
@@ -4007,10 +3695,10 @@ def main():
             gerar_r_apendice_group_comments_if_possible(IMGS_DIR, COMMENTS_DIR, args.start, args.end)
 
         # Org do grupo (salva em orgs/)
-        org_grupo_top = gerar_org_top10_grupo(args.start, args.end, RELATORIO_DIR, IMGS_DIR, COMMENTS_DIR, orgs_dir=ORGS_DIR)
+        org_grupo_top10 = gerar_org_top10_grupo(args.start, args.end, RELATORIO_DIR, IMGS_DIR, COMMENTS_DIR, orgs_dir=ORGS_DIR)
 
-        # Peritos selecionados (lista_selecionados) — monta org individual de cada um
-        for perito in lista_selecionados:
+        # Peritos do Top10 — usa a lista pré-selecionada
+        for perito in lista_top10:
             if not perito_tem_dados(perito, args.start, args.end):
                 continue
             copiar_artefatos_perito(perito, IMGS_DIR, COMMENTS_DIR, ORGS_DIR)
@@ -4019,11 +3707,12 @@ def main():
             org_path = gerar_org_perito(perito, args.start, args.end, args.add_comments, IMGS_DIR, COMMENTS_DIR, RELATORIO_DIR, orgs_dir=ORGS_DIR)
             org_paths.append(org_path)
 
-        # Coorte extra (se existiu)
+        # Coorte extra
         if args.include_high_nc:
-            df_high = pegar_peritos_nc_altissima(args.start, args.end, nc_threshold=args.high_nc_threshold, min_tasks=args.high_nc_min_tasks)
-            base_set = set(lista_selecionados) if lista_selecionados else set_top10
-            extras_list = [n for n in df_high['nomePerito'].astype(str).tolist() if n not in base_set]
+            df_high = pegar_peritos_nc_altissima(args.start, args.end,
+                                                 nc_threshold=args.high_nc_threshold,
+                                                 min_tasks=args.high_nc_min_tasks)
+            extras_list = [n for n in df_high['nomePerito'].astype(str).tolist() if n not in set_top10]
             for perito in extras_list:
                 if not perito_tem_dados(perito, args.start, args.end):
                     continue
@@ -4036,14 +3725,14 @@ def main():
         # Mover quaisquer .md remanescentes para 'markdown/'
         _mover_markdowns_de_exports(MARKDOWN_DIR)
 
-        # Org consolidado do grupo — nomeia conforme label
-        if (args.export_org or args.export_pdf) and (org_paths or org_grupo_top or extras_org_paths):
-            org_final = os.path.join(ORGS_DIR, f"relatorio_{group_label}_{args.start}_a_{args.end}.org")
-            lines = [f"* Relatório — {group_label.replace('_', ' ').upper()} ({args.start} a {args.end}) — Fluxo {fluxo}", ""]
+        # Org consolidado do Top10 — monta com a mesma lista/top 10
+        if (args.export_org or args.export_pdf) and (org_paths or org_grupo_top10 or extras_org_paths):
+            org_final = os.path.join(ORGS_DIR, f"relatorio_dez_piores_{args.start}_a_{args.end}.org")
+            lines = [f"* Relatório dos 10 piores peritos ({args.start} a {args.end}) — Fluxo {fluxo}", ""]
 
-            # Grupo (TopX)
-            if org_grupo_top and os.path.exists(org_grupo_top):
-                with open(org_grupo_top, encoding="utf-8") as f:
+            # Grupo (Top10)
+            if org_grupo_top10 and os.path.exists(org_grupo_top10):
+                with open(org_grupo_top10, encoding="utf-8") as f:
                     lines.append(f.read().strip())
                     lines.append("#+LATEX: \\newpage\n")
 
@@ -4069,7 +3758,7 @@ def main():
                     except Exception as e:
                         print(f"[AVISO] Falha ao anexar impacto do perito ({imp_path}): {e}")
 
-            # Extras (coorte %NC altíssima)
+            # Extras (coorte de %NC altíssima)
             if extras_org_paths:
                 lines.append(f"** Peritos com %NC ≥ {args.high_nc_threshold:.0f}% e ≥ {args.high_nc_min_tasks} tarefas\n")
                 for org_path in extras_org_paths:
@@ -4080,7 +3769,7 @@ def main():
                             lines.append(content)
                             lines.append("#+LATEX: \\newpage\n")
 
-            # Impacto na Fila do GRUPO (se houver)
+            # Impacto na Fila do GRUPO (Top10)
             grp_impacts = coletar_orgs_impacto(PERIODO_DIR, args.start, args.end, perito=None)
             for path in grp_impacts:
                 try:
@@ -4093,10 +3782,12 @@ def main():
                 except Exception as e:
                     print(f"[AVISO] Falha ao anexar impacto do grupo ({path}): {e}")
 
-            # Protocolos transferidos (grupo)
-            _append_protocol_transfers_group_block(lines, RELATORIO_DIR, args.start, args.end, heading_level="**", link_prefix="../")
+            # Protocolos transferidos (grupo) — link relativo ao wrapper em orgs/
+            _append_protocol_transfers_group_block(
+                lines, RELATORIO_DIR, args.start, args.end, heading_level="**", link_prefix="../"
+            )
 
-            # Panorama global (W→WE) AO FINAL — imagens com ../imgs/
+            # Panorama global (W→WE) AO FINAL do Top10 — imagens com ../imgs/
             _append_weekday2weekend_panorama_block(
                 lines, IMGS_DIR, COMMENTS_DIR,
                 start=args.start, end=args.end,
@@ -4106,31 +3797,54 @@ def main():
             with open(org_final, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines).strip() + "\n")
             print(f"✅ Org consolidado salvo em: {org_final}")
+
+            # Reincidentes (≥2 meses no Top 10) — DB Jan→end e min_analises do CLI
+            reinc_csv = os.path.join(ORGS_DIR, "top10_reincidentes.csv")
+            _run_reincidentes_scan(
+                reinc_csv,
+                min_months=2,
+                root=OUTPUTS_DIR,
+                start=args.start,
+                end=args.end,
+                min_analises=args.min_analises
+            )
+            _append_reincidentes_to_org(org_final, reinc_csv, min_months=2, heading_level="**")
+
             org_to_export = org_final
         else:
-            # Caso não queira consolidar, tenta expor o primeiro org individual
             org_to_export = org_paths[0] if org_paths else None
 
     # --------------------------------------------------------------------------
     # INDIVIDUAL — consolidado + bloco W→WE condicional por perito
     # --------------------------------------------------------------------------
-    if not is_group_run:
+    if not args.top10:
         perito = args.perito.strip()
+
         imgs_dir_i     = os.path.join(RELATORIO_DIR, "imgs")
         comments_dir_i = os.path.join(RELATORIO_DIR, "comments")
         orgs_dir_i     = os.path.join(RELATORIO_DIR, "orgs")
 
         copiar_artefatos_perito(perito, imgs_dir_i, comments_dir_i, orgs_dir_i)
+
+        # Copia artefatos globais pois o bloco W→WE do perito será extraído deles
         try:
             copiar_artefatos_weekday2weekend(imgs_dir_i, comments_dir_i, orgs_dir_i)
         except NameError:
             pass
 
+        # Mover quaisquer .md remanescentes para 'markdown/'
         _mover_markdowns_de_exports(MARKDOWN_DIR)
 
-        perito_org_path = gerar_org_perito(perito, args.start, args.end, args.add_comments, imgs_dir_i, comments_dir_i, RELATORIO_DIR, orgs_dir=orgs_dir_i)
+        # Monta org individual base (salva em orgs/)
+        perito_org_path = gerar_org_perito(
+            perito, args.start, args.end, args.add_comments,
+            imgs_dir_i, comments_dir_i, RELATORIO_DIR, orgs_dir=orgs_dir_i
+        )
 
-        org_final = os.path.join(orgs_dir_i, f"relatorio_{_safe(perito)}_{args.start}_a_{args.end}.org")
+        # Consolida: relatório do perito + (se houver) bloco W→WE deste perito no FINAL
+        org_final = os.path.join(
+            orgs_dir_i, f"relatorio_{_safe(perito)}_{args.start}_a_{args.end}.org"
+        )
         lines = [f"* Relatório individual — {perito} ({args.start} a {args.end})", ""]
 
         with open(perito_org_path, encoding="utf-8") as f:
@@ -4139,7 +3853,11 @@ def main():
                 lines.append(content)
                 lines.append("#+LATEX: \\newpage\n")
 
-        _append_weekday2weekend_perito_block_if_any(lines, perito, imgs_dir_i, comments_dir_i, start=args.start, end=args.end, heading_level="**")
+        _append_weekday2weekend_perito_block_if_any(
+            lines, perito, imgs_dir_i, comments_dir_i,
+            start=args.start, end=args.end,
+            heading_level="**"
+        )
 
         with open(org_final, "w", encoding="utf-8") as f:
             f.write("\n".join(lines).strip() + "\n")
@@ -4157,7 +3875,6 @@ def main():
     mm, ss = divmod(int(dt + 0.5), 60)
     hh, mm = divmod(mm, 60)
     print(f"⏱️ Tempo total: {hh:02d}:{mm:02d}:{ss:02d}")
-
 
 if __name__ == '__main__':
     main()

@@ -17,7 +17,6 @@ openpyxl = "*"
 xlsxwriter = "*"
 prompt-toolkit = "*"
 asciimatics = "*"
-matplotlib = "*"
 pillow = "*"
 pypdf2 = "*"
 fpdf = "*"
@@ -26,6 +25,7 @@ python-dotenv = {extras = ["cli"], version = "*"}
 requests = "*"
 reportlab = "*"
 pypdf = "*"
+matplotlib = "*"
 
 [dev-packages]
 plotext = "*"

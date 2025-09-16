@@ -1,44 +1,82 @@
 #!/usr/bin/env bash
-# kpi_wizard.sh — Wizard interativo para make_kpi_report.py
-# Gera relatórios KPI (Top10 ou Individual) com todas as flags suportadas,
-# em lógica similar ao impact_wizard.sh.
-#
-# Uso rápido (não interativo): você pode passar flags que serão anexadas ao comando final.
-#   ./kpi_wizard.sh --add-comments --with-impact
-#
-# Requisitos: bash, python3, Rscript (opcional para apêndice R)
+# KPI Wizard — Top10 (com pré-pass p/ CSVs) ou Individual
+# - Faz pré-pass no modo TopK=10 Fluxo B para gerar:
+#     reports/outputs/<PERIODO>/top10/topk_peritos.csv
+#     reports/outputs/<PERIODO>/top10/scope_gate_b.csv
+#   e então executa o run principal em modo Top10 com --peritos-csv/--scope-csv.
+# - Requisitos opcionais: fzf (ou gum) para autocomplete
+# - Dependências: sqlite3 (para listar peritos), python3
+
 set -euo pipefail
 
-# ──────────────────────────────────────────────────────────────────────
-# Descobrir Python (prioriza venv local)
-# ──────────────────────────────────────────────────────────────────────
-if [[ -x "./.venv/bin/python" ]]; then
-  PYTHON="./.venv/bin/python"
-elif compgen -G "${HOME}/.local/share/virtualenvs/atestmed-*/bin/python3" >/dev/null; then
-  PYTHON="$(ls -1 ${HOME}/.local/share/virtualenvs/atestmed-*/bin/python3 | head -n1)"
+# ─────────────────────────── Helpers de data ───────────────────────────
+DBIN() { if command -v gdate >/dev/null 2>&1; then echo "gdate"; else echo "date"; fi; }
+DATE_BIN="$(DBIN)"
+
+# ─────────────────────────── Raiz do projeto ───────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Tenta git root; se falhar, usa o pai do script
+if command -v git >/dev/null 2>&1 && git -C "$SCRIPT_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
+  PROJ_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 else
-  PYTHON="$(command -v python3 || command -v python || true)"
-fi
-if [[ -z "${PYTHON}" ]]; then
-  echo "❌ Python não encontrado no PATH." >&2
-  exit 1
+  PROJ_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 fi
 
-# ──────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────
-date_bin() { if command -v gdate >/dev/null 2>&1; then echo "gdate"; else echo "date"; fi; }
-DBIN="$(date_bin)"
+DB_PATH="${PROJ_ROOT}/db/atestmed.db"
 
-is_ym()  { [[ "$1" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]; }
-is_ymd() { [[ "$1" =~ ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$ ]]; }
+# ───────────────────────── localizar make_kpi_report.py ─────────────────────────
+find_make_py() {
+  local cands=(
+    "${PROJ_ROOT}/reports/make_kpi_report.py"
+    "${PROJ_ROOT}/graphs_and_tables/make_kpi_report.py"
+    "${PROJ_ROOT}/make_kpi_report.py"
+    "${SCRIPT_DIR}/make_kpi_report.py"
+    "${SCRIPT_DIR}/../reports/make_kpi_report.py"
+  )
+  for p in "${cands[@]}"; do
+    [[ -f "$p" ]] && { echo "$p"; return 0; }
+  done
+  # Fallback: varredura rasa (até 3 níveis) a partir do PROJ_ROOT
+  local found
+  found="$(find "$PROJ_ROOT" -maxdepth 3 -type f -name 'make_kpi_report.py' -print -quit 2>/dev/null || true)"
+  if [[ -n "$found" && -f "$found" ]]; then
+    echo "$found"
+    return 0
+  fi
+  echo ""
+}
 
-ym_first_day() { echo "$1-01"; }
-ym_last_day()  { $DBIN -d "$1-01 +1 month -1 day" +%Y-%m-%d; }
+MAKE_KPI_PY="$(find_make_py)"
+if [[ -z "$MAKE_KPI_PY" ]]; then
+  echo "⚠️  Não encontrei make_kpi_report.py automaticamente."
+  read -rp "Informe o caminho completo para make_kpi_report.py: " MAKE_KPI_PY
+fi
+if [[ ! -f "$MAKE_KPI_PY" ]]; then
+  echo "❌ make_kpi_report.py não encontrado em: $MAKE_KPI_PY"
+  exit 2
+fi
+echo "✅ Usando: $MAKE_KPI_PY"
 
-ask() { # ask "Pergunta" "valor_padrao"
-  local prompt="${1:-}"; local default="${2:-}"; local ans=""
-  if [[ -n "${default}" ]]; then
+# ─────────────────────────── Bins básicos ───────────────────────────
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "❌ python3 não encontrado no PATH."
+  exit 2
+fi
+
+if [[ ! -f "$DB_PATH" ]]; then
+  echo "⚠️  Banco não encontrado em: $DB_PATH"
+  read -rp "Informe o caminho do SQLite do projeto (atestmed.db): " DB_PATH
+fi
+
+has_fzf() { command -v fzf >/dev/null 2>&1; }
+has_gum() { command -v gum >/dev/null 2>&1; }
+
+ask() { # ask "Pergunta" "default"
+  local prompt="${1:-}"; shift
+  local default="${1:-}"; shift || true
+  local ans
+  if [[ -n "$default" ]]; then
     read -rp "${prompt} [${default}]: " ans || true
     echo "${ans:-$default}"
   else
@@ -47,322 +85,190 @@ ask() { # ask "Pergunta" "valor_padrao"
   fi
 }
 
-confirm() { # confirm "Pergunta" "y|n"
-  local prompt="${1:-}"; local def="${2:-y}"; local ans=""
-  read -rp "${prompt} [${def}]: " ans || true
-  ans="${ans:-$def}"
-  [[ "${ans,,}" =~ ^y(es)?$|^s(im)?$|^y$|^$ ]]
+confirm() { # confirm "Pergunta" "Y/n"
+  local q="${1:-Confirmar?}"; local def="${2:-Y/n}"
+  local ans; read -rp "${q} [${def}]: " ans || true
+  ans="${ans:-${def%%/*}}"
+  case "${ans,,}" in
+    y|yes|s|sim) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-sanitize() {
-  # substitui chars não alfanuméricos por _ (para nomes de logs)
-  local s="${1:-}"
-  s="${s//[^[:alnum:]-_]/_}"
-  s="${s##_}"; s="${s%%_}"
-  echo "${s:-output}"
-}
+# ─────────────────────── Modo: Top10 x Individual ───────────────────────
+echo "===== KPI Wizard ====="
+echo "Selecione o modo:"
+echo "  1) Top 10 (Fluxo B com pré-pass p/ CSVs)"
+echo "  2) Individual (por perito)"
+MODE="$(ask "Opção [1-2]" "1")"
+case "$MODE" in
+  1) KIND="top10" ;;
+  2) KIND="perito" ;;
+  *) echo "Opção inválida."; exit 2 ;;
+esac
 
-# ──────────────────────────────────────────────────────────────────────
-# Localiza make_kpi_report.py na raiz ou em reports/
-# ──────────────────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJ_ROOT="$(cd "$SCRIPT_DIR" && pwd)"
-TARGET=""
-for CAND in \
-  "${PROJ_ROOT}/reports/make_report.py" \
-  "${PROJ_ROOT}/reports/make_kpi_report.py" \
-  "${PROJ_ROOT}/make_report.py" \
-  "${PROJ_ROOT}/make_kpi_report.py"
-do
-  if [[ -f "${CAND}" ]]; then TARGET="${CAND}"; break; fi
-done
-if [[ -z "${TARGET}" ]]; then
-  echo "❌ Não encontrei make_report.py/make_kpi_report.py em '${PROJ_ROOT}' ou em 'reports/'." >&2
-  exit 1
+# ───────────────────── Seleção de perito (se Individual) ─────────────────────
+PERITO_NAME=""
+if [[ "$KIND" == "perito" ]]; then
+  echo "Buscando peritos no banco..."
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "⚠️  sqlite3 não encontrado. Entrada manual."
+    PERITO_NAME="$(ask "Digite exatamente o nome do perito (como no DB)")"
+  else
+    mapfile -t PERITOS < <(sqlite3 -noheader -batch "$DB_PATH" "SELECT nomePerito FROM peritos ORDER BY nomePerito COLLATE NOCASE;")
+    if ((${#PERITOS[@]}==0)); then
+      echo "⚠️  Nenhum perito encontrado. Entrada manual."
+      PERITO_NAME="$(ask "Digite o nome do perito")"
+    else
+      if has_fzf; then
+        echo "Digite para filtrar e selecione com ↑/↓ (fzf):"
+        PERITO_NAME="$(printf '%s\n' "${PERITOS[@]}" | fzf --height=20 --reverse --prompt="Perito > " --border --no-multi || true)"
+      elif has_gum; then
+        PERITO_NAME="$(printf '%s\n' "${PERITOS[@]}" | gum filter --placeholder "Busque o perito..." || true)"
+      else
+        printf '%s\n' "${PERITOS[@]:0:30}"
+        echo "… (lista truncada; instale fzf/gum para UX melhor)"
+        PERITO_NAME="$(ask "Digite exatamente o nome do perito")"
+      fi
+    fi
+  fi
+  if [[ -z "$PERITO_NAME" ]]; then
+    echo "❌ Perito não selecionado."; exit 2
+  fi
+  echo "Perito selecionado: $PERITO_NAME"
 fi
 
-# Aviso se o alvo não estiver em reports/ (pode quebrar BASE_DIR)
-if [[ "$(basename "$(dirname "$TARGET")")" != "reports" ]]; then
-  echo "⚠️  Alvo encontrado fora de 'reports/': ${TARGET}"
-  echo "   Dica: mantenha o script Python em 'reports/' para BASE_DIR correto."
-fi
-
-# ──────────────────────────────────────────────────────────────────────
-# Coleta de parâmetros (assistente)
-# ──────────────────────────────────────────────────────────────────────
-echo "===== KPI Wizard (Top10 | Individual) ====="
+# ───────────────────────────── Escolha do período ─────────────────────────────
 echo
 echo "Escolha o período:"
 echo "  1) Mês atual"
 echo "  2) Mês anterior"
 echo "  3) Escolher um dos últimos 6 meses"
 echo "  4) Intervalo personalizado (YYYY-MM-DD a YYYY-MM-DD)"
-echo
+OPT_PERIOD="$(ask "Opção [1-4]" "1")"
 
-read -rp "Opção [1-4]: " OPT || true
-echo
+calc_month_bounds() {
+  local ym="$1"  # YYYY-MM
+  local y="${ym%-*}" m="${ym#*-}"
+  local first="${y}-${m}-01"
+  local last="$($DATE_BIN -d "${first} +1 month -1 day" +%Y-%m-%d)"
+  echo "$first" "$last"
+}
 
-START=""; END=""
-case "${OPT:-}" in
+case "$OPT_PERIOD" in
   1)
-    YM="$($DBIN +%Y-%m)"
-    START="$(ym_first_day "$YM")"
-    END="$(ym_last_day "$YM")"
+    YM="$($DATE_BIN +%Y-%m)"
+    read START END < <(calc_month_bounds "$YM")
     ;;
   2)
-    YM="$($DBIN -d "$($DBIN +%Y-%m-01) -1 month" +%Y-%m)"
-    START="$(ym_first_day "$YM")"
-    END="$(ym_last_day "$YM")"
+    YM="$($DATE_BIN -d "-1 month" +%Y-%m)"
+    read START END < <(calc_month_bounds "$YM")
     ;;
   3)
-    echo "Selecione o mês:"
-    declare -a LIST=()
+    echo "Selecione o mês (últimos 6):"
+    declare -a YMS=()
     for i in {0..5}; do
-      LIST+=("$($DBIN -d "$($DBIN +%Y-%m-01) -${i} month" +%Y-%m)")
+      YMS+=("$($DATE_BIN -d "-$i month" +%Y-%m)")
     done
-    idx=1
-    for ym in "${LIST[@]}"; do
-      echo "  $idx) $ym"
-      idx=$((idx+1))
-    done
-    echo
-    read -rp "Mês [1-${#LIST[@]}]: " MIDX || true
-    if ! [[ "$MIDX" =~ ^[1-9][0-9]*$ ]] || (( MIDX < 1 || MIDX > ${#LIST[@]} )); then
-      echo "❌ Opção inválida." >&2; exit 1
+    SEL=""
+    if has_fzf; then
+      SEL="$(printf '%s\n' "${YMS[@]}" | fzf --height=10 --reverse --prompt="YYYY-MM > " --border || true)"
+    elif has_gum; then
+      SEL="$(printf '%s\n' "${YMS[@]}" | gum choose || true)"
+    else
+      printf '%s\n' "${YMS[@]}"
+      SEL="$(ask "Digite YYYY-MM" "${YMS[0]}")"
     fi
-    YM="${LIST[$((MIDX-1))]}"
-    START="$(ym_first_day "$YM")"
-    END="$(ym_last_day "$YM")"
+    [[ -z "$SEL" ]] && { echo "❌ Mês não selecionado."; exit 2; }
+    read START END < <(calc_month_bounds "$SEL")
     ;;
   4)
-    read -rp "Data inicial (YYYY-MM-DD): " START || true
-    read -rp "Data final   (YYYY-MM-DD): " END   || true
+    START="$(ask "Data inicial (YYYY-MM-DD)")"
+    END="$(ask "Data final   (YYYY-MM-DD)")"
     ;;
   *)
-    echo "❌ Opção inválida." >&2; exit 1
-    ;;
+    echo "Opção inválida."; exit 2 ;;
 esac
+echo "Período escolhido: $START a $END"
 
-if ! is_ymd "$START" || ! is_ymd "$END"; then
-  echo "❌ Datas inválidas. Use YYYY-MM-DD." >&2
-  exit 1
+# ───────────────────────── Flags padrão (Top10 e Individual) ─────────────────────────
+DEFAULT_FLAGS=( --min-analises 50 --export-org --export-pdf --add-comments --r-appendix --include-high-nc --kpi-base full --save-manifests )
+
+echo
+if confirm "Usar o comando PADRÃO agora?" "Y/n"; then
+  USE_DEFAULT=1
+else
+  USE_DEFAULT=0
+fi
+
+EXTRA_FLAGS=()
+if (( USE_DEFAULT == 0 )); then
+  echo "Você pode acrescentar flags extras (vazio para continuar)."
+  echo "Exemplos: --with-impact  --impact-all-tests  --reuse-kpi  --rank-by scoreFinal"
+  read -rp "Flags extras: " EXTRA_LINE || true
+  # shellcheck disable=SC2206
+  EXTRA_FLAGS=( $EXTRA_LINE )
+fi
+
+# ───────────────────────────── Montagem do comando ─────────────────────────────
+CMD=( "$PYTHON_BIN" "$MAKE_KPI_PY" --start "$START" --end "$END" )
+
+# Diretórios conforme make_kpi_report.py (BASE_DIR = root do projeto; outputs em reports/outputs)
+PERIODO_DIR="${PROJ_ROOT}/reports/outputs/${START}_a_${END}"
+TOP_DIR="${PERIODO_DIR}/top10"
+mkdir -p "$TOP_DIR"
+
+if [[ "$KIND" == "top10" ]]; then
+  # ───────────────────── Pré-pass: materializa seleção (TopK=10, Fluxo B) ─────────────────────
+  echo
+  echo "🔎 Pré-pass: gerando CSVs de seleção (TopK=10, Fluxo B)…"
+  PREPASS_CMD=( "$PYTHON_BIN" "$MAKE_KPI_PY"
+    --start "$START" --end "$END"
+    --topk 10 --fluxo B
+    --min-analises 50
+    --save-manifests
+    --plan-only
+  )
+  printf ' [prepass] %q' "${PREPASS_CMD[@]}"; echo
+  "${PREPASS_CMD[@]}"
+
+  # Esperados: TOP_DIR/topk_peritos.csv e TOP_DIR/scope_gate_b.csv
+  PERITOS_CSV="${TOP_DIR}/topk_peritos.csv"
+  SCOPE_CSV="${TOP_DIR}/scope_gate_b.csv"
+
+  if [[ ! -f "$PERITOS_CSV" ]]; then
+    echo "❌ Pré-pass não gerou ${PERITOS_CSV}."
+    echo "   Verifique se há peritos elegíveis (gate Fluxo B) no período informado."
+    exit 3
+  fi
+  if [[ ! -f "$SCOPE_CSV" ]]; then
+    echo "⚠️  Pré-pass não gerou ${SCOPE_CSV}. Seguirei apenas com --peritos-csv."
+    SCOPE_CSV=""
+  fi
+
+  # Comando principal em Top10 (Fluxo B) com CSVs materializados
+  CMD+=( --top10 --fluxo B --peritos-csv "$PERITOS_CSV" )
+  [[ -n "$SCOPE_CSV" ]] && CMD+=( --scope-csv "$SCOPE_CSV" )
+else
+  # Individual
+  CMD+=( --perito "$PERITO_NAME" )
+fi
+
+# Acrescenta flags padrão e extras
+if (( USE_DEFAULT == 1 )); then
+  CMD+=( "${DEFAULT_FLAGS[@]}" )
+fi
+if ((${#EXTRA_FLAGS[@]} > 0)); then
+  CMD+=( "${EXTRA_FLAGS[@]}" )
 fi
 
 echo
-echo "Período escolhido: ${START} a ${END}"
-echo "Padrão: Top 10, --min-analises 50, fluxo=B, kpi-base=nc-only, --save-manifests,"
-echo "        --export-org --export-pdf --add-comments,"
-echo "        --r-appendix (Rscript), --include-high-nc (thr=90, min=50),"
-echo "        sem --with-impact, sem --reuse-kpi, sem --plan-only."
-if confirm "Usar COMANDO PADRÃO agora?" "y"; then
-  USE_DEFAULT="y"
-else
-  USE_DEFAULT="n"
-fi
-
-# ──────────────────────────────────────────────────────────────────────
-# Coletas adicionais (somente se NÃO usar o padrão)
-# ──────────────────────────────────────────────────────────────────────
-MODE="top10"
-PERITO_NAME=""
-MIN_ANALISES="50"
-EXPORT_ORG="y"; EXPORT_PDF="y"; ADD_COMMENTS="y"
-R_APPENDIX="y"; R_BIN="Rscript"
-INCLUDE_HIGH_NC="y"; HIGH_NC_THRESHOLD="90"; HIGH_NC_MIN_TASKS="50"
-WITH_IMPACT="n"; IMPACT_ALL_TESTS="n"
-REUSE_KPI="n"
-PLAN_ONLY="n"
-FLUXO="B"           # padrão do fluxo
-KPI_BASE="nc-only"  # padrão da base de KPI
-SAVE_MANIFESTS="y"  # ← NOVO: padrão salva manifests (p/ Rchecks B)
-
-if [[ "${USE_DEFAULT}" == "n" ]]; then
-  echo
-  echo "Modo:"
-  echo "  1) Top 10"
-  echo "  2) Individual (um perito)"
-  read -rp "Opção [1-2]: " MODO || true
-  case "${MODO:-}" in
-    1) MODE="top10" ;;
-    2) MODE="perito"; PERITO_NAME="$(ask "Nome exato do perito" "")" ;;
-    *) echo "❌ Opção inválida." >&2; exit 1 ;;
-  esac
-  if [[ "$MODE" == "perito" && -z "${PERITO_NAME}" ]]; then
-    echo "❌ Informe o nome do perito." >&2; exit 1
-  fi
-
-  MIN_ANALISES="$(ask "--min-analises" "50")"
-
-  # Fluxo (A ou B)
-  echo
-  echo "Fluxo:"
-  echo "  1) B — Gate %NC ≥ 2× Brasil (válidas) e ranking por scoreFinal [Padrão]"
-  echo "  2) A — Top 10 direto por scoreFinal (sem gate)"
-  read -rp "Opção [1-2]: " FOPT || true
-  case "${FOPT:-1}" in
-    1) FLUXO="B" ;;
-    2) FLUXO="A" ;;
-    *) FLUXO="B" ;;
-  esac
-
-  # Base de KPI (score)
-  echo
-  echo "Base de KPI (score):"
-  echo "  1) nc-only — usar score_final_nc quando disponível [Padrão]"
-  echo "  2) full     — usar score_final completo"
-  read -rp "Opção [1-2]: " KBOPT || true
-  case "${KBOPT:-1}" in
-    1) KPI_BASE="nc-only" ;;
-    2) KPI_BASE="full" ;;
-    *) KPI_BASE="nc-only" ;;
-  esac
-
-  # Manifests (Top10 + scope do Fluxo B)
-  if confirm "Salvar manifests para os Rchecks (top10_peritos.csv / scope_gate_b.csv)?" "y"; then
-    SAVE_MANIFESTS="y"
-  else
-    SAVE_MANIFESTS="n"
-  fi
-
-  # Exportações e comentários
-  confirm "Exportar ORG?" "y" && EXPORT_ORG="y" || EXPORT_ORG="n"
-  confirm "Exportar PDF?" "y" && EXPORT_PDF="y" || EXPORT_PDF="n"
-  confirm "Incluir comentários GPT?" "y" && ADD_COMMENTS="y" || ADD_COMMENTS="n"
-
-  # Apêndice R
-  confirm "Incluir apêndice R?" "y" && R_APPENDIX="y" || R_APPENDIX="n"
-  R_BIN="$(ask "--r-bin" "Rscript")"
-
-  # High-NC extra
-  confirm "Incluir seção de alto %NC?" "y" && INCLUDE_HIGH_NC="y" || INCLUDE_HIGH_NC="n"
-  HIGH_NC_THRESHOLD="$(ask "--high-nc-threshold" "90")"
-  HIGH_NC_MIN_TASKS="$(ask "--high-nc-min-tasks" "50")"
-
-  # Impacto na fila
-  confirm "Rodar com Impacto na Fila (--with-impact)?" "n" && WITH_IMPACT="y" || WITH_IMPACT="n"
-  if [[ "${WITH_IMPACT}" == "y" ]]; then
-    confirm "Usar --impact-all-tests?" "n" && IMPACT_ALL_TESTS="y" || IMPACT_ALL_TESTS="n"
-  fi
-
-  # Reuso/assemble
-  confirm "Reutilizar saídas já geradas (--reuse-kpi / --assemble-only)?" "n" && REUSE_KPI="y" || REUSE_KPI="n"
-
-  # Dry-run
-  confirm "Apenas plano (dry-run) --plan-only?" "n" && PLAN_ONLY="y" || PLAN_ONLY="n"
-fi
-
-# ──────────────────────────────────────────────────────────────────────
-# Resumo
-# ──────────────────────────────────────────────────────────────────────
-echo
-echo "===== Resumo ====="
-echo "Período: ${START} a ${END}"
-if [[ "$MODE" == "top10" ]]; then
-  echo "Modo: Top 10"
-else
-  echo "Modo: Individual — Perito='${PERITO_NAME}'"
-fi
-echo "Fluxo: ${FLUXO}"
-echo "KPI base: ${KPI_BASE}"
-echo "Salvar manifests: ${SAVE_MANIFESTS}"
-echo "min-analises: ${MIN_ANALISES}"
-echo "Export ORG: ${EXPORT_ORG} / Export PDF: ${EXPORT_PDF} / Comentários: ${ADD_COMMENTS}"
-echo "Apêndice R: ${R_APPENDIX} (R bin=${R_BIN})"
-echo "High NC: ${INCLUDE_HIGH_NC} (thr=${HIGH_NC_THRESHOLD}, min-tasks=${HIGH_NC_MIN_TASKS})"
-echo "With Impact: ${WITH_IMPACT} / Impact all-tests: ${IMPACT_ALL_TESTS}"
-echo "Reutilizar KPI: ${REUSE_KPI}"
-echo "Dry-run: ${PLAN_ONLY}"
+echo "==========================================="
+echo "Comando final:"
+printf ' %q' "${CMD[@]}"; echo
+echo "==========================================="
 echo
 
-# ──────────────────────────────────────────────────────────────────────
-# Montagem do comando (aceita flags extras via "$@")
-# ──────────────────────────────────────────────────────────────────────
-# Detecta se o usuário já passou --fluxo / --kpi-base / --save-manifests em flags extras; se sim, não adicionamos aqui.
-HAS_FLUXO="n"; HAS_KPI_BASE="n"; HAS_SAVE_MANIFESTS="n"
-if (( "$#" > 0 )); then
-  for arg in "$@"; do
-    if [[ "$arg" == "--fluxo" || "$arg" =~ ^--fluxo= ]]; then
-      HAS_FLUXO="y"
-    fi
-    if [[ "$arg" == "--kpi-base" || "$arg" =~ ^--kpi-base= ]]; then
-      HAS_KPI_BASE="y"
-    fi
-    if [[ "$arg" == "--save-manifests" ]]; then
-      HAS_SAVE_MANIFESTS="y"
-    fi
-  done
-fi
-
-cmd=( "${PYTHON}" "${TARGET}" --start "${START}" --end "${END}" )
-if [[ "$MODE" == "top10" ]]; then
-  cmd+=( --top10 )
-else
-  cmd+=( --perito "${PERITO_NAME}" )
-fi
-cmd+=( --min-analises "${MIN_ANALISES}" )
-
-# fluxo (só adiciona se o usuário não forneceu via "$@")
-if [[ "${HAS_FLUXO}" == "n" ]]; then
-  cmd+=( --fluxo "${FLUXO}" )
-fi
-
-# kpi-base (só adiciona se o usuário não forneceu via "$@")
-if [[ "${HAS_KPI_BASE}" == "n" ]]; then
-  cmd+=( --kpi-base "${KPI_BASE}" )
-fi
-
-# manifests (gera top10_peritos.csv e scope_gate_b.csv quando Fluxo B)
-if [[ "${SAVE_MANIFESTS}" == "y" && "${HAS_SAVE_MANIFESTS}" == "n" ]]; then
-  cmd+=( --save-manifests )
-fi
-
-# exportações
-[[ "${EXPORT_ORG}" == "y" ]] && cmd+=( --export-org )
-[[ "${EXPORT_PDF}" == "y" ]] && cmd+=( --export-pdf )
-[[ "${ADD_COMMENTS}" == "y" ]] && cmd+=( --add-comments )
-
-# apêndice R
-if [[ "${R_APPENDIX}" == "y" ]]; then
-  cmd+=( --r-appendix )
-else
-  cmd+=( --no-r-appendix )
-fi
-cmd+=( --r-bin "${R_BIN}" )
-
-# high-nc
-if [[ "${INCLUDE_HIGH_NC}" == "y" ]]; then
-  cmd+=( --include-high-nc )
-else
-  cmd+=( --no-high-nc )
-fi
-cmd+=( --high-nc-threshold "${HIGH_NC_THRESHOLD}" --high-nc-min-tasks "${HIGH_NC_MIN_TASKS}" )
-
-# impacto
-[[ "${WITH_IMPACT}" == "y" ]] && cmd+=( --with-impact )
-[[ "${IMPACT_ALL_TESTS}" == "y" ]] && cmd+=( --impact-all-tests )
-
-# reuse/assemble
-[[ "${REUSE_KPI}" == "y" ]] && cmd+=( --reuse-kpi )
-
-# dry-run
-[[ "${PLAN_ONLY}" == "y" ]] && cmd+=( --plan-only )
-
-# flags extras passadas ao script (não interativas)
-if (( "$#" > 0 )); then
-  cmd+=( "$@" )
-fi
-
-echo "▶ Executando:"
-printf ' %q' "${cmd[@]}"; echo; echo
-
-# Se for --plan-only, salvar plano em log
-if [[ "${PLAN_ONLY}" == "y" ]]; then
-  safe="top10"
-  if [[ "$MODE" == "perito" ]]; then safe="$(sanitize "${PERITO_NAME}")"; fi
-  LOG="${PROJ_ROOT}/plan_kpi_${safe}_${START}_${END}.log"
-  "${cmd[@]}" | tee "${LOG}"
-  exit "${PIPESTATUS[0]}"
-else
-  exec "${cmd[@]}"
-fi
+# ───────────────────────────── Execução ─────────────────────────────
+exec "${CMD[@]}"
 

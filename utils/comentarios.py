@@ -752,6 +752,10 @@ def comentar_composto(payload: Dict[str, Any],
 # IMPACTO NA FILA — comentário geral para o relatório do impacto_fila.py  (NOVO)
 # ────────────────────────────────────────────────────────────────────────────────
 
+def comentar_artefato(kind: str, ctx: dict, **kwargs) -> str:
+    # pode evoluir depois; por enquanto, retorna vazio para não quebrar
+    return ""
+
 def _system_prompt_impacto() -> str:
     """
     System prompt específico do Impacto na Fila:
@@ -894,4 +898,146 @@ def comentar_impacto_fila(df_all: Any,
 
     # Fallback final
     return _cap_words(_fallback_impacto_fila(meta), max_words)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# FLUXO B — prompts por gráfico/tabela + despachante genérico
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _ctx_get(ctx: dict, key: str, default=None):
+    try:
+        v = ctx.get(key, default)
+        # floats podem vir como str:
+        if key in {"soma_impacto","media_nc_brasil","gini","mediana_global","p90_global"} and isinstance(v, str):
+            try: return float(v)
+            except: return default
+        return v
+    except Exception:
+        return default
+
+PROMPTS_FB = {
+    # FIGURAS
+    "impacto_top20": (
+        "Comente o gráfico 'Impacto na fila — Top 20 elegíveis'. "
+        "Período: {periodo_inicio} a {periodo_fim}. Modo de impacto: {impact_mode}. "
+        "Elegíveis considerados no relatório: {n_elegiveis}. Soma do impacto reportado: {soma_impacto:.0f}. "
+        "Explique o que o ranking mostra, como interpretar as barras e que leitura gerencial fazer "
+        "(concentração, cauda longa, priorização). Não invente números."
+    ),
+    "heatmap_score_flags": (
+        "Comente o heatmap 'Critérios acionados (até 10 peritos)'. "
+        "Período: {periodo_inicio} a {periodo_fim}. Média nacional de NC: {media_nc_brasil:.2f}%. "
+        "Explique cada coluna (Prod≥50/h, Overlap, ≤15s≥10, %NC≥2×BR), como interpretar combinações de flags "
+        "e o que priorizar na prática."
+    ),
+    "dist_por_CR": (
+        "Comente a distribuição por CR (contagem baseada em {contagem_base}). "
+        "Período: {periodo_inicio} a {periodo_fim}. Indique concentração, dispersão e como usar a visão "
+        "para priorização regional."
+    ),
+    "dist_por_DR": (
+        "Comente a distribuição por DR (contagem baseada em {contagem_base}). "
+        "Aponte onde há maior representatividade e como isso orienta focos operacionais."
+    ),
+    "dist_por_UF": (
+        "Comente a distribuição por UF (contagem baseada em {contagem_base}). "
+        "Discuta diferenças esperadas/inesperadas e como isso apoia a governança local."
+    ),
+    "indicadores_medios": (
+        "Comente 'Indicadores médios — Elegíveis' (Prod/h média vs alvo 50/h, %NC, ≤15s%, Overlap%). "
+        "Período: {periodo_inicio} a {periodo_fim}. Aponte lacunas frente ao alvo e riscos operacionais."
+    ),
+    "impacto_esperado_pos_medidas_top20": (
+        "Comente 'Impacto esperado pós-medidas — Top 20'. "
+        "Explique a lógica das medidas (produtividade, NC, ≤15s, sobreposição), hipóteses e limitações, "
+        "e como priorizar ações de curto prazo."
+    ),
+    "lorenz_impacto_elegiveis": (
+        "Comente a 'Curva de Lorenz — Impacto entre elegíveis' com índice de Gini={gini:.3f}. "
+        "Explique o que a curvatura e o Gini indicam sobre concentração do impacto e prioridades."
+    ),
+    "pareto_impacto": (
+        "Comente o 'Pareto por impacto (Top-20)'. "
+        "Explique a leitura de barras vs. cumulativo e como usar o ponto de corte para foco."
+    ),
+    "duracao_mediana_p90_top20": (
+        "Comente 'Duração por perito — Mediana e P90 (Top-20 por volume)'. "
+        "Resumo global: mediana {mediana_global:.1f}s; P90 {p90_global:.1f}s. "
+        "Explique o que isso diz sobre fila/variabilidade e implicações operacionais."
+    ),
+    "cenarios_mensais": (
+        "Comente 'Impacto na fila — Real vs Cenários' ({rotulos_cenarios}) aplicados sobre IV_sel (Top-{topk_mensal} mensal). "
+        "Explique o que significa reduzir {reducoes_descritas} do IV_sel e como a simulação orienta metas."
+    ),
+    # TABELAS / SEÇÕES
+    "tabela_principal_csv": (
+        "Comente a 'Tabela principal (ranking)' dos elegíveis ao Fluxo B. "
+        "Explique colunas-chave (Prod/h, %NC, ≤15s, Overlap, Score v2, Impacto) e como ler o ranking para priorização."
+    ),
+    "tabela_full_csv": (
+        "Comente a 'Tabela completa de peritos' (apêndice). "
+        "Oriente como ela apoia auditoria, drill-down e checagens de consistência."
+    ),
+    "plano_acao_csv": (
+        "Comente o 'Plano de ação (CSV)'. "
+        "Explique colunas de ganho esperado e gargalos e como usar na rotina de acompanhamento."
+    ),
+    "cenarios_csv": (
+        "Comente a tabela 'Cenários mensais (CSV)' (IV_total, IV_sel e reduções por rótulo). "
+        "Explique como interpretar os deltas mensais e o total."
+    ),
+    "files_section": (
+        "Escreva 2–3 linhas de guia rápido para a seção 'Arquivos gerados', indicando por onde começar e "
+        "como navegar entre PDF, ORG, CSVs e figuras."
+    ),
+}
+
+def _build_prompt_fb(kind: str, ctx: dict, max_words: int) -> str:
+    tpl = PROMPTS_FB.get(kind)
+    if not tpl:
+        return f"Escreva um comentário breve e objetivo (≤{max_words} palavras) para o artefato '{kind}'. Contexto: {json.dumps(ctx, ensure_ascii=False)}"
+    # valores com defaults seguros
+    safe_ctx = {
+        "periodo_inicio":   _ctx_get(ctx, "periodo_inicio", ""),
+        "periodo_fim":      _ctx_get(ctx, "periodo_fim", ""),
+        "impact_mode":      _ctx_get(ctx, "impact_mode", "combined"),
+        "n_elegiveis":      int(_ctx_get(ctx, "n_elegiveis", 0) or 0),
+        "soma_impacto":     float(_ctx_get(ctx, "soma_impacto", 0.0) or 0.0),
+        "media_nc_brasil":  float(_ctx_get(ctx, "media_nc_brasil", 0.0) or 0.0),
+        "contagem_base":    _ctx_get(ctx, "contagem_base", "peritos"),
+        "gini":             float(_ctx_get(ctx, "gini", 0.0) or 0.0),
+        "mediana_global":   float(_ctx_get(ctx, "mediana_global", 0.0) or 0.0),
+        "p90_global":       float(_ctx_get(ctx, "p90_global", 0.0) or 0.0),
+        "topk_mensal":      int(_ctx_get(ctx, "topk_mensal", 10) or 10),
+        "rotulos_cenarios": _ctx_get(ctx, "rotulos_cenarios", "A, B, C"),
+        "reducoes_descritas": _ctx_get(ctx, "reducoes_descritas", "50%, 70%, 100%"),
+    }
+    user = (
+        f"Produza um comentário interpretativo em português (Brasil), TEXTO CORRIDO (um parágrafo), "
+        f"com no máximo {max_words} palavras, para o artefato '{kind}'. "
+        + tpl.format(**safe_ctx)
+    )
+    return user
+
+def comentar_artefato(kind: str,
+                      ctx: dict,
+                      *,
+                      call_api: bool = True,
+                      model: str = "gpt-4o-mini",
+                      temperature: float = 0.2,
+                      max_words: int = 180,
+                      return_prompt: bool = False) -> str:
+    """
+    Comentário genérico para gráficos/tabelas do Fluxo B.
+    - kind: uma das chaves de PROMPTS_FB
+    - ctx: dicionário com os placeholders esperados
+    """
+    user_prompt = _build_prompt_fb(kind, ctx, max_words=max_words)
+    if return_prompt:
+        return user_prompt
+    out = chamar_gpt(SYSTEM_PROMPT, user_prompt, call_api=call_api, model=model, temperature=temperature)
+    txt = (out.get("comment") or "").strip()
+    if not txt:
+        # fallback simples: devolve o próprio prompt resumido
+        return _cap_words(_to_one_paragraph(_strip_markers(user_prompt)), max_words)
+    return _cap_words(_to_one_paragraph(_strip_markers(txt)), max_words)
 
