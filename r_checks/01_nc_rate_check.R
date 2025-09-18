@@ -162,7 +162,7 @@ local({
   db_path <- am_args[["db"]]
   if (is.null(db_path) || !nzchar(db_path)) stop("Faltou --db <path>")
   con <<- am_open_db(db_path)
-  # (patch) removido on.exit de desconexão precoce
+  on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
 
   export_dir <<- am_resolve_export_dir(am_args[["out-dir"]])
   a_tbl     <<- tryCatch(am_detect_analises_table(con), error=function(e) NA_character_)
@@ -233,8 +233,8 @@ nc_case_sql <- function(alias = "a") {
 }
 
 # ------------------------------ DB --------------------------------------------
-con <- dbConnect(SQLite(), opt$db)
-on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
+# usar a conexão do prólogo; apenas garantir que esteja válida
+con <- am_ensure_con(con)
 
 a_tbl <- detect_analises_table(con)
 nc_sql <- nc_case_sql("a")
@@ -262,24 +262,24 @@ df <- am_dbGetQuery(con, sql, params = list(opt$start, opt$end))
 stopifnot(nrow(df) > 0)
 
 if (!(opt$perito %in% df$perito)) {
-  sim <- df %>% filter(grepl(opt$perito, perito, ignore.case = TRUE)) %>% pull(perito)
+  sim <- df %>% dplyr::filter(grepl(opt$perito, perito, ignore.case = TRUE)) %>% dplyr::pull(perito)
   msg <- if (length(sim)) paste0(" Peritos semelhantes: ", paste(sim, collapse=", "), ".") else ""
   stop(sprintf("Perito '%s' não encontrado no período dentro do escopo.%s", opt$perito, msg))
 }
 
 # --------------------------- cálculo ------------------------------------------
-p_row <- df %>% filter(perito == opt$perito) %>% slice(1)
-o_row <- df %>% filter(perito != opt$perito) %>% summarise(nc = sum(nc), n = sum(n))
+p_row <- df %>% dplyr::filter(perito == opt$perito) %>% dplyr::slice(1)
+o_row <- df %>% dplyr::filter(perito != opt$perito) %>% dplyr::summarise(nc = sum(nc), n = sum(n))
 
 p_pct <- ifelse(p_row$n > 0, p_row$nc / p_row$n, NA_real_)
 o_pct <- ifelse(o_row$n > 0, o_row$nc / o_row$n, NA_real_)
 
-p_ci <- if (is.finite(p_pct)) prop.test(p_row$nc, p_row$n)$conf.int else c(NA_real_, NA_real_)
-o_ci <- if (is.finite(o_pct)) prop.test(o_row$nc, o_row$n)$conf.int else c(NA_real_, NA_real_)
+p_ci <- if (is.finite(p_pct)) stats::prop.test(p_row$nc, p_row$n)$conf.int else c(NA_real_, NA_real_)
+o_ci <- if (is.finite(o_pct)) stats::prop.test(o_row$nc, o_row$n)$conf.int else c(NA_real_, NA_real_)
 
 pval <- NA_real_
 if (p_row$n > 0 && o_row$n > 0) {
-  pval <- suppressWarnings(prop.test(c(p_row$nc, o_row$nc), c(p_row$n, o_row$n))$p.value)
+  pval <- suppressWarnings(stats::prop.test(c(p_row$nc, o_row$nc), c(p_row$n, o_row$n))$p.value)
 }
 
 grp_others_lab <- if (!is.null(scope_names)) "Demais (escopo)" else "Demais (excl.)"
@@ -304,7 +304,7 @@ gg <- ggplot(plot_df, aes(Grupo, pct)) +
     title   = "Taxa de Não Conformidade (NC robusto) – Perito vs Demais",
     subtitle= sprintf("Período: %s a %s  |  n=%d vs %d", opt$start, opt$end, p_row$n, o_row$n),
     y       = "Percentual", x = NULL,
-    caption = "NC robusto: conformado=0 OU (motivoNaoConformado ≠ '' E CAST(motivoNaoConformado) ≠ 0)."
+    caption = "NC robusto: conformado=0 OU (motivoNaoConformado ≠ '' e CAST(motivoNaoConformado) ≠ 0)."
   ) +
   theme_minimal(base_size=11) +
   theme(panel.grid.major.x = element_blank())
@@ -313,7 +313,7 @@ png_path <- file.path(export_dir, sprintf("rcheck_nc_rate_%s.png", perito_safe))
 ggsave(png_path, gg, width=8, height=5, dpi=160)
 cat(sprintf("✓ salvo: %s\n", png_path))
 
-percent_s <- function(x) ifelse(is.finite(x), percent(x, accuracy = .1), "NA")
+percent_s <- function(x) ifelse(is.finite(x), scales::percent(x, accuracy = .1), "NA")
 num_s     <- function(x) format(x, big.mark=".", decimal.mark=",", trim=TRUE)
 
 esc_txt <- if (!is.null(scope_names)) " no *escopo (Fluxo B)*" else ""
@@ -356,3 +356,4 @@ org_comment <- file.path(export_dir, sprintf("rcheck_nc_rate_%s_comment.org", pe
 org_comment_txt <- paste(metodo_txt, "", interpret_txt, "", sep = "\n")
 writeLines(org_comment_txt, org_comment)
 cat(sprintf("✓ org(comment): %s\n", org_comment))
+

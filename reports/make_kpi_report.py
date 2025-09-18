@@ -1895,6 +1895,11 @@ def build_commands_for_script(script_file: str, context: dict) -> list:
         sel += ["--peritos-csv", peritos_csv]
         if scope_csv and "--scope-csv" in flags:
             sel += ["--scope-csv", scope_csv]
+        # NOVO: vários scripts exigem seletor exclusivo (--perito | --top10).
+        # Quando estamos em execução de grupo com manifesto, passamos --top10
+        # para satisfazer o parser e indicar “modo grupo”.
+        if "--top10" in flags and kind in ("group", "top10"):
+            sel += ["--top10"]
 
     # (2) Execução individual
     elif context.get("perito"):
@@ -1950,7 +1955,6 @@ def build_commands_for_script(script_file: str, context: dict) -> list:
         cmds.append(cmd)
 
     return cmds
-
 
 def build_r_commands_for_perito(perito: str, start: str, end: str, r_bin: str) -> list:
     """Planeja a fila de R checks individuais para o perito."""

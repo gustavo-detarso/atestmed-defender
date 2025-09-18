@@ -163,7 +163,7 @@ local({
   db_path <- am_args[["db"]]
   if (is.null(db_path) || !nzchar(db_path)) stop("Faltou --db <path>")
   con <<- am_open_db(db_path)
-  # (patch) removido on.exit de desconexão precoce
+  # sem desconexão aqui; deixamos para o corpo principal
 
   export_dir <<- am_resolve_export_dir(am_args[["out-dir"]])
   a_tbl     <<- tryCatch(am_detect_analises_table(con), error=function(e) NA_character_)
@@ -206,15 +206,15 @@ thr     <- as.numeric(args[["threshold"]] %||% "15")
 out_dir <- args[["out-dir"]]
 peritos_csv <- args[["peritos-csv"]] %||% NULL
 scope_csv   <- args[["scope-csv"]]   %||% NULL
-flow_opt    <- toupper(args[["flow"]] %||% "")        # "A" ou "B"
-rank_by_opt <- tolower(args[["rank-by"]] %||% "")     # "scorefinal" ou "harm"
+fluxo_opt   <- toupper(args[["fluxo"]] %||% "")          # "A" ou "B"
+rank_by_opt <- tolower(args[["rank-by"]] %||% "")        # "scorefinal" ou "harm"
 
 if (is.null(db_path) || is.null(start_d) || is.null(end_d)) {
-  stop("Uso: --db <path> --start YYYY-MM-DD --end YYYY-MM-DD [--min-analises 50] [--threshold 15] [--peritos-csv <csv>] [--scope-csv <csv>] [--flow A|B] [--rank-by scoreFinal|harm] [--out-dir <dir>]")
+  stop("Uso: --db <path> --start YYYY-MM-DD --end YYYY-MM-DD [--min-analises 50] [--threshold 15] [--peritos-csv <csv>] [--scope-csv <csv>] [--fluxo A|B] [--rank-by scoreFinal|harm] [--out-dir <dir>]")
 }
 
-# mapeamento flow→rank-by (fallback)
-rank_by <- if (nzchar(rank_by_opt)) rank_by_opt else if (identical(flow_opt, "B")) "harm" else "scorefinal"
+# mapeamento fluxo→rank-by (fallback)
+rank_by <- if (nzchar(rank_by_opt)) rank_by_opt else if (identical(fluxo_opt, "B")) "harm" else "scorefinal"
 
 base_dir   <- normalizePath(file.path(dirname(db_path), ".."))
 export_dir <- if (!is.null(out_dir)) normalizePath(out_dir, mustWork = FALSE) else
@@ -226,8 +226,8 @@ org_main <- file.path(export_dir, sprintf("rcheck_top10_le%ds.org", as.integer(t
 org_comm <- file.path(export_dir, sprintf("rcheck_top10_le%ds_comment.org", as.integer(thr)))
 
 # ───────────────────────── Conexão/schema ─────────────────────
-con <- dbConnect(RSQLite::SQLite(), db_path)
-on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
+con <- am_ensure_con(if (exists("con", inherits=TRUE)) get("con", inherits=TRUE) else NULL)
+on.exit(try(am_safe_disconnect(con), silent=TRUE), add = TRUE)
 
 table_exists <- function(con, name) {
   nrow(am_dbGetQuery(con, "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1", params=list(name))) > 0
@@ -250,10 +250,10 @@ if (!(need_col %in% ind_cols)) {
 load_names_csv <- function(path) {
   if (is.null(path) || !nzchar(path) || !file.exists(path)) return(NULL)
   df <- tryCatch(read.csv(path, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM"), error=function(e) NULL)
-  if (is.null(df) || !nrow(df)) return(NULL)
+  if (is.null(df) || !nrow(df)) return(character(0))
   key <- if ("nomePerito" %in% names(df)) "nomePerito" else names(df)[1]
   out <- trimws(as.character(df[[key]])); out <- out[nzchar(out)]
-  if (length(out)) unique(out) else NULL
+  if (length(out)) unique(out) else character(0)
 }
 
 # ───────────────────────── ESCOPO (coorte) ────────────────────
@@ -270,7 +270,7 @@ if (length(scope_names)) {
 top_names_raw <- load_names_csv(peritos_csv)
 sel_caption <- NULL
 
-if (!is.null(top_names_raw)) {
+if (length(top_names_raw)) {
   # Revalida min-analises mantendo a ordem do CSV (aplica ESCOPO se fornecido)
   in_list <- paste(sprintf("'%s'", gsub("'", "''", top_names_raw)), collapse=",")
   qry_cnt <- sprintf("
@@ -428,3 +428,4 @@ writeLines(org_main_txt, org_main); base::cat(sprintf("✅ Org salvo: %s\n", org
 
 org_comm_txt <- paste(metodo_txt, "", interpreta_txt, "", sep = "\n")
 writeLines(org_comm_txt, org_comm); base::cat(sprintf("✅ Org(comment) salvo: %s\n", org_comm))
+

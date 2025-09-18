@@ -226,8 +226,8 @@ org_main <- file.path(export_dir, "rcheck_top10_productivity.org")
 org_comm <- file.path(export_dir, "rcheck_top10_productivity_comment.org")
 
 # ───────────────────────── Conexão/schema ─────────────────────
-con <- dbConnect(RSQLite::SQLite(), db_path)
-on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
+# usa a conexão aberta no prólogo; se não estiver válida, reconecta
+con <- am_ensure_con(con)
 
 table_exists <- function(con, name) {
   nrow(am_dbGetQuery(con, "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1", params=list(name))) > 0
@@ -428,3 +428,4 @@ writeLines(org_main_txt, org_main); base::cat(sprintf("✅ Org salvo: %s\n", org
 
 org_comm_txt <- paste(metodo_txt, "", interpreta_txt, "", sep = "\n")
 writeLines(org_comm_txt, org_comm); base::cat(sprintf("✅ Org(comment) salvo: %s\n", org_comm))
+

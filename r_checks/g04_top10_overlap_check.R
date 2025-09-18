@@ -185,7 +185,8 @@ org_main <- file.path(export_dir, "rcheck_top10_overlap.org")
 org_comm <- file.path(export_dir, "rcheck_top10_overlap_comment.org")
 
 # ─────────────── Helpers de schema ───────────────
-con <- DBI::dbConnect(RSQLite::SQLite(), db_path); on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
+con <- am_db_connect(db_path)
+on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
 table_exists <- function(con, name) nrow(am_dbGetQuery(con, "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1", params=list(name))) > 0
 detect_analises_table <- function(con) { for (t in c("analises","analises_atestmed")) if (table_exists(con, t)) return(t); stop("Não encontrei 'analises' nem 'analises_atestmed'.") }
 

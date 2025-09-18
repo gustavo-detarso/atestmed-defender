@@ -191,7 +191,8 @@ to_upper <- function(xs) unique(toupper(trimws(xs)))
 # ────────────────────────────────────────────────────────────────────────────────
 # Seleção do grupo-alvo (manifesto OU Top10 interno por scoreFinal/harm) + ESCOPO
 # ────────────────────────────────────────────────────────────────────────────────
-con <- DBI::dbConnect(RSQLite::SQLite(), opt$db); on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
+con <- am_db_connect(opt$db)
+on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
 a_tbl <- detect_analises_table(con)
 
 rank_by_opt <- tolower(opt$`rank-by` %||% "")

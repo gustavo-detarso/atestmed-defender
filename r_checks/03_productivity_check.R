@@ -136,7 +136,7 @@ local({
         base_dir <- if (nzchar(dbp)) normalizePath(file.path(dirname(dbp), ".."), mustWork=FALSE) else getwd()
         od <- file.path(base_dir, "graphs_and_tables", "exports")
       }
-      if (!dir.exists(od)) dir.create(od, recursive=TRUE, showWarnings=FALSE); od
+      if (!dir.exists(od)) dir.create(od, recursive=FALSE, showWarnings=FALSE); od
     }
   }
   if (!exists("am_detect_analises_table", mode="function", inherits=TRUE)) {
@@ -176,7 +176,7 @@ local({
   db_path <- am_args[["db"]]
   if (is.null(db_path) || !nzchar(db_path)) stop("Faltou --db <path>")
   con <<- am_open_db(db_path)
-  # (patch) removido on.exit de desconexão precoce
+  on.exit(try(am_safe_disconnect(con), silent = TRUE), add = TRUE)
 
   export_dir <<- am_resolve_export_dir(am_args[["out-dir"]])
   a_tbl     <<- tryCatch(am_detect_analises_table(con), error=function(e) NA_character_)
@@ -220,8 +220,8 @@ load_names_csv <- function(path) {
 }
 
 # ------------------------------ DB / duração -----------------------------------
-con <- dbConnect(RSQLite::SQLite(), opt$db)
-on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
+# Usa a conexão do prólogo; garante que está válida (abre se necessário)
+con <- am_ensure_con(con)
 
 # tabela de análises
 a_tbl <- if (exists("a_tbl", inherits=TRUE) && nzchar(a_tbl)) a_tbl else {
@@ -347,3 +347,4 @@ writeLines(org_main_txt, org_main); cat(sprintf("✓ org: %s\n", org_main))
 org_comment <- file.path(export_dir, sprintf("rcheck_productivity_%s_comment.org", perito_safe))
 org_comment_txt <- paste(metodo_txt, "", interpret_txt, "", sep = "\n")
 writeLines(org_comment_txt, org_comment); cat(sprintf("✓ org(comment): %s\n", org_comment))
+

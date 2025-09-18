@@ -34,6 +34,7 @@ from statistics import median
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import List, Dict, Any, Tuple, Optional
+from collections import OrderedDict
 
 # garante que o diretório raiz do repositório entre no sys.path
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -541,9 +542,92 @@ def org_file_link(path: str, label: Optional[str] = None) -> str:
     if not path:
         return ""
     lab = label or os.path.basename(path)
+    # evita sub/superscript no export (LaTeX/HTML) quando há '_' no label
+    if "_" in lab:
+        lab = f"={lab}="
     return f"[[file:{path}][{lab}]]"
 
+FNAME_RE = re.compile(r'(?<![A-Za-z0-9/=])([A-Za-z0-9][\w\-.]*_[\w\-.]+)(?![\w/])')
 
+def _org_protect_underscores(text: str) -> str:
+    """Envolve tokens com '_' em =...= (evita sobrescrito). Ignora links Org existentes."""
+    if not text:
+        return text
+    # protege apenas BASENAMES com '_' (ex.: plano_acao.csv); não mexe em [[file:...][...]]
+    def repl(m):
+        tok = m.group(1)
+        # já está em verbatim?
+        if tok.startswith("=") and tok.endswith("="):
+            return tok
+        return f"={tok}="
+    return FNAME_RE.sub(repl, text)
+
+def make_files_section_links(base_name: str,
+                             args,
+                             csv_path: str,
+                             full_csv: str,
+                             plano_acao_csv: str,
+                             figs: List[str]) -> List[Tuple[str, str]]:
+    """
+    Monta a lista consolidada de 'Arquivos gerados', com rótulos humanos e deduplicação.
+    Inclui: ORG, PDF, CSVs (ranking, full, plano_acao), cenários (CSV/PNG) e TODAS as figuras.
+    """
+    links: List[Tuple[str, str]] = []
+    seen: set = set()  # caminhos absolutos já incluídos
+
+    def add(label: str, path: Optional[str]):
+        if not path:
+            return
+        ap = os.path.abspath(path)
+        if os.path.exists(path) and ap not in seen:
+            links.append((label, path))
+            seen.add(ap)
+
+    # Base
+    add("Relatório ORG", os.path.join(args.org_dir, base_name + ".org"))
+    add("Relatório PDF", os.path.join(args.pdf_dir, base_name + ".pdf"))
+    add("CSV principal (ranking)", csv_path)
+    add("CSV completo (auditoria)", full_csv)
+    add("Plano de ação por perito", plano_acao_csv)
+
+    # Cenários (se existirem)
+    scen_csv = os.path.join(args.out_dir, base_name + "_cenarios_mensais.csv")
+    scen_png = os.path.join(args.out_dir, base_name + "_cenarios_mensais.png")
+    add("Cenários (CSV — Real vs A/B/C)", scen_csv)
+    add("Cenários (PNG — Real vs A/B/C)", scen_png)
+
+    # Mapa de rótulos amigáveis para figuras conhecidas
+    nice_labels = [
+        ("_impacto_top20.png", "Impacto na fila — Top 20 elegíveis"),
+        ("_heatmap_score_flags.png", "Heatmap de critérios do Score v2"),
+        ("_dist_por_CR.png", "Distribuição por CR"),
+        ("_dist_por_DR.png", "Distribuição por DR"),
+        ("_dist_por_UF.png", "Distribuição por UF"),
+        ("_indicadores_medios.png", "Indicadores médios dos elegíveis vs alvo"),
+        ("_impacto_esperado_pos_medidas_top20.png", "Impacto esperado pós-medidas — Top 20"),
+        ("_lorenz_impacto_elegiveis.png", "Curva de Lorenz do impacto (elegíveis)"),
+        ("_pareto_impacto.png", "Pareto por impacto (Top-20)"),
+        ("_duracao_mediana_p90_top20.png", "Duração por perito — mediana e P90 (Top-20)"),
+    ]
+
+    # Index rápido por sufixo
+    suffix_to_label = OrderedDict(nice_labels)
+
+    # Adiciona TODAS as figuras, priorizando rótulo humano quando reconhecer o sufixo
+    for f in figs:
+        label = None
+        base = os.path.basename(f)
+        for suf, lab in suffix_to_label.items():
+            if base.endswith(suf):
+                label = lab
+                break
+        if not label:
+            # fallback: usa o basename do arquivo
+            label = base
+        add(label, f)
+
+    return links
+    
 def annotate_png_with_text(png_path: str, text: str):
     """Acrescenta uma linha de texto discreta no rodapé do PNG, in-place (matplotlib-only)."""
     try:
@@ -694,6 +778,33 @@ def emit_org_table_block(table_lines: List[str],
         out.append("#+LATEX: \\end{landscape}")
     return out
 
+def ensure_graphs_module():
+    """
+    Localiza e importa o módulo graphs_and_tables/graphs_melhorias.py,
+    mesmo que o pacote não tenha __init__.py.
+    Retorna o módulo importado com as funções:
+        - save_bar(values, labels, title, out_path, ylabel="Valor")
+        - save_heatmap(matrix, row_labels, col_labels, title, out_path, ...)
+        - save_lorenz_impact(values, out_path, title=...)
+    """
+    import importlib.util, sys, os
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    graphs_dir = os.path.join(base_dir, 'graphs_and_tables')
+    mod_path = os.path.join(graphs_dir, 'graphs_melhorias.py')
+    if not os.path.exists(mod_path):
+        raise FileNotFoundError(f"Não encontrei {mod_path}")
+
+    # Garante que graphs_and_tables entre no sys.path (facilita links relativos, se houver)
+    if graphs_dir not in sys.path:
+        sys.path.insert(0, graphs_dir)
+
+    spec = importlib.util.spec_from_file_location("graphs_melhorias", mod_path)
+    if spec is None or spec.loader is None:
+        raise ImportError("Falha ao montar spec para graphs_melhorias")
+    gm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gm)  # type: ignore[attr-defined]
+    return gm
+
 # ---------- Gráficos ----------
 def save_bar(values, labels, title, out_path, ylabel="Valor"):
     plt.figure()
@@ -803,6 +914,250 @@ def save_lorenz_impact(values: List[float], out_path: str,
     plt.close()
 
     return float(gini)
+
+def generate_figures_bundle(args,
+                            rows: List[Dict[str, Any]],
+                            peritos: Dict[str, PeritoAgg],
+                            focus_records: List[Dict[str, Any]],
+                            base_name: str,
+                            mean_br: float) -> Tuple[
+                                List[str],                     # figs
+                                Dict[str, str],                # comments_by_fig
+                                Optional[str],                 # pareto_fig
+                                Optional[List[str]],           # pareto_table_lines (org lines)
+                                Optional[float],               # impact_gini
+                                Optional[List[str]],           # cen_table_org_lines (org lines)
+                                Dict[str, Any]                 # payload_extra (cenários)
+                            ]:
+    """
+    Gera todas as figuras do relatório e agrega metadados auxiliares.
+
+    Retorna:
+      - figs: lista de caminhos para todas as figuras PNG geradas (1 gráfico por arquivo).
+      - comments_by_fig: { caminho_png: comentário/legenda curta }.
+      - pareto_fig: caminho do PNG de Pareto (ou None).
+      - pareto_table_lines: tabela Pareto (Top-10) em linhas Org (ou None).
+      - impact_gini: índice de Gini (Curva de Lorenz) se calculado (ou None).
+      - cen_table_org_lines: tabela de cenários em linhas Org (ou None).
+      - payload_extra: { 'cenarios': {...} } quando cenários são gerados; caso contrário, {}.
+
+    Observações:
+      - Usa graphs_and_tables/graphs_melhorias.py se presente (ensure_graphs_module), com
+        fallback para as funções locais save_bar/save_heatmap/save_lorenz_impact.
+      - Respeita as flags de linha de comando (e.g., --no-graphs, --with-impact, etc.).
+    """
+    # -------------------- helpers & setup --------------------
+    try:
+        gm = ensure_graphs_module()
+        _save_bar = getattr(gm, "save_bar", save_bar)
+        _save_heat = getattr(gm, "save_heatmap", save_heatmap)
+        _save_lorenz = getattr(gm, "save_lorenz_impact", save_lorenz_impact)
+    except Exception:
+        gm = None
+        _save_bar = save_bar
+        _save_heat = save_heatmap
+        _save_lorenz = save_lorenz_impact
+
+    figs: List[str] = []
+    comments_by_fig: Dict[str, str] = {}
+    pareto_fig: Optional[str] = None
+    pareto_table_lines: Optional[List[str]] = None
+    impact_gini: Optional[float] = None
+    cen_table_org_lines: Optional[List[str]] = None
+    payload_extra: Dict[str, Any] = {}
+
+    elegiveis_keyset = {(r["nome"], r["siape"]) for r in focus_records}
+    out_dir = args.out_dir
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _coment(kind: str, extra_ctx: Optional[Dict[str, Any]] = None) -> str:
+        fn = getattr(comentarios, "comentar_artefato", None) if comentarios else None
+        if callable(fn):
+            try:
+                ctx = {
+                    "impact_mode": args.impact_mode,
+                    "n_elegiveis": len(focus_records),
+                    "soma_impacto": float(sum(r.get("impacto_fila", 0.0) for r in focus_records)) if args.with_impact else 0.0,
+                    "media_nc_brasil": float(mean_br),
+                }
+                if extra_ctx:
+                    ctx.update(extra_ctx)
+                return fn(kind, ctx, model=os.getenv("ATESTMED_OPENAI_MODEL", "gpt-4o-mini"))
+            except Exception:
+                return ""
+        return ""
+
+    # -------------------- cenários (mensais) --------------------
+    if getattr(args, "scenarios_follow_melhorias", False):
+        try:
+            reds = [float(x) for x in (args.scenarios_reductions.split(","))]
+        except Exception:
+            reds = [0.5, 0.7, 1.0]
+        try:
+            labs = [x.strip() for x in (args.scenarios_labels.split(","))]
+        except Exception:
+            labs = ["A", "B", "C"]
+
+        monthly = compute_monthly_impacts(rows, args.impact_mode, args.scenarios_topk)
+        cen_csv = os.path.join(out_dir, base_name + "_cenarios_mensais.csv")
+        export_table_csv(cen_csv, monthly)
+
+        cen_fig = os.path.join(out_dir, base_name + "_cenarios_mensais.png")
+        title = "Impacto na fila — Real vs Cenários (Top-10 mensal; A=50%, B=70%, C=100% IV_sel)"
+        fig_path, cen_table = build_cenarios_and_plot(monthly, reds, labs, cen_fig, title)
+        if cen_table:
+            cen_table_org_lines = export_table_org_lines(cen_table)
+        if fig_path and os.path.exists(fig_path):
+            figs.append(fig_path)
+            reds_str = ", ".join([f"{int(r*100)}%" for r in reds])
+            comments_by_fig[fig_path] = _coment(
+                "cenarios_mensais",
+                {"topk_mensal": int(args.scenarios_topk),
+                 "rotulos_cenarios": ", ".join(labs),
+                 "reducoes_descritas": reds_str}
+            )
+        payload_extra["cenarios"] = {
+            "labels": labs,
+            "reductions": reds,
+            "topk": int(args.scenarios_topk),
+            "mensal_csv": cen_csv,
+            "fig": fig_path
+        }
+
+    if args.no_graphs:
+        # Se gráficos estiverem desligados, ainda retornamos dados auxiliares (cenários)
+        return figs, comments_by_fig, pareto_fig, pareto_table_lines, impact_gini, cen_table_org_lines, payload_extra
+
+    # -------------------- impacto Top-20 --------------------
+    if args.with_impact and focus_records:
+        top_imp = sorted(focus_records, key=lambda x: x.get("impacto_fila", 0.0), reverse=True)[:20]
+        vals = [float(r.get("impacto_fila", 0.0)) for r in top_imp]
+        lbls = [short_label(r["nome"]) for r in top_imp]
+        f1 = os.path.join(out_dir, base_name + "_impacto_top20.png")
+        _save_bar(vals, lbls, "Impacto na fila — Top 20 elegíveis", f1, ylabel="Análises")
+        figs.append(f1)
+        comments_by_fig[f1] = _coment("impacto_top20")
+
+    # -------------------- heatmap critérios (até 10) --------------------
+    if focus_records:
+        rows_hm: List[List[float]] = []
+        rlabels: List[str] = []
+        N_HM = min(10, len(focus_records))
+        for r in focus_records[:N_HM]:
+            k = f"{r['nome']} [{r['siape']}]"
+            agg = peritos.get(k)
+            if not agg:
+                continue
+            rows_hm.append([
+                1.0 if agg.prod_por_hora >= 50.0 else 0.0,
+                1.0 if agg.overlaps > 0 else 0.0,
+                1.0 if agg.le15s >= 10 else 0.0,
+                1.0 if agg.pct_nc >= 2.0 * mean_br else 0.0,
+            ])
+            rlabels.append(short_label(r["nome"]))
+        f2 = os.path.join(out_dir, base_name + "_heatmap_score_flags.png")
+        _save_heat(rows_hm, rlabels, ["Prod≥50/h", "Overlap", "≤15s≥10", "%NC≥2×BR"],
+                   "Heatmap — Critérios acionados (até 10 peritos)", f2)
+        figs.append(f2)
+        comments_by_fig[f2] = _coment("heatmap_score_flags")
+
+    # -------------------- distribuições por CR/DR/UF --------------------
+    def _plot_dist_by(field: str, title: str, suffix: str, kind_key: str, contagem_base: str):
+        items: List[Tuple[str, int]]
+        if field == "cr" and args.cr_mode == "analises":
+            counts = count_by_dimension_analises(rows, elegiveis_keyset, field)
+        else:
+            counts = count_by_dimension_peritos(focus_records, field)
+        items = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        TOPN = 20
+        if len(items) > TOPN:
+            top = items[:TOPN-1]
+            outros = sum(v for _, v in items[TOPN-1:])
+            items = top + [("Outros", outros)]
+        labels = [k for k, _ in items]
+        values = [v for _, v in items]
+        fpath = os.path.join(out_dir, base_name + f"_{suffix}.png")
+        _save_bar(values, labels, title, fpath, ylabel=contagem_base.capitalize())
+        figs.append(fpath)
+        comments_by_fig[fpath] = _coment(kind_key, {"contagem_base": contagem_base})
+
+    if args.fluxo_b and focus_records:
+        _plot_dist_by("cr", "Distribuição por CR", "dist_por_CR", "dist_por_CR",
+                      "análises" if args.cr_mode == "analises" else "peritos")
+        if getattr(args, "with_dist_dr", False):
+            _plot_dist_by("dr", "Distribuição por DR", "dist_por_DR", "dist_por_DR", "peritos")
+        if getattr(args, "with_dist_uf", False):
+            _plot_dist_by("uf", "Distribuição por UF", "dist_por_UF", "dist_por_UF", "peritos")
+
+    # -------------------- indicadores médios --------------------
+    if focus_records:
+        prod = float(np.mean([r["prod_por_hora"] for r in focus_records]))
+        nc = float(np.mean([r["pct_nc"] for r in focus_records]))
+        le15 = float(np.mean([r["pct_le15s"] for r in focus_records]))
+        ov = float(np.mean([r["pct_overlap"] for r in focus_records]))
+        vals = [prod, 50.0, nc, le15, ov]
+        lbls = ["Prod/h (média)", "Alvo (50/h)", "%NC (média)", "≤15s% (média)", "Overlap% (média)"]
+        f4 = os.path.join(out_dir, base_name + "_indicadores_medios.png")
+        _save_bar(vals, lbls, "Indicadores médios — Elegíveis", f4, ylabel="Valor / %")
+        figs.append(f4)
+        comments_by_fig[f4] = _coment("indicadores_medios")
+
+    # -------------------- impacto esperado pós-medidas (Top-20) --------------------
+    if args.with_impact and focus_records:
+        top_imp = sorted(focus_records, key=lambda x: x["impacto_fila"], reverse=True)[:20]
+        exp_vals, lbls = [], []
+        for r in top_imp:
+            k = f"{r['nome']} [{r['siape']}]"
+            agg = peritos.get(k)
+            if not agg:
+                exp_vals.append(float(r.get("impacto_fila", 0.0)))
+            else:
+                exp_imp, _ = expected_impact_after_measures(agg, float(r.get("impacto_fila", 0.0)), args)
+                exp_vals.append(float(exp_imp))
+            lbls.append(short_label(r["nome"]))
+        f5 = os.path.join(out_dir, base_name + "_impacto_esperado_pos_medidas_top20.png")
+        _save_bar(exp_vals, lbls, "Impacto esperado pós-medidas — Top 20", f5, ylabel="Análises (esperado)")
+        figs.append(f5)
+        comments_by_fig[f5] = _coment("impacto_esperado_pos_medidas_top20")
+
+    # -------------------- curva de Lorenz do impacto --------------------
+    if args.with_impact and getattr(args, "with_impact_lorenz", False) and focus_records:
+        impacts_all = [float(r.get("impacto_fila", 0.0)) for r in focus_records]
+        f_lorenz = os.path.join(out_dir, base_name + "_lorenz_impacto_elegiveis.png")
+        gini = _save_lorenz(impacts_all, f_lorenz, title="Curva de Lorenz — Impacto entre elegíveis")
+        if gini is not None and os.path.exists(f_lorenz):
+            figs.append(f_lorenz)
+            impact_gini = float(gini)
+            comments_by_fig[f_lorenz] = _coment("lorenz_impacto_elegiveis", {"gini": float(gini)})
+
+    # -------------------- Pareto (Top-20) --------------------
+    if args.with_impact and getattr(args, "with_pareto", False) and focus_records:
+        vals = [(short_label(r["nome"]), float(r.get("impacto_fila", 0.0))) for r in focus_records]
+        vals = [v for v in vals if v[1] > 0]
+        if vals:
+            vals_sorted = sorted(vals, key=lambda x: x[1], reverse=True)[:20]
+            labels = [n for n, _ in vals_sorted]
+            values = [v for _, v in vals_sorted]
+            pareto_fig = os.path.join(out_dir, base_name + "_pareto_impacto.png")
+            # Pareto com matplotlib puro (sem seaborn)
+            plt.figure()
+            x = np.arange(len(values))
+            plt.bar(x, values)
+            cum = np.cumsum(values) / sum(values)
+            plt.plot(x, cum * max(values), marker="o", linestyle="--")
+            plt.xticks(x, labels, rotation=45, ha="right")
+            plt.title("Pareto por impacto (Top-20)")
+            plt.ylabel("Impacto (barras) / Cumulativo (linha)")
+            plt.tight_layout()
+            plt.savefig(pareto_fig, dpi=160)
+            plt.close()
+
+            pareto_table = build_pareto_table(vals, topk=10)
+            pareto_table_lines = export_table_org_lines(pareto_table)
+            figs.append(pareto_fig)
+            comments_by_fig[pareto_fig] = _coment("pareto_impacto")
+
+    return figs, comments_by_fig, pareto_fig, pareto_table_lines, impact_gini, cen_table_org_lines, payload_extra
 
 # ---------- Cenários probabilísticos ----------
 def expected_impact_after_measures(agg: PeritoAgg, base_impact: float, args) -> Tuple[float, Dict[str, float]]:
@@ -1269,11 +1624,20 @@ def build_action_plan(focus_records, peritos, args, mean_nc_br: float):
     return plan
 
 def ai_proposals(summary_payload: Dict[str, Any], action_plan_csv: str) -> str:
-    """Texto de propostas usando OpenAI (se houver), com instrução para NÃO inventar números (com debug)."""
+    """Texto de propostas usando OpenAI (se houver), com instrução para NÃO inventar números (com debug).
+       Inclui link Org para o plano de ação como [[file:/caminho/plano_acao.csv][=plano_acao.csv=]]."""
     _dbg("ai_proposals() iniciou")
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     model = os.getenv("ATESTMED_OPENAI_MODEL", "gpt-4o-mini")
     _dbg(f"key? {bool(api_key)} | model={model} | action_plan_csv={action_plan_csv}")
+
+    # helper: link Org com label verbatim (evita sobrescrito por '_')
+    from os.path import basename
+    def _org_link_action(p: Optional[str]) -> str:
+        if not p:
+            return ""
+        b = basename(p)
+        return f"[[file:{p}][={b}=]]"
 
     base = (
         "Propostas de intervenção organizadas por alavanca: produtividade, não conformidade, ≤15s e sobreposição. "
@@ -1282,10 +1646,11 @@ def ai_proposals(summary_payload: Dict[str, Any], action_plan_csv: str) -> str:
         "(iii) revisão de triagem e limites operacionais p/ ≤15s; (iv) alerta/bloqueio de sessões sobrepostas; "
         "(v) monitoramento contínuo com reavaliação quinzenal do impacto na fila."
     )
+    link_rodape = f"\n\nArquivo do plano de ação: {_org_link_action(action_plan_csv)}"
 
     if not api_key:
         _dbg("sem OPENAI_API_KEY — retornando texto base (fallback)")
-        return base + f"\n\nArquivo do plano de ação: {action_plan_csv}"
+        return base + link_rodape
 
     prompt = (
         "Você é consultor(a) operacional. Escreva a seção 'Propostas' do relatório ATESTMED, "
@@ -1313,7 +1678,7 @@ def ai_proposals(summary_payload: Dict[str, Any], action_plan_csv: str) -> str:
         txt = resp.choices[0].message.content.strip() if getattr(resp, "choices", None) else ""
         _dbg(f"OpenAI completou propostas? {bool(txt)}")
         if txt:
-            return txt + f"\n\nArquivo do plano de ação: {action_plan_csv}"
+            return txt + link_rodape
     except Exception as e:
         _dbg(f"exceção proposals(OpenAI): {e!r} — tentando fallback ChatCompletion")
 
@@ -1334,11 +1699,11 @@ def ai_proposals(summary_payload: Dict[str, Any], action_plan_csv: str) -> str:
         txt = resp["choices"][0]["message"]["content"].strip()
         _dbg(f"ChatCompletion completou propostas? {bool(txt)}")
         if txt:
-            return txt + f"\n\nArquivo do plano de ação: {action_plan_csv}"
+            return txt + link_rodape
     except Exception as e:
         _dbg(f"exceção proposals(ChatCompletion): {e!r} — usando base local")
 
-    return base + f"\n\nArquivo do plano de ação: {action_plan_csv}"
+    return base + link_rodape
 
 def build_org_report(path: str, titulo: str, periodo: str, tabela_csv_path: str,
                      resumo_txt: str, figs: List[str], explicacoes_txt: str,
@@ -1369,34 +1734,223 @@ def build_org_report(path: str, titulo: str, periodo: str, tabela_csv_path: str,
                      files_links: Optional[List[Tuple[str, str]]] = None,
                      # NOVO: comentários curtos para tabelas/listas
                      table_captions: Optional[Dict[str, str]] = None):
+    import os, re, itertools
+
     lines: List[str] = []
 
-    # Helper link
+    # ─────────────────────────────────────────────────────────────
+    # Helpers: filenames verbatim; markdown→org; símbolos; math; etc.
+    # ─────────────────────────────────────────────────────────────
+
+    # Detecta nomes de arquivo típicos e protege com placeholders
+    _FILENAME_RE = re.compile(
+        r'\b[\w\-.]+(?:\.(?:csv|tsv|xlsx?|png|jpe?g|pdf|zip|org|tex|json|txt))\b',
+        re.IGNORECASE
+    )
+
+    def _extract_protect_filenames(text: str):
+        if not text:
+            return "", {}
+        mapping = {}
+        counter = itertools.count(1)
+        def repl(m):
+            tok = m.group(0)
+            key = f"@@FILE{next(counter)}@@"
+            mapping[key] = tok
+            return key
+        return _FILENAME_RE.sub(repl, text), mapping
+
+    def _restore_filenames_to_verbatim(text: str, mapping: dict) -> str:
+        if not text:
+            return ""
+        for key, fname in mapping.items():
+            text = text.replace(key, f"={fname}=")
+        return text
+
+    # Markdown → Org (### → **, bullets)
+    _MD_HEADING_RE = re.compile(r'^\s{0,3}(#{1,6})\s+(.*)$')
+
+    def _md_to_org(text: str, base_level: int = 2) -> str:
+        out = []
+        for L in str(text).splitlines():
+            m = _MD_HEADING_RE.match(L)
+            if m:
+                n = len(m.group(1))
+                stars = "*" * max(2, min(6, n + base_level - 1))
+                out.append(f"{stars} {m.group(2).strip()}")
+                continue
+            if re.match(r'^\s*[-*]\s+', L):
+                out.append(re.sub(r'^\s*[-*]\s+', '- ', L)); continue
+            if re.match(r'^\s*•\s*', L):
+                out.append(re.sub(r'^\s*•\s*', '- ', L)); continue
+            out.append(L)
+        return "\n".join(out)
+
+    # Corrige símbolos comuns
+    def _fix_basic_symbols(s: str) -> str:
+        if not s:
+            return ""
+        s = s.replace("’", "'").replace("–", "-").replace("—", "-").replace("−", "-")
+        s = s.replace("Œ", "×")  # glitch
+        s = re.sub(r'>=\s*', '≥ ', s)
+        s = re.sub(r'<=\s*', '≤ ', s)
+        return s
+
+    # Ordinais PT-BR (1º/1ª) e glitch “ž” → LaTeX \textsuperscript{…}
+    def _normalize_ordinals(s: str) -> str:
+        if not s:
+            return ""
+        def repl_o(m):  # masculino
+            return m.group(1) + r'\textsuperscript{o}'
+        def repl_a(m):  # feminino
+            return m.group(1) + r'\textsuperscript{a}'
+        s = re.sub(r'(\b[0-9]{1,2})\s*[ºž]', repl_o, s)   # 1º / 1ž
+        s = re.sub(r'(\b[0-9]{1,2})\s*ª', repl_a, s)      # 1ª
+        return s
+
+    # Latexifica ≥ ≤ × em inline math
+    def _latexify_symbols(s: str) -> str:
+        if not s:
+            return ""
+        return (
+            s.replace("≥", r"\(\geq\)")
+             .replace("≤", r"\(\leq\)")
+             .replace("×", r"\(\times\)")
+        )
+
+    # Aplica substituições apenas fora de \( ... \)
+    def _sub_outside_math(pattern: re.Pattern, repl_fn, s: str) -> str:
+        parts, i, outside = [], 0, True
+        for m in re.finditer(r'\\\(|\\\)', s):
+            token = m.group(0)
+            if outside:
+                seg = s[i:m.start()]
+                seg = pattern.sub(repl_fn, seg)
+                parts.append(seg)
+            else:
+                parts.append(s[i:m.start()])
+            parts.append(token)
+            i = m.end()
+            outside = (token == r'\)')
+        tail = s[i:]
+        if outside:
+            tail = pattern.sub(repl_fn, tail)
+        parts.append(tail)
+        return "".join(parts)
+
+    # IV_total / IV_sel → modo math com subscrito legível
+    _IV_VAR_RE = re.compile(r'\bIV_(total|sel)\b', re.IGNORECASE)
+    def _mathify_iv_vars(s: str) -> str:
+        def repl(m):
+            sub = m.group(1).lower()
+            return rf"\(IV_{{\mathrm{{{sub}}}}}\)"
+        return _sub_outside_math(_IV_VAR_RE, repl, s)
+
+    # %NC ≥ 2× BR (corrige várias variantes). Usa função de repl para evitar escapes.
+    def _fix_percent_nc_rule(s: str) -> str:
+        repl = lambda _m: "%NC ≥ 2× BR"
+        pat1 = re.compile(
+            r'%\s*NC\s*(?:\\\(\s*\\geq\\\)\s*|≥\s*|>=\s*)?2\s*(?:\\\(\s*\\times\\\)\s*|×\s*|x\s*)BR',
+            flags=re.IGNORECASE
+        )
+        s = pat1.sub(repl, s)
+        pat2 = re.compile(r'%\s*NC\s*2\s*BR', flags=re.IGNORECASE)
+        s = pat2.sub(repl, s)
+        return s
+
+    # Protege palavras_com_underscore (não-arquivos), fora de math
+    _WORD_WITH_UNDERSCORE = re.compile(r'(?<![A-Za-z0-9/=])([A-Za-z0-9][\w\-]*_[\w\-]+)(?![\w/])')
+    def _protect_residual_underscores(s: str) -> str:
+        def repl(m):
+            tok = m.group(1)
+            if tok.lower() in ("iv_total", "iv_sel"):
+                return tok
+            return f"={tok}="
+        return _sub_outside_math(_WORD_WITH_UNDERSCORE, repl, s)
+
+    # “impacto total contrafactual = …” → fórmula inline em itálico
+    _CONTRA_RE = re.compile(
+        r'impacto\s*(?:\n\s*)?total\s+contrafactual\s*=\s*([^\n]+)',
+        re.IGNORECASE
+    )
+    def _format_rhs_for_math(rhs: str) -> str:
+        t = rhs.strip()
+        t = t.replace("−", "-").replace("–", "-").replace("—", "-")
+        t = re.sub(r'\bIV_total\b', r'IV_{\mathrm{total}}', t, flags=re.IGNORECASE)
+        t = re.sub(r'\bIV_sel\b',   r'IV_{\mathrm{sel}}',   t, flags=re.IGNORECASE)
+        t = re.sub(r'redu[cç][aã]o[_ ]aplicada[_ ]sobre[_ ]IV[_ ]sel',
+                   r'\\textit{redução aplicada sobre } IV_{\\mathrm{sel}}',
+                   t, flags=re.IGNORECASE)
+        t = re.sub(r'\s*-\s*', r' \;-\; ', t)
+        return t
+    def _mathify_contrafactual_expression(s: str) -> str:
+        def repl(m):
+            rhs = _format_rhs_for_math(m.group(1))
+            return rf"\( \mathit{{impacto\ total\ contrafactual}} \;=\; {rhs} \)"
+        return _CONTRA_RE.sub(repl, s)
+
+    # Pipeline principal de saneamento (para textos vindos da IA/dinâmicos)
+    def _sanitize_ai_text(text: Optional[str]) -> str:
+        if not text:
+            return ""
+        tmp, fmap = _extract_protect_filenames(str(text))
+        tmp = _md_to_org(tmp, base_level=2)
+        tmp = _fix_basic_symbols(tmp)
+        tmp = _normalize_ordinals(tmp)             # <<< corrige 1ž/1º/1ª
+        tmp = _fix_percent_nc_rule(tmp)            # %NC ≥ 2× BR (Unicode)
+        tmp = _mathify_contrafactual_expression(tmp)
+        tmp = _mathify_iv_vars(tmp)
+        tmp = _protect_residual_underscores(tmp)
+        tmp = _latexify_symbols(tmp)               # ≥ ≤ × → LaTeX inline
+        tmp = _restore_filenames_to_verbatim(tmp, fmap)
+        return tmp
+
+    # Helper de link Org (label com verbatim quando há "_")
     def _org_link(p: Optional[str], label: Optional[str] = None) -> str:
         if not p:
             return ""
         try:
-            return org_file_link(p, label)  # usa helper já definido no módulo
+            return org_file_link(p, label)
         except Exception:
             lab = label or os.path.basename(p)
+            if "_" in lab:
+                lab = f"={lab}="
             return f"[[file:{p}][{lab}]]"
 
-    # Landscape resolve
+    # CAPTION/NAME para figuras (usa legenda da IA se houver)
+    def _caption_for(fig: str) -> str:
+        base = os.path.basename(fig)
+        cap = (fig_captions or {}).get(fig) or (fig_captions or {}).get(base)
+        if not cap:
+            nice = os.path.splitext(base)[0]
+            nice = nice.replace("relatorio_fluxo_b_", "").replace("_", " ")
+            cap = nice.strip().capitalize()
+        return _sanitize_ai_text(cap)
+
+    def _name_for(fig: str) -> str:
+        base = os.path.splitext(os.path.basename(fig))[0].lower()
+        safe = re.sub(r'[^a-z0-9]+', '-', base).strip('-')
+        return f"fig:{safe}"
+
+    # ───────── Landscape resolve ─────────
     land_main = bool(table_landscape) or bool(landscape_main)
     land_cen  = bool(table_landscape) or bool(landscape_cenarios)
     land_plan = bool(table_landscape) or bool(landscape_plan)
     land_app  = bool(table_landscape) or bool(landscape_appendix)
 
-    # Cabeçalho
+    # ───────── Cabeçalho ─────────
     if prepend_org_text:
         lines.append(prepend_org_text.strip())
         lines.append("")
+        lines.append("#+OPTIONS: ^:{}")
+        lines.append("#+LATEX_HEADER: \\usepackage{amsmath}")
     else:
         lines.append(f"#+TITLE: {titulo}")
         lines.append("#+LANGUAGE: pt_BR")
-        lines.append("#+OPTIONS: toc:nil num:t")
+        lines.append("#+OPTIONS: toc:nil num:t ^:{}")
         lines.append("#+LATEX_CLASS: article")
         lines.append("#+LATEX_COMPILER: xelatex")
+        lines.append("#+LATEX_HEADER: \\usepackage{amsmath}")
         lines.append("")
 
     if table_use_longtable:
@@ -1406,15 +1960,17 @@ def build_org_report(path: str, titulo: str, periodo: str, tabela_csv_path: str,
         lines.append("#+LATEX_HEADER: \\usepackage{pdflscape}")
     lines.append("")
 
-    # Período & resumo
+    # ───────── Período & Resumo ─────────
+    lines.append("#+LATEX: \\setcounter{section}{0}")  # reinicia numeração
+    lines.append("")
     lines.append("* Período")
     lines.append(periodo)
     lines.append("")
     lines.append("* Resumo")
-    lines.append(resumo_txt)
+    lines.append(_sanitize_ai_text(resumo_txt))
     lines.append("")
 
-    # Tabela principal
+    # ───────── Tabela principal ─────────
     if not no_main_table_section:
         lines.append("* Tabela principal")
         if embed_tables:
@@ -1424,39 +1980,63 @@ def build_org_report(path: str, titulo: str, periodo: str, tabela_csv_path: str,
                                               use_longtable=table_use_longtable,
                                               landscape=land_main))
             if table_captions and table_captions.get("main"):
-                lines.append(table_captions["main"])
+                lines.append(_sanitize_ai_text(table_captions["main"]))
             lines.append("")
             lines.append(f"Arquivo completo: {_org_link(tabela_csv_path, 'CSV principal (completo)')}")
         else:
             lines.append(f"Arquivo: {_org_link(tabela_csv_path, 'CSV principal (ranking)')}")
             if table_captions and table_captions.get("main"):
-                lines.append(table_captions["main"])
+                lines.append(_sanitize_ai_text(table_captions["main"]))
         lines.append("")
 
-    # Gráficos
+    # ───────── Série mensal — Real vs. cenários (Top-10) ─────────
+    base_dir = os.path.dirname(os.path.abspath(tabela_csv_path)) if tabela_csv_path else "."
+    base_name = os.path.splitext(os.path.basename(tabela_csv_path or ""))[0]
+    scen_png = os.path.join(base_dir, base_name + "_cenarios_mensais.png")
+    scen_csv = os.path.join(base_dir, base_name + "_cenarios_mensais.csv")
+
+    if (not no_scenarios_section) and (os.path.exists(scen_png) or os.path.exists(scen_csv)):
+        lines.append("* Série mensal — Real vs. cenários (Top-10)")
+        if os.path.exists(scen_png):
+            lines.append("#+CAPTION: Impacto na fila — Série observada e cenários (A/B/C) aplicados sobre IV_sel (Top-10 mensal).")
+            lines.append("#+ATTR_LATEX: :placement [H] :width 0.92\\textwidth")
+            lines.append(f"[[file:{scen_png}]]")
+        if os.path.exists(scen_csv):
+            lines.append("")
+            lines.append(f"Arquivo (CSV dos cenários): {_org_link(scen_csv, os.path.basename(scen_csv))}")
+        if table_captions and table_captions.get("cenarios"):
+            lines.append(_sanitize_ai_text(table_captions["cenarios"]))
+        lines.append("")
+
+    # ───────── Gráficos ─────────
     if not no_graphs:
         lines.append("* Gráficos")
+        scen_abs = os.path.abspath(scen_png)
         for fig in figs:
-            lines.append(f"[[{fig}]]")
-            cap = (fig_captions or {}).get(fig)
-            if cap:
-                lines.append(cap)
-        # Pareto (opcional)
+            if os.path.abspath(fig) == scen_abs:
+                continue  # evita duplicar o gráfico de cenários
+            lines.append(f"#+CAPTION: {_caption_for(fig)}")
+            lines.append(f"#+NAME: {_name_for(fig)}")
+            lines.append(f"[[file:{fig}]]")
         if pareto_fig:
             lines.append("")
             lines.append("* Pareto por impacto")
-            lines.append(f"[[{pareto_fig}]]")
+            lines.append(f"#+CAPTION: {_caption_for(pareto_fig)}")
+            lines.append(f"#+NAME: {_name_for(pareto_fig)}")
+            lines.append(f"[[file:{pareto_fig}]]")
             if pareto_table_lines:
                 lines.append("")
-                lines.extend(emit_org_table_block(pareto_table_lines,
-                                                  font_size=table_font_size,
-                                                  use_longtable=table_use_longtable,
-                                                  landscape=False))
+                lines.extend(emit_org_table_block(
+                    pareto_table_lines,
+                    font_size=table_font_size,
+                    use_longtable=table_use_longtable,
+                    landscape=False
+                ))
                 if table_captions and table_captions.get("pareto_table"):
-                    lines.append(table_captions["pareto_table"])
+                    lines.append(_sanitize_ai_text(table_captions["pareto_table"]))
         lines.append("")
 
-    # Cenários
+    # ───────── Cenários (tabela em Org) ─────────
     if (cen_table_lines and (not no_scenarios_section)):
         lines.append("* Cenários (conforme melhorias.org)")
         lines.append("Aplicação das reduções A/B/C sobre IV_sel (Top-10 mensal).")
@@ -1465,14 +2045,14 @@ def build_org_report(path: str, titulo: str, periodo: str, tabela_csv_path: str,
                                           use_longtable=table_use_longtable,
                                           landscape=land_cen))
         if table_captions and table_captions.get("cenarios"):
-            lines.append(table_captions["cenarios"])
+            lines.append(_sanitize_ai_text(table_captions["cenarios"]))
         lines.append("")
 
-    # Propostas
+    # ───────── Propostas ─────────
     if not no_plan_section:
         lines.append("* Propostas")
         if propostas_txt:
-            lines.append(propostas_txt)
+            lines.append(_sanitize_ai_text(propostas_txt))
         if plano_acao_csv:
             if embed_tables and action_plan_csv_path and os.path.exists(action_plan_csv_path):
                 lines.append("")
@@ -1483,22 +2063,22 @@ def build_org_report(path: str, titulo: str, periodo: str, tabela_csv_path: str,
                                                   use_longtable=table_use_longtable,
                                                   landscape=land_plan))
                 if table_captions and table_captions.get("plan"):
-                    lines.append(table_captions["plan"])
+                    lines.append(_sanitize_ai_text(table_captions["plan"]))
                 lines.append("")
                 lines.append(f"Arquivo (plano de ação completo): {_org_link(action_plan_csv_path, 'plano_acao.csv')}")
             else:
                 lines.append("")
                 lines.append(f"Arquivo (plano de ação): {_org_link(plano_acao_csv, 'plano_acao.csv')}")
                 if table_captions and table_captions.get("plan"):
-                    lines.append(table_captions["plan"])
+                    lines.append(_sanitize_ai_text(table_captions["plan"]))
         lines.append("")
 
-    # Explicações e metodologia
+    # ───────── Explicações e Metodologia ─────────
     lines.append("* Explicações e Metodologia")
-    lines.append(explicacoes_txt)
+    lines.append(_sanitize_ai_text(explicacoes_txt))
     lines.append("")
 
-    # Apêndice FULL (embed ou link)
+    # ───────── Apêndices ─────────
     if embed_tables and full_table_csv_path and os.path.exists(full_table_csv_path):
         lines.append("* Apêndice — Tabela completa de peritos")
         full_tbl = csv_to_org_table(full_table_csv_path, max_rows=None)
@@ -1507,26 +2087,26 @@ def build_org_report(path: str, titulo: str, periodo: str, tabela_csv_path: str,
                                           use_longtable=table_use_longtable,
                                           landscape=land_app))
         if table_captions and table_captions.get("appendix"):
-            lines.append(table_captions["appendix"])
+            lines.append(_sanitize_ai_text(table_captions["appendix"]))
         lines.append("")
     if (not embed_tables) and full_table_csv_path and os.path.exists(full_table_csv_path):
         lines.append("* Apêndice — Tabela completa de peritos (arquivo)")
         lines.append(_org_link(full_table_csv_path, os.path.basename(full_table_csv_path)))
         if table_captions and table_captions.get("appendix"):
-            lines.append(table_captions["appendix"])
+            lines.append(_sanitize_ai_text(table_captions["appendix"]))
         lines.append("")
 
-    # Apêndice de texto adicional
     if extra_org_text:
         lines.append("* Apêndice — Texto adicional (melhorias.org)")
         lines.append(extra_org_text)
         lines.append("")
 
-    # Files section
+    # ───────── Arquivos gerados ─────────
     if files_links:
         lines.append("* Arquivos gerados")
-        for label, fpath in files_links:
-            lines.append(f"- {_org_link(fpath, label)}")
+        for _, fpath in files_links:
+            base = os.path.basename(fpath)
+            lines.append(f"- [[file:{fpath}][={base}=]]")
         lines.append("")
 
     with open(path, "w", encoding="utf-8") as f:
@@ -1894,9 +2474,6 @@ def main():
             comments_by_fig[f_lorenz] = _coment("lorenz_impacto_elegiveis", {"gini": float(gini)})
         _dbg(f"fig lorenz gerada: {f_lorenz} | gini={impact_gini}")
 
-    # Anexa figura de cenários
-    figs.extend(figs_for_cenarios)
-
     # Pareto (opcional)
     pareto_fig = None
     pareto_table_lines = None
@@ -2025,14 +2602,17 @@ def main():
     _dbg(f"legendas de figuras (merge): {len(fig_captions)} itens")
 
     # Anotar legendas nos PNGs (se pedido)
-    if getattr(args, "annotate_figures", False) and fig_captions:
+    # Só anota PNGs quando NÃO estiver exportando Org/PDF (evita texto duplicado no relatório)
+    if getattr(args, "annotate_figures", False) and fig_captions and not (args.export_org or args.export_pdf):
         ann_count = 0
         for f in figs:
             cap = fig_captions.get(f)
             if cap:
                 annotate_png_with_text(f, cap)
                 ann_count += 1
-        _dbg(f"anotações em PNGs realizadas: {ann_count}")
+        _dbg(f"anotações em PNGs realizadas (sem export_org/pdf): {ann_count}")
+    else:
+        _dbg("anotação em PNGs desativada (export_org/pdf ativo ou flag ausente)")
 
     # PREPEND .org (melhorias.org)
     prepend_org_text = None
@@ -2045,22 +2625,18 @@ def main():
             _dbg(f"falha ao ler prepend_org_file: {e!r}")
             prepend_org_text = None
 
-    # Seção “Arquivos gerados”
+    # Seção “Arquivos gerados” (UNIFICADA com figuras e cenários; sem duplicatas)
     files_links: List[Tuple[str, str]] = []
     if getattr(args, "with_files_section", False):
-        files_links = [
-            ("Relatório ORG", os.path.join(args.org_dir, base_name + ".org")),
-            ("Relatório PDF", os.path.join(args.pdf_dir, base_name + ".pdf")),
-            ("CSV principal (ranking)", csv_path),
-            ("CSV completo", full_csv),
-            ("Plano de ação", plano_acao_csv),
-        ]
-        if getattr(args, "scenarios_follow_melhorias", False):
-            files_links.append(("Cenários (CSV)", os.path.join(args.out_dir, base_name + "_cenarios_mensais.csv")))
-            files_links.append(("Cenários (PNG)", os.path.join(args.out_dir, base_name + "_cenarios_mensais.png")))
-        for f in figs:
-            files_links.append((os.path.basename(f), f))
-        _dbg(f"files section: {len(files_links)} links")
+        files_links = make_files_section_links(
+            base_name=base_name,
+            args=args,
+            csv_path=csv_path,
+            full_csv=full_csv,
+            plano_acao_csv=plano_acao_csv,
+            figs=figs
+        )
+        _dbg(f"files section (unificada): {len(files_links)} links")
 
     # Comentários de TABELAS (tenta AI centralizada; fallback para _coment)
     table_captions: Dict[str, str] = {}

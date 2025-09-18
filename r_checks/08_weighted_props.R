@@ -8,24 +8,21 @@ Sys.setlocale(category = "LC_ALL", locale = "C.UTF-8")
 # ----------------------------------------------------------------------
 
 suppressPackageStartupMessages({
-
-# --- hardening: garanta am_resolve_export_dir mesmo sem _common.R ---
-if (!exists("am_resolve_export_dir", mode = "function", inherits = TRUE)
-
-) {
-  `%||%` <- function(a,b) if (is.null(a)) b else a
-  am_resolve_export_dir <- function(out_dir = NULL) {
-    od <- if (!is.null(out_dir) && nzchar(out_dir)) {
-      normalizePath(out_dir, mustWork = FALSE)
-    } else {
-      dbp <- tryCatch(am_args[["db"]], error = function(e) NULL) %||% ""
-      base_dir <- if (nzchar(dbp)) normalizePath(file.path(dirname(dbp), ".."), mustWork = FALSE) else getwd()
-      file.path(base_dir, "graphs_and_tables", "exports")
+  # --- hardening: garanta am_resolve_export_dir mesmo sem _common.R ---
+  if (!exists("am_resolve_export_dir", mode = "function", inherits = TRUE)) {
+    `%||%` <- function(a,b) if (is.null(a)) b else a
+    am_resolve_export_dir <- function(out_dir = NULL) {
+      od <- if (!is.null(out_dir) && nzchar(out_dir)) {
+        normalizePath(out_dir, mustWork = FALSE)
+      } else {
+        dbp <- tryCatch(am_args[["db"]], error = function(e) NULL) %||% ""
+        base_dir <- if (nzchar(dbp)) normalizePath(file.path(dirname(dbp), ".."), mustWork = FALSE) else getwd()
+        file.path(base_dir, "graphs_and_tables", "exports")
+      }
+      if (!dir.exists(od)) dir.create(od, recursive = TRUE, showWarnings = FALSE)
+      od
     }
-    if (!dir.exists(od)) dir.create(od, recursive = TRUE, showWarnings = FALSE)
-    od
   }
-}
   library(DBI); library(RSQLite)
   library(dplyr); library(ggplot2); library(scales); library(stringr); library(tibble); library(readr)
 })
@@ -80,15 +77,7 @@ if (!exists("am_dbQuoteIdentifier", mode="function", inherits=TRUE)) {
     }
   })(DBI::dbQuoteIdentifier)
 }
-# --- fim do fix ---
-
 # --- end: am_db_reconnect_helpers ---
-
-
-
-
-
-
 
 # ==== ATESTMED PROLOGO (INICIO) ====
 local({
@@ -128,7 +117,6 @@ local({
   }
 })
 # ==== ATESTMED PROLOGO (FIM) ====
-
 
 # ---- CLI fallback (ATESTMED) ----
 if (!exists("start_d", inherits=TRUE) ||
@@ -174,7 +162,9 @@ if (!exists("start_d", inherits=TRUE) ||
     export_dir <- if (!is.null(out_dir) && nzchar(out_dir)) normalizePath(out_dir, mustWork=FALSE) else file.path(base_dir, "graphs_and_tables","exports")
     if (!dir.exists(export_dir)) dir.create(export_dir, recursive=TRUE, showWarnings=FALSE)
 
-    con <- tryCatch(DBI::dbConnect(RSQLite::SQLite(), dbname=normalizePath(db_path, mustWork=TRUE)), error=function(e) NULL)
+    con <- am_db_connect(db_path)
+    on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
+    if (!is.null(con)) on.exit(try(DBI::dbDisconnect(con), silent=TRUE), add = TRUE)
     if (is.null(con) || !DBI::dbIsValid(con)) stop("Conexão DB inválida (fallback).")
 
     if (!exists("am_detect_analises_table", mode="function", inherits=TRUE)) {
@@ -198,8 +188,6 @@ if (!exists("start_d", inherits=TRUE) ||
 
     a_tbl <- tryCatch(am_detect_analises_table(con), error=function(e) NA_character_)
     cols  <- tryCatch(am_detect_columns(con, a_tbl), error=function(e) character(0))
-
-    # (patch) removido on.exit de desconexão precoce
   }
 }
 
@@ -220,7 +208,7 @@ z_test_2props <- function(x1,n1,x2,n2) {
   se     <- sqrt(p_pool*(1-p_pool)*(1/n1 + 1/n2))
   if (!is.finite(se) || se == 0) return(list(z=NA_real_, p=NA_real_))
   z <- (x1/n1 - x2/n2) / se
-  p <- 2 * (1 - pnorm(abs(z)))
+  p <- 2 * (1 - stats::pnorm(abs(z)))
   list(z=z, p=p)
 }
 
@@ -543,3 +531,4 @@ if (!top10) {
 
   write_org_bundle(nm$png, spec$title, metodo_txt, interp_txt, nm$org, nm$orgc, nm$md)
 }
+

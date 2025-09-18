@@ -26,12 +26,7 @@ if (!exists("am_resolve_export_dir", mode = "function", inherits = TRUE)
     od
   }
 }
-  library(DBI)
-  library(RSQLite)
-  library(ggplot2)
-  library(dplyr)
-  library(stringr)
-  library(scales)
+  library(optparse); library(DBI); library(RSQLite); library(dplyr); library(ggplot2); library(scales)
 })
 
 # --- begin: am_db_reconnect_helpers ---
@@ -87,12 +82,6 @@ if (!exists("am_dbQuoteIdentifier", mode="function", inherits=TRUE)) {
 # --- fim do fix ---
 
 # --- end: am_db_reconnect_helpers ---
-
-
-
-
-
-
 
 # ==== ATESTMED PROLOGO (INICIO) ====
 local({
@@ -167,7 +156,7 @@ local({
   db_path <- am_args[["db"]]
   if (is.null(db_path) || !nzchar(db_path)) stop("Faltou --db <path>")
   con <<- am_open_db(db_path)
-  # (patch) removido on.exit de desconexão precoce
+  on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
 
   export_dir <<- am_resolve_export_dir(am_args[["out-dir"]])
   a_tbl     <<- tryCatch(am_detect_analises_table(con), error=function(e) NA_character_)
@@ -187,75 +176,28 @@ local({
 # ==== ATESTMED PROLOGO (FIM) ====
 
 
-`%||%` <- function(a,b) if (is.null(a)) b else a
+# ----------------------------- CLI --------------------------------------------
+opt_list <- list(
+  make_option("--db",          type="character", help="Caminho do SQLite"),
+  make_option("--start",       type="character", help="AAAA-MM-DD"),
+  make_option("--end",         type="character", help="AAAA-MM-DD"),
+  make_option("--perito",      type="character", help="Nome do perito"),
+  make_option("--out-dir",     type="character", default=NULL, help="Diretório de saída (PNG/org)"),
+  make_option("--scope-csv",   type="character", default=NULL, help="CSV com nomes do escopo (Fluxo B)")
+)
+opt <- optparse::parse_args(OptionParser(option_list = opt_list))
+stopifnot(!is.null(opt$db), !is.null(opt$start), !is.null(opt$end), !is.null(opt$perito))
 
-parse_args <- function() {
-  args <- am_normalize_cli(base::commandArgs(TRUE))
-  kv <- list(); i <- 1
-  while (i <= length(args)) {
-    k <- args[[i]]
-    if (startsWith(k, "--")) {
-      v <- if (i + 1 <= length(args) && !startsWith(args[[i+1]], "--")) args[[i+1]] else TRUE
-      kv[[substr(k, 3, nchar(k))]] <- v
-      i <- i + if (isTRUE(v) || identical(v, TRUE)) 1 else 2
-    } else i <- i + 1
-  }
-  kv
-}
+# --------------------------- helpers -------------------------------------------
+safe <- function(x) { gsub("(^_+|_+$)", "", gsub("[^A-Za-z0-9_-]+","_", x)) }
+perito_safe <- safe(opt$perito)
 
-ensure_dir <- function(p) if (!dir.exists(p)) dir.create(p, recursive = TRUE, showWarnings = FALSE)
-fail_plot <- function(msg) ggplot() + annotate("text", x=0, y=0, label=msg, size=5) + theme_void()
-safe_slug <- function(x){ x <- gsub("[^A-Za-z0-9\\-_]+","_", x); x <- gsub("_+","_", x); x <- gsub("^_|_$","", x); ifelse(nchar(x)>0, x, "output") }
-percent_s <- function(x, acc=.1) ifelse(is.finite(x), percent(x, accuracy=acc), "NA")
-to_upper  <- function(xs) unique(toupper(trimws(xs)))
-
-# ----------------------------------------------------------------------
-# Args e paths
-# ----------------------------------------------------------------------
-args <- parse_args()
-db_path <- args$db
-start_d <- args$start
-end_d   <- args$end
-min_n   <- as.integer(args[["min-analises"]] %||% "50")
-out_dir <- args[["out-dir"]]
-
-peritos_csv <- args[["peritos-csv"]] %||% NULL   # lista externa (Fluxo A/B)
-scope_csv   <- args[["scope-csv"]]   %||% NULL   # define ESCOPO (coorte)
-
-# NOVO: escolha do critério de ranqueamento quando não há manifest
-flow_arg    <- toupper(trimws(args[["flow"]] %||% ""))     # "A" ou "B"
-rank_by_arg <- tolower(trimws(args[["rank-by"]] %||% ""))  # "scorefinal" ou "harm"
-
-if (is.null(db_path) || is.null(start_d) || is.null(end_d)) {
-  stop("Uso: --db <path> --start YYYY-MM-DD --end YYYY-MM-DD [--min-analises 50] [--peritos-csv <csv>] [--scope-csv <csv>] [--flow A|B | --rank-by scoreFinal|harm] [--out-dir <dir>]")
-}
-
-base_dir   <- normalizePath(file.path(dirname(db_path), ".."))
-export_dir <- if (!is.null(out_dir)) normalizePath(out_dir, mustWork = FALSE) else
-  file.path(base_dir, "graphs_and_tables", "exports")
+ensure_dir <- function(p) if (!dir.exists(p)) dir.create(p, recursive=TRUE, showWarnings=FALSE)
+base_dir   <- normalizePath(file.path(dirname(opt$db), ".."))
+export_dir <- if (!is.null(opt$`out-dir`)) normalizePath(opt$`out-dir`, mustWork = FALSE) else
+              file.path(base_dir, "graphs_and_tables", "exports")
 ensure_dir(export_dir)
 
-png_file <- file.path(export_dir, "rcheck_top10_nc_rate.png")
-org_main <- file.path(export_dir, "rcheck_top10_nc_rate.org")
-org_comm <- file.path(export_dir, "rcheck_top10_nc_rate_comment.org")
-
-# ----------------------------------------------------------------------
-# Conexão e helpers
-# ----------------------------------------------------------------------
-con <- dbConnect(RSQLite::SQLite(), db_path)
-on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
-
-table_exists <- function(con, name) {
-  nrow(am_dbGetQuery(con, "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1", params=list(name))) > 0
-}
-detect_analises_table <- function(con) { for (t in c("analises","analises_atestmed")) if (table_exists(con, t)) return(t); stop("Não encontrei 'analises' nem 'analises_atestmed'.") }
-a_tbl <- detect_analises_table(con)
-if (!table_exists(con, "indicadores")) {
-  ggsave(png_file, fail_plot("Tabela 'indicadores' não encontrada"), width=9, height=5, dpi=150)
-  quit(save="no")
-}
-
-# utilitário: carregar lista do CSV (se existir)
 load_names_csv <- function(path) {
   if (is.null(path) || !nzchar(path) || !file.exists(path)) return(NULL)
   df <- tryCatch(read.csv(path, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM"), error=function(e) NULL)
@@ -265,174 +207,147 @@ load_names_csv <- function(path) {
   if (length(out)) unique(out) else NULL
 }
 
-scope_names <- to_upper(load_names_csv(scope_csv))
-scope_clause <- ""
-scope_params <- list()
-if (length(scope_names)) {
-  placeholders_scope <- paste(rep("?", length(scope_names)), collapse = ",")
-  scope_clause <- sprintf(" AND TRIM(UPPER(p.nomePerito)) IN (%s) ", placeholders_scope)
-  scope_params <- as.list(scope_names)
+detect_analises_table <- function(con) {
+  tabs <- am_dbGetQuery(con, "SELECT name FROM sqlite_master WHERE type IN ('table','view')")
+  cand <- c("analises", "analises_atestmed")
+  hit  <- intersect(cand, tabs$name)
+  if (length(hit) == 0) stop("Não encontrei 'analises' nem 'analises_atestmed'.")
+  hit[[1]]
 }
 
-# ----------------------------------------------------------------------
-# Top 10 — fonte: (1) manifest CSV; senão (2) rank por scoreFinal (Fluxo A) OU harm (Fluxo B)
-#      — com ESCOPO aplicado quando fornecido
-# ----------------------------------------------------------------------
-top10_names <- load_names_csv(peritos_csv)
-
-# decide métrica quando não houver manifest
-metric <- "scoreFinal"  # padrão Fluxo A
-if (nzchar(rank_by_arg)) {
-  if (rank_by_arg %in% c("harm","scorefinal","score_final","score")) {
-    metric <- if (startsWith(rank_by_arg,"harm")) "harm" else "scoreFinal"
-  }
-} else if (nzchar(flow_arg)) {
-  metric <- if (flow_arg == "B") "harm" else "scoreFinal"
+nc_case_sql <- function(alias = "a") {
+  sprintf("
+    CASE
+      WHEN CAST(IFNULL(%1$s.conformado,1) AS INTEGER)=0 THEN 1
+      WHEN TRIM(IFNULL(%1$s.motivoNaoConformado,'')) <> ''
+           AND CAST(IFNULL(%1$s.motivoNaoConformado,'0') AS INTEGER) <> 0 THEN 1
+      ELSE 0
+    END
+  ", alias)
 }
 
-if (!is.null(top10_names)) {
-  # Fonte = manifest (lista externa)
-  top10 <- tibble::tibble(nomePerito = head(top10_names, 10L))
-  sel_caption <- "Seleção: lista externa (manifest) — fornecida pelo make_kpi_report.py."
-} else {
-  # Fonte = indicadores.<metric> (aplica ESCOPO se houver)
-  ind_cols <- am_dbGetQuery(con, "PRAGMA table_info(indicadores)")$name
-  if (!(metric %in% ind_cols)) {
-    ggsave(png_file, fail_plot(sprintf("A coluna '%s' não existe em 'indicadores'.", metric)), width=9, height=5, dpi=150)
-    quit(save="no")
-  }
-  qry_top10 <- sprintf("
-  SELECT p.nomePerito, i.%s AS metric_val, COUNT(a.protocolo) AS total_analises
-    FROM indicadores i
-    JOIN peritos   p ON i.perito = p.siapePerito
-    JOIN %s  a ON a.siapePerito = i.perito
-   WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ? %s
-   GROUP BY p.nomePerito, i.%s
-  HAVING total_analises >= ?
-   ORDER BY i.%s DESC, total_analises DESC
-   LIMIT 10
-  ", metric, a_tbl, scope_clause, metric, metric)
-  params_top10 <- c(list(start_d, end_d), scope_params, list(min_n))
-  top10 <- do.call(am_dbGetQuery, c(list(con, qry_top10), list(params = params_top10)))
-  if (nrow(top10) == 0) {
-    ggsave(png_file, fail_plot("Sem Top 10 para o período/critério (após escopo)."), width=9, height=5, dpi=150)
-    quit(save="no")
-  }
-  sel_caption <- sprintf("Seleção: %s (indicadores.%s)%s.",
-                         if (metric=="harm") "harm (Fluxo B)" else "scoreFinal (Fluxo A)",
-                         metric,
-                         if (length(scope_names)) " — escopo aplicado" else "")
+# ------------------------------ DB --------------------------------------------
+# usar a conexão do prólogo; apenas garantir que esteja válida
+con <- am_ensure_con(con)
+
+a_tbl <- detect_analises_table(con)
+nc_sql <- nc_case_sql("a")
+
+# escopo (Fluxo B), se fornecido
+scope_names <- load_names_csv(opt$`scope-csv`)
+scope_filter_sql <- ""
+if (!is.null(scope_names) && length(scope_names)) {
+  in_list <- paste(sprintf("'%s'", gsub("'", "''", scope_names)), collapse=",")
+  scope_filter_sql <- sprintf(" AND p.nomePerito IN (%s) ", in_list)
 }
 
-# ----------------------------------------------------------------------
-# %NC (robusto) para os peritos selecionados — com ESCOPO se houver
-# ----------------------------------------------------------------------
-peritos <- paste(sprintf("'%s'", gsub("'", "''", top10$nomePerito)), collapse=",")
+sql <- sprintf("
+SELECT
+  p.nomePerito AS perito,
+  SUM(%s) AS nc,
+  COUNT(*) AS n
+FROM %s a
+JOIN peritos p ON a.siapePerito = p.siapePerito
+WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ? %s
+GROUP BY p.nomePerito
+", nc_sql, am_dbQuoteIdentifier(con, a_tbl), scope_filter_sql)
 
-nc_expr <- "
-CASE
-  WHEN CAST(IFNULL(a.conformado,1) AS INTEGER)=0 THEN 1
-  WHEN TRIM(IFNULL(a.motivoNaoConformado,'')) <> ''
-       AND CAST(IFNULL(a.motivoNaoConformado,'0') AS INTEGER) <> 0 THEN 1
-  ELSE 0
-END
-"
+df <- am_dbGetQuery(con, sql, params = list(opt$start, opt$end))
+stopifnot(nrow(df) > 0)
 
-qry_nc <- sprintf("
-SELECT p.nomePerito,
-       COUNT(*) AS total,
-       SUM(%s) AS nc
-  FROM %s a
-  JOIN peritos p ON a.siapePerito = p.siapePerito
- WHERE substr(a.dataHoraIniPericia,1,10) BETWEEN ? AND ?
-   AND p.nomePerito IN (%s) %s
- GROUP BY p.nomePerito
-", nc_expr, a_tbl, peritos, scope_clause)
-
-params_nc <- c(list(start_d, end_d), scope_params)
-df <- do.call(am_dbGetQuery, c(list(con, qry_nc), list(params = params_nc)))
-
-if (nrow(df) == 0) {
-  ggsave(png_file, fail_plot("Sem dados de NC para os selecionados (após escopo)."), width=9, height=5, dpi=150)
-  quit(save="no")
+if (!(opt$perito %in% df$perito)) {
+  sim <- df %>% dplyr::filter(grepl(opt$perito, perito, ignore.case = TRUE)) %>% dplyr::pull(perito)
+  msg <- if (length(sim)) paste0(" Peritos semelhantes: ", paste(sim, collapse=", "), ".") else ""
+  stop(sprintf("Perito '%s' não encontrado no período dentro do escopo.%s", opt$perito, msg))
 }
 
-df <- df %>%
-  mutate(prop_nc = ifelse(total > 0, nc/total, NA_real_),
-         pct_nc  = prop_nc * 100) %>%
-  arrange(desc(pct_nc)) %>%
-  mutate(nomePerito = factor(nomePerito, levels = nomePerito))
+# --------------------------- cálculo ------------------------------------------
+p_row <- df %>% dplyr::filter(perito == opt$perito) %>% dplyr::slice(1)
+o_row <- df %>% dplyr::filter(perito != opt$perito) %>% dplyr::summarise(nc = sum(nc), n = sum(n))
 
-# ----------------------------------------------------------------------
-# Plot
-# ----------------------------------------------------------------------
-p <- ggplot(df, aes(x = nomePerito, y = pct_nc)) +
-  geom_col(fill = "#d62728") +
-  geom_text(aes(label = sprintf("%.1f%% (n=%d/%d)", pct_nc, nc, total)),
-            vjust = -0.3, size = 3) +
+p_pct <- ifelse(p_row$n > 0, p_row$nc / p_row$n, NA_real_)
+o_pct <- ifelse(o_row$n > 0, o_row$nc / o_row$n, NA_real_)
+
+p_ci <- if (is.finite(p_pct)) stats::prop.test(p_row$nc, p_row$n)$conf.int else c(NA_real_, NA_real_)
+o_ci <- if (is.finite(o_pct)) stats::prop.test(o_row$nc, o_row$n)$conf.int else c(NA_real_, NA_real_)
+
+pval <- NA_real_
+if (p_row$n > 0 && o_row$n > 0) {
+  pval <- suppressWarnings(stats::prop.test(c(p_row$nc, o_row$nc), c(p_row$n, o_row$n))$p.value)
+}
+
+grp_others_lab <- if (!is.null(scope_names)) "Demais (escopo)" else "Demais (excl.)"
+plot_df <- tibble::tibble(
+  Grupo = factor(c(opt$perito, grp_others_lab), levels=c(opt$perito, grp_others_lab)),
+  pct   = c(p_pct, o_pct),
+  lo    = c(p_ci[1], o_ci[1]),
+  hi    = c(p_ci[2], o_ci[2]),
+  n     = c(p_row$n, o_row$n)
+)
+
+ylim_max <- max(c(plot_df$hi, 0), na.rm = TRUE)
+if (!is.finite(ylim_max) || ylim_max <= 0) ylim_max <- max(c(plot_df$pct, 0.05), na.rm = TRUE)
+ylim_max <- min(1, ylim_max * 1.15)
+
+gg <- ggplot(plot_df, aes(Grupo, pct)) +
+  geom_col(fill=c("#d62728","#1f77b4"), width=.6) +
+  geom_errorbar(aes(ymin=lo, ymax=hi), width=.15, linewidth=.4, na.rm = TRUE) +
+  geom_text(aes(label=scales::percent(pct, accuracy=.1)), vjust=-.4, size=3.3) +
+  scale_y_continuous(labels=percent_format(accuracy=1), limits=c(0, ylim_max)) +
   labs(
-    title = "Top 10 — Taxa de Não Conformidade (NC robusto) [%]",
-    subtitle = sprintf("%s a %s | mínimo de análises: %d | %s", start_d, end_d, min_n, sel_caption),
-    x = "Perito", y = "% NC (robusto)",
-    caption = "NC robusto: conformado=0 OU (motivoNaoConformado ≠ '' E CAST(motivoNaoConformado) ≠ 0)."
+    title   = "Taxa de Não Conformidade (NC robusto) – Perito vs Demais",
+    subtitle= sprintf("Período: %s a %s  |  n=%d vs %d", opt$start, opt$end, p_row$n, o_row$n),
+    y       = "Percentual", x = NULL,
+    caption = "NC robusto: conformado=0 OU (motivoNaoConformado ≠ '' e CAST(motivoNaoConformado) ≠ 0)."
   ) +
-  theme_minimal(base_size = 11) +
-  theme(axis.text.x = element_text(angle=45, hjust=1))
+  theme_minimal(base_size=11) +
+  theme(panel.grid.major.x = element_blank())
 
-ymax <- suppressWarnings(max(df$pct_nc, na.rm = TRUE)); if (!is.finite(ymax)) ymax <- 0
-ggsave(png_file, p + coord_cartesian(ylim = c(0, ymax * 1.15)),
-       width=9, height=5, dpi=150)
-base::cat(sprintf("✅ Figura salva: %s\n", png_file))
+png_path <- file.path(export_dir, sprintf("rcheck_nc_rate_%s.png", perito_safe))
+ggsave(png_path, gg, width=8, height=5, dpi=160)
+cat(sprintf("✓ salvo: %s\n", png_path))
 
-# ----------------------------------------------------------------------
-# Comentários .org
-# ----------------------------------------------------------------------
-ord <- df %>% arrange(desc(prop_nc))
-top3 <- ord %>% dplyr::slice_head(n = 3) %>%
-  transmute(txt = sprintf("%s: %s (n=%d/%d)",
-                          as.character(nomePerito),
-                          percent_s(prop_nc, .1), nc, total))
-rng     <- range(df$prop_nc, na.rm = TRUE)
-media   <- mean(df$prop_nc, na.rm = TRUE)
-mediana <- median(df$prop_nc, na.rm = TRUE)
+percent_s <- function(x) ifelse(is.finite(x), scales::percent(x, accuracy = .1), "NA")
+num_s     <- function(x) format(x, big.mark=".", decimal.mark=",", trim=TRUE)
 
-sel_txt <- if (!is.null(top10_names)) {
-  paste0("lista externa (manifest) — fornecida pelo make_kpi_report.py",
-         if (length(scope_names)) " — escopo aplicado." else ".")
-} else if (metric == "harm") {
-  paste0("Top-10 por *harm* (Fluxo B)",
-         if (length(scope_names)) " — com escopo." else ".")
-} else {
-  paste0("Top-10 por *scoreFinal* (Fluxo A)",
-         if (length(scope_names)) " — com escopo." else ".")
+esc_txt <- if (!is.null(scope_names)) " no *escopo (Fluxo B)*" else ""
+metodo_txt <- sprintf(
+  paste0(
+    "*Método.* Comparamos a *taxa robusta de NC* do perito (n=%s; nc=%s; %s) ",
+    "com o agregado dos *demais peritos%s* (n=%s; nc=%s; %s) no período %s a %s. ",
+    "A taxa de NC é definida como: conformado=0 OU motivoNaoConformado não-vazio ",
+    "e diferente de 0. IC 95%% via `prop.test` e teste de duas proporções."
+  ),
+  num_s(p_row$n), num_s(p_row$nc), percent_s(p_pct),
+  esc_txt, num_s(o_row$n), num_s(o_row$nc), percent_s(o_pct),
+  opt$start, opt$end
+)
+
+interpret_txt <- {
+  dir_txt <- if (is.finite(p_pct) && is.finite(o_pct)) {
+    if (p_pct > o_pct) "acima dos demais" else if (p_pct < o_pct) "abaixo dos demais" else "igual aos demais"
+  } else "indeterminado"
+  sig_txt <- if (is.finite(pval)) {
+    if (pval < 0.001) "diferença estatisticamente significativa (p<0,001)"
+    else if (pval < 0.01) "diferença estatisticamente significativa (p<0,01)"
+    else if (pval < 0.05) "diferença estatisticamente significativa (p<0,05)"
+    else "diferença *não* significativa (p≥0,05)"
+  } else { "amostra insuficiente para inferência (algum grupo com n=0)" }
+  sprintf("*Interpretação.* A taxa do perito está %s em relação ao grupo. Resultado: %s.", dir_txt, sig_txt)
 }
 
-escopo_txt <- if (length(scope_names)) {
-  paste0("\n*Escopo.* Coorte com ", length(scope_names), " peritos; primeiros: ",
-         paste(head(scope_names, 5), collapse = ", "),
-         if (length(scope_names) > 5) ", …" else "", ".")
-} else ""
-
-metodo_txt <- paste0(
-  "*Método.* Seleção de peritos: ", sel_txt, " ",
-  "Para cada selecionado, calculamos a *taxa de NC robusto* usando ",
-  shQuote(a_tbl), " no período ", start_d, " a ", end_d, ".", escopo_txt
-)
-
-interpreta_txt <- paste0(
-  "*Interpretação.* Entre os selecionados, a %NC variou de ",
-  percent_s(min(rng), .1), " a ", percent_s(max(rng), .1),
-  "; média=", percent_s(media, .1), ", mediana=", percent_s(mediana, .1), ".\n",
-  if (nrow(top3)) paste0("- Maiores %NC: ", paste(top3$txt, collapse = "; "), ".\n") else "",
-  "Observação: seleção e %NC são conceitos distintos; avalie sempre o volume (n) e o contexto."
-)
-
+# .orgs
+org_main <- file.path(export_dir, sprintf("rcheck_nc_rate_%s.org", perito_safe))
 org_main_txt <- paste(
-  "#+CAPTION: Top 10 — %NC (robusto) no período",
-  sprintf("[[file:%s]]", basename(png_file)),
-  "", metodo_txt, "", interpreta_txt, "", sep = "\n"
+  "#+CAPTION: Taxa de NC — perito vs demais",
+  sprintf("[[file:%s]]", basename(png_path)),
+  "", metodo_txt, "", interpret_txt, "", sep = "\n"
 )
-writeLines(org_main_txt, org_main); base::cat(sprintf("✅ Org salvo: %s\n", org_main))
+writeLines(org_main_txt, org_main)
+cat(sprintf("✓ org: %s\n", org_main))
 
-org_comm_txt <- paste(metodo_txt, "", interpreta_txt, "", sep = "\n")
-writeLines(org_comm_txt, org_comm); base::cat(sprintf("✅ Org(comment) salvo: %s\n", org_comm))
+org_comment <- file.path(export_dir, sprintf("rcheck_nc_rate_%s_comment.org", perito_safe))
+org_comment_txt <- paste(metodo_txt, "", interpret_txt, "", sep = "\n")
+writeLines(org_comment_txt, org_comment)
+cat(sprintf("✓ org(comment): %s\n", org_comment))
+

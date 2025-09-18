@@ -21,9 +21,6 @@ lista*
 /db/**
 !/db/.gitkeep
 
-/exports/**
-!/exports/.gitkeep
-
 # Dejetos
 
 .Rhistory

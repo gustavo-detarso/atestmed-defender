@@ -184,7 +184,8 @@ export_dir  <- if (!is.null(opt$`out-dir`)) normalizePath(opt$`out-dir`, mustWor
 dir.create(export_dir, showWarnings = FALSE, recursive = TRUE)
 
 # ------------------------------ DB / janela ------------------------------------
-con  <- dbConnect(SQLite(), opt$db); on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
+con <- am_db_connect(opt$db)
+on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
 a_tbl <- if (exists("a_tbl", inherits=TRUE) && nzchar(a_tbl)) a_tbl else "analises"
 
 # Evita usar o nome 'cols' (que é função do readr)

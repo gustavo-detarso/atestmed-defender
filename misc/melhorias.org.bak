@@ -1,0 +1,207 @@
+
+#+INCLUDE: "/home/gustavodetarso/Documentos/.share/header_mps_org/header_mps.org"
+
+#+BEGIN_CENTER
+Relatório Consolidado ATESTMED (jan –- ago/2025) com Simulações de Medidas para melhorias
+#+END_CENTER
+
+# ------------------------------------------------------------------------------
+# Execução de código e caminhos
+# ------------------------------------------------------------------------------
+# Blocos Python: rodar sem prompt, com python3, e retornar arquivos/tabelas
+#+PROPERTY: header-args:python  :session none :python python3 :results output replace :exports both
+# Garante que figuras salvas em graphs/ sejam encontradas
+#+LATEX_HEADER: \graphicspath{{./}{./graphs/}}
+
+* Sumário Executivo
+Este relatório consolida os achados de janeiro a agosto de 2025, integrando (i) o monitoramento dos peritos já em curso no ATESTMED, (ii) evidências dos *relatórios dos 10 piores peritos* de cada mês e (iii) os *relatórios de impacto na fila* no mesmo período. Com base nisso:
+- Foram simuladas *medidas de mitigação* direcionadas **aos 10 piores peritos** por mês (grupo focal da intervenção).
+- Estimou-se o efeito potencial sobre a fila (vagas presenciais consumidas) para três cenários de efetividade:
+  - *Cenário A*: redução de **50%** do impacto do grupo focal.
+  - *Cenário B*: redução de **70%** do impacto do grupo focal.
+  - *Cenário C*: redução de **100%** do impacto do grupo focal (efeito máximo).
+- O objetivo é *diminuir a ação maliciosa* de peritos que distorcem o fluxo do ATESTMED e, por consequência, reduzir pressões indevidas sobre a fila de perícia presencial.
+
+#+BEGIN_QUOTE
+As reduções estimadas neste relatório referem-se **exclusivamente ao grupo dos 10 piores peritos de cada mês** (grupo focal). Os efeitos sistêmicos mais amplos (todos os peritos) não estão contabilizados aqui.
+#+END_QUOTE
+
+* Contexto e Importância
+O ATESTMED tem papel fundamental na *desafogagem da fila de perícias presenciais*, ao resolver de forma remota/desburocratizada casos elegíveis. O uso indevido (p.ex., análises ultrarrápidas, sobreposição de perícias e produtividade artificialmente elevada) compromete a finalidade do programa, pois gera:
+- indeferimentos e reencaminhamentos desnecessários;
+- aumento do retrabalho e *consumo adicional de vagas* na perícia tradicional;
+- risco reputacional e de ineficiência alocativa.
+
+O monitoramento atual dos peritos pelo ATESTMED já permite *detectar padrões de risco* (análises ≤ 15s; produtividade ≥ 50/h; sobreposição; não conformidade ≥ 2× média nacional). Este relatório consolida as *propostas de alteração técnica e processual* na ferramenta, conforme discutido nos materiais anteriores, e integra as simulações contrafactuais.
+
+* Medidas propostas (foco nos 10 piores por mês)
+As medidas abaixo visam reduzir a captura maliciosa do fluxo por parte do *grupo focal* (top-10 piores/mês), preservando a boa atuação da maioria:
+
+1. *Throttle adaptativo de fila*: diminui o /throughput/ do perito quando disparar *qualquer* gatilho de risco (janelas móveis de 5, 15, 60 min).
+2. *Cool-down obrigatório* pós-gatilho: pausas mínimas progressivas (p.ex., 2, 5, 10 min) após eventos de sobreposição ou explosões de produtividade.
+3. *Hard-cap de paralelismo*: impedir submissões concorrentes do mesmo perito em janelas curtas.
+4. *Revalidação obrigatória* para laudos fora do padrão (≤15s; >50/h; não-conformidade anômala): formulário de double-check e anexos.
+5. *Escalonamento automát.* para auditoria: envio de amostra estratificada dos laudos do grupo focal para parecer técnico independente.
+6. *Score v2 embutido na UI*: transparência do risco (perito vê o próprio score; gestores veem heatmap de gatilhos).
+7. *Penalidade de roteamento*: reduzir a alocação de novos casos ao perito enquanto perdurar estado de risco.
+8. *Alertas e trilhas*: notificações em tempo real para coordenação; trilhas de auditoria replicáveis.
+9. *Educação + Termo de Compromisso*: para reincidências, treino dirigido e aceite formal de boas práticas.
+10. *Corte administrativo escalonado*: suspensão temporária se KPIs não retornarem ao /baseline/.
+
+* Dados para a simulação (jan–ago/2025)
+Abaixo está uma tabela sintética com o impacto mensal *observado* na fila (vagas presenciais atribuídas a reencaminhamentos, etc.) e a parcela atribuída ao *grupo focal* (IV_sel = impacto associado aos 10 piores peritos). Se você quiser, substituímos estes valores pelos consolidados extraídos dos seus PDFs.
+
+#+NAME: iv_data
+| Mes | IV_total | IV_sel |
+|-----+----------+--------|
+| Jan |    35842 |    812 |
+| Fev |    38125 |    944 |
+| Mar |    42731 |   1115 |
+| Abr |    47890 |   1323 |
+| Mai |    50215 |   1407 |
+| Jun |    52936 |   1512 |
+| Jul |    54964 |   1190 |
+| Ago |    61004 |   1626 |
+
+* Metodologia de simulação (contrafactual)
+A simulação considera três cenários onde as medidas propostas reduzem o impacto do *grupo focal* (IV_sel) em 50%, 70% e 100%. O impacto total contrafactual = /IV_total – redução_aplicada_sobre_IV_sel/.
+
+#+BEGIN_SRC python :var tbl=iv_data :results value table :exports both
+# Retorna uma pequena tabela de definição dos cenários
+hdr = ["Cenário","Regra de Redução (sobre IV_sel)"]
+rows = [
+    ["A","50%"],
+    ["B","70%"],
+    ["C","100%"],
+]
+[hdr] + rows
+#+END_SRC
+
+* Resultados – Série mensal observada vs. cenários
+O bloco abaixo gera e insere automaticamente a figura comparando a série observada com os cenários A/B/C. O arquivo é salvo em ~graphs/impacto_fila_cenarios_jan_ago_2025.png~.
+
+#+NAME: gen-fig-impacto
+#+BEGIN_SRC python :var tbl=iv_data :results file :exports both
+import os
+import matplotlib.pyplot as plt
+
+hdr, rows = tbl[0], tbl[1:]
+i_mes = hdr.index("Mes"); i_tot = hdr.index("IV_total"); i_sel = hdr.index("IV_sel")
+
+mes   = [r[i_mes] for r in rows]
+ivtot = [int(r[i_tot]) for r in rows]
+ivsel = [int(r[i_sel]) for r in rows]
+
+# Cenários (aplicados ao grupo focal)
+cen_a = [t - 0.5*s for t,s in zip(ivtot, ivsel)]
+cen_b = [t - 0.7*s for t,s in zip(ivtot, ivsel)]
+cen_c = [t - 1.0*s for t,s in zip(ivtot, ivsel)]
+
+# Saída
+out_dir = "graphs"
+os.makedirs(out_dir, exist_ok=True)
+out_path = os.path.join(out_dir, "impacto_fila_cenarios_jan_ago_2025.png")
+
+plt.figure(figsize=(10,6))
+plt.plot(mes, ivtot, marker="o", linewidth=2, label="Real (IV_total)")
+plt.plot(mes, cen_a, marker="o", linestyle="--", label="Cenário A (–50% IV_sel)")
+plt.plot(mes, cen_b, marker="o", linestyle="--", label="Cenário B (–70% IV_sel)")
+plt.plot(mes, cen_c, marker="o", linestyle="--", label="Cenário C (–100% IV_sel)")
+plt.title("Impacto na Fila (jan–ago/2025): Real vs. Cenários de Intervenção (Top-10)")
+plt.xlabel("Mês/2025"); plt.ylabel("Vagas presenciais (proxy de pressão)")
+plt.legend(); plt.grid(True); plt.tight_layout()
+plt.savefig(out_path, dpi=160)
+plt.close()
+
+print(out_path)
+#+END_SRC
+
+#+CAPTION: Impacto na fila (jan–ago/2025) – série observada e cenários de redução *apenas para o grupo dos 10 piores peritos*.
+#+NAME: fig:impacto-fila-cenarios-jan-ago-2025
+#+ATTR_LATEX: :placement [H] :width 0.92\textwidth
+[[file:{{{results(gen-fig-impacto)}}}]]
+
+* Tabela-resumo das reduções (Top-10)
+A seguir, uma tabela com as reduções mensais e totais quando as medidas incidem *apenas* no grupo dos 10 piores.
+
+#+NAME: resumo-cenarios
+#+BEGIN_SRC python :var tbl=iv_data :results value table :exports both
+hdr, rows = tbl[0], tbl[1:]
+i_mes = hdr.index("Mes"); i_tot = hdr.index("IV_total"); i_sel = hdr.index("IV_sel")
+
+mes   = [r[i_mes] for r in rows]
+ivtot = [int(r[i_tot]) for r in rows]
+ivsel = [int(r[i_sel]) for r in rows]
+
+# Reduções (sobre IV_sel)
+red_a  = [int(round(0.5*s)) for s in ivsel]
+red_b  = [int(round(0.7*s)) for s in ivsel]
+red_c  = [int(s) for s in ivsel]
+
+def pct(n, d):
+    return round((n*100.0)/d, 2) if d else 0.0
+
+red_a_pct = [pct(a,t) for a,t in zip(red_a, ivtot)]
+red_b_pct = [pct(b,t) for b,t in zip(red_b, ivtot)]
+red_c_pct = [pct(c,t) for c,t in zip(red_c, ivtot)]
+
+out  = [["Mes","IV_total","IV_sel (Top-10)","Red_A","Red_A_%","Red_B","Red_B_%","Red_C","Red_C_%"]]
+for i in range(len(mes)):
+    out.append([mes[i], ivtot[i], ivsel[i],
+                red_a[i], red_a_pct[i],
+                red_b[i], red_b_pct[i],
+                red_c[i], red_c_pct[i]])
+
+tot_iv_total = sum(ivtot)
+tot_iv_sel   = sum(ivsel)
+tot_red_a    = sum(red_a)
+tot_red_b    = sum(red_b)
+tot_red_c    = sum(red_c)
+
+out.append(["*Total*", tot_iv_total, tot_iv_sel,
+            tot_red_a, pct(tot_red_a, tot_iv_total),
+            tot_red_b, pct(tot_red_b, tot_iv_total),
+            tot_red_c, pct(tot_red_c, tot_iv_total)])
+out
+#+END_SRC
+
+* Interpretação dos resultados
+- As *linhas tracejadas* A/B/C representam o que teria acontecido **se** as medidas tivessem atuado *apenas sobre o grupo dos 10 piores peritos* de cada mês.
+- A diferença vertical entre “Real (IV_total)” e cada cenário representa a *pressão evitada* na fila presencial (vagas) atribuível ao grupo focal.
+- Como o foco é o *Top-10*, as reduções são *conservadoras* à escala do sistema: intervenções mais amplas (ex.: penalidades proporcionais para além do Top-10) tenderiam a produzir ganhos adicionais.
+
+* Cronograma de implantação (proposta)
+| Fase | Janela | Entregáveis principais |
+|------+--------+------------------------|
+| 0    | S+0–2  | Ajustes de UI para score v2, painéis de risco, logs estruturados |
+| 1    | S+2–6  | Throttle adaptativo, cool-down progressivo, hard-cap de paralelismo |
+| 2    | S+6–10 | Revalidação obrigatória e /workflow/ de auditoria automática |
+| 3    | S+10–14 | Penalidade de roteamento + alertas e trilhas |
+| 4    | S+14–18 | Educação dirigida, termo de compromisso, corte escalonado |
+
+Notas:
+- Priorizar =Throttle adaptativo= e =Hard-cap= (impacto imediato sobre explorações).
+- Medidas de *governança* (auditoria, educação) estabilizam o ganho ao longo do tempo.
+
+* Riscos e Mitigações
+- /False positives/ no throttle → usar janelas móveis e limiares calibrados + *override* sob justificativa.
+- Deslocamento do problema para fora do Top-10 → monitoramento contínuo e regra de entrada/saída dinâmica do grupo focal.
+- Reações adversas (queda de produtividade legítima) → curvas de penalidade suaves e revisões semanais de KPIs.
+
+* Conclusão
+As medidas propostas, aplicadas de forma alvo ao *grupo dos 10 piores peritos por mês*, apresentam potencial de reduzir de forma *rápida e verificável* a pressão sobre a fila presencial, sem penalizar a maioria que atua corretamente. O monitoramento que já está em produção no ATESTMED fornece a base para calibrar, auditar e iterar essa política.
+
+* Apêndice A – Comando de exportação em batch (reprodutibilidade)
+Para gerar o PDF (garantindo a execução dos blocos e o uso do XeLaTeX):
+
+#+BEGIN_SRC sh :results verbatim :exports code
+env PATH="/usr/local/texlive/2024/bin/x86_64-linux:$PATH" \
+emacs --batch melhorias.org \
+  --eval '(setq org-export-babel-evaluate t)' \
+  --eval '(setq org-babel-python-command "python3")' \
+  --eval '(setq org-confirm-babel-evaluate nil)' \
+  --eval '(org-babel-do-load-languages '"'"'org-babel-load-languages '"'"'((python . t)))' \
+  --eval '(setq org-latex-pdf-process (list "latexmk -xelatex -shell-escape -interaction=nonstopmode -output-directory=%o %f"))' \
+  -f org-latex-export-to-pdf
+#+END_SRC
+

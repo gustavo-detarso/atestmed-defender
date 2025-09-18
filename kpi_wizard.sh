@@ -118,23 +118,19 @@ if [[ "$KIND" == "perito" ]]; then
     mapfile -t PERITOS < <(sqlite3 -noheader -batch "$DB_PATH" "SELECT nomePerito FROM peritos ORDER BY nomePerito COLLATE NOCASE;")
     if ((${#PERITOS[@]}==0)); then
       echo "⚠️  Nenhum perito encontrado. Entrada manual."
-      PERITO_NAME="$(ask "Digite o nome do perito")"
+      PERITO_NAME="$(ask "Digite exatamente o nome do perito (como no DB)")"
     else
       if has_fzf; then
-        echo "Digite para filtrar e selecione com ↑/↓ (fzf):"
-        PERITO_NAME="$(printf '%s\n' "${PERITOS[@]}" | fzf --height=20 --reverse --prompt="Perito > " --border --no-multi || true)"
+        PERITO_NAME="$(printf '%s\n' "${PERITOS[@]}" | fzf --height=20 --reverse --prompt="Perito > " --border || true)"
       elif has_gum; then
-        PERITO_NAME="$(printf '%s\n' "${PERITOS[@]}" | gum filter --placeholder "Busque o perito..." || true)"
+        PERITO_NAME="$(printf '%s\n' "${PERITOS[@]}" | gum choose || true)"
       else
-        printf '%s\n' "${PERITOS[@]:0:30}"
-        echo "… (lista truncada; instale fzf/gum para UX melhor)"
-        PERITO_NAME="$(ask "Digite exatamente o nome do perito")"
+        printf '%s\n' "${PERITOS[@]}"
+        PERITO_NAME="$(ask "Copie/cole o nome do perito exatamente como acima")"
       fi
     fi
   fi
-  if [[ -z "$PERITO_NAME" ]]; then
-    echo "❌ Perito não selecionado."; exit 2
-  fi
+  [[ -z "$PERITO_NAME" ]] && { echo "❌ Perito não selecionado."; exit 2; }
   echo "Perito selecionado: $PERITO_NAME"
 fi
 
@@ -156,38 +152,29 @@ calc_month_bounds() {
 }
 
 case "$OPT_PERIOD" in
-  1)
-    YM="$($DATE_BIN +%Y-%m)"
-    read START END < <(calc_month_bounds "$YM")
-    ;;
-  2)
-    YM="$($DATE_BIN -d "-1 month" +%Y-%m)"
-    read START END < <(calc_month_bounds "$YM")
-    ;;
+  1) YM="$($DATE_BIN +%Y-%m)";              read START END < <(calc_month_bounds "$YM") ;;
+  2) YM="$($DATE_BIN -d "-1 month" +%Y-%m)"; read START END < <(calc_month_bounds "$YM") ;;
   3)
-    echo "Selecione o mês (últimos 6):"
-    declare -a YMS=()
-    for i in {0..5}; do
-      YMS+=("$($DATE_BIN -d "-$i month" +%Y-%m)")
-    done
-    SEL=""
-    if has_fzf; then
-      SEL="$(printf '%s\n' "${YMS[@]}" | fzf --height=10 --reverse --prompt="YYYY-MM > " --border || true)"
-    elif has_gum; then
-      SEL="$(printf '%s\n' "${YMS[@]}" | gum choose || true)"
-    else
-      printf '%s\n' "${YMS[@]}"
-      SEL="$(ask "Digite YYYY-MM" "${YMS[0]}")"
-    fi
-    [[ -z "$SEL" ]] && { echo "❌ Mês não selecionado."; exit 2; }
-    read START END < <(calc_month_bounds "$SEL")
-    ;;
+     echo "Selecione o mês (últimos 6):"
+     declare -a YMS=()
+     for i in {0..5}; do YMS+=("$($DATE_BIN -d "-$i month" +%Y-%m)"); done
+     SEL=""
+     if has_fzf; then
+       SEL="$(printf '%s\n' "${YMS[@]}" | fzf --height=10 --reverse --prompt="YYYY-MM > " --border || true)"
+     elif has_gum; then
+       SEL="$(printf '%s\n' "${YMS[@]}" | gum choose || true)"
+     else
+       printf '%s\n' "${YMS[@]}"
+       SEL="$(ask "Digite YYYY-MM" "${YMS[0]}")"
+     fi
+     [[ -z "$SEL" ]] && { echo "❌ Mês não selecionado."; exit 2; }
+     read START END < <(calc_month_bounds "$SEL")
+     ;;
   4)
-    START="$(ask "Data inicial (YYYY-MM-DD)")"
-    END="$(ask "Data final   (YYYY-MM-DD)")"
-    ;;
-  *)
-    echo "Opção inválida."; exit 2 ;;
+     START="$(ask "Data inicial (YYYY-MM-DD)")"
+     END="$(ask "Data final   (YYYY-MM-DD)")"
+     ;;
+  *) echo "Opção inválida."; exit 2 ;;
 esac
 echo "Período escolhido: $START a $END"
 
@@ -201,13 +188,195 @@ else
   USE_DEFAULT=0
 fi
 
+# ========== SELEÇÃO DE EXTRAS COM HELP ==========
+declare -a EXTRA_CATALOG=(
+  "--with-impact|Gera seção 'Impacto na Fila' (grupos e/ou individual)|"
+  "--impact-all-tests|Roda todos os testes/figuras do módulo de impacto|"
+  "--reuse-kpi|Reusa KPI/figuras já existentes (montagem apenas)|"
+  "--rank-by=scoreFinal|Ranking por scoreFinal (quando aplicável)|VALUE_FIXED"
+  "--rank-by=harm|Ranking por 'harm' (quando aplicável)|VALUE_FIXED"
+  "--high-nc-threshold|Altera limiar de 'Alta NC' (padrão 90%)|ASK_NUMBER"
+  "--high-nc-min-tasks|Mínimo de tarefas para 'Alta NC' (padrão 50)|ASK_INT"
+  "--kpi-base=full|KPI completo (padrão)|VALUE_FIXED"
+  "--kpi-base=nc-only|KPI calculado apenas por NC|VALUE_FIXED"
+  "--save-manifests|Salvar CSVs com seleção/escopo usados|"
+  "--plan-only|Mostra plano (dry-run) e sai|"
+)
+
+show_extra_help() {
+  local key="$1"
+  for entry in "${EXTRA_CATALOG[@]}"; do
+    IFS='|' read -r flag desc kind <<<"$entry"
+    if [[ "$key" == "$flag" ]]; then
+      printf "%s\n\nEx.: %s\n" "$desc" "$flag"
+      return
+    fi
+  done
+  echo "Selecione para ativar."
+}
+
+pick_extras_gum() {
+  local items=()
+  for entry in "${EXTRA_CATALOG[@]}"; do
+    IFS='|' read -r flag desc kind <<<"$entry"
+    items+=("$flag  —  $desc")
+  done
+  gum choose --no-limit "${items[@]}" || true
+}
+
+pick_extras_fzf() {
+  local list=""
+  for entry in "${EXTRA_CATALOG[@]}"; do
+    IFS='|' read -r flag desc kind <<<"$entry"
+    list+="$flag  —  $desc"$'\n'
+  done
+  echo -n "$list" | \
+    fzf --multi --height=18 --reverse --prompt="Extras > " \
+        --preview='flag=$(echo {} | sed "s/  —.*//"); '"$(typeset -f show_extra_help)";' show_extra_help "$flag"' \
+        --preview-window=right:60%:wrap || true
+}
+
+pick_extras_text() {
+  echo "Extras disponíveis (digite números separados por espaço, Enter para nenhum):"
+  local i=1
+  for entry in "${EXTRA_CATALOG[@]}"; do
+    IFS='|' read -r flag desc kind <<<"$entry"
+    printf "  %2d) %-24s %s\n" "$i" "$flag" "$desc"
+    ((i++))
+  done
+  read -rp "Escolhas: " CHOICES || true
+  local out=()
+  i=1
+  while read -r n; do
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    local idx=$((n-1))
+    [[ $idx -ge 0 && $idx -lt ${#EXTRA_CATALOG[@]} ]] || continue
+    IFS='|' read -r flag desc kind <<<"${EXTRA_CATALOG[$idx]}"
+    out+=("$flag  —  $desc")
+  done <<<"$(echo "$CHOICES")"
+  printf '%s\n' "${out[@]}"
+}
+
+collect_extras() {
+  local picks=()
+  if has_gum; then
+    mapfile -t picks < <(pick_extras_gum)
+  elif has_fzf; then
+    mapfile -t picks < <(pick_extras_fzf)
+  else
+    mapfile -t picks < <(pick_extras_text)
+  fi
+
+  local out=()
+  for line in "${picks[@]}"; do
+    local flag="${line%%  —*}"
+    local kind=""
+    for entry in "${EXTRA_CATALOG[@]}"; do
+      IFS='|' read -r f d k <<<"$entry"
+      [[ "$f" == "$flag" ]] && { kind="$k"; break; }
+    done
+    case "$kind" in
+      VALUE_FIXED) out+=("$flag") ;;
+      ASK_NUMBER)
+        read -rp "Valor numérico para ${flag} (ex.: 90): " val
+        [[ -n "$val" ]] && out+=("${flag}=${val}") || true
+        ;;
+      ASK_INT)
+        read -rp "Valor inteiro para ${flag} (ex.: 50): " val
+        [[ -n "$val" ]] && out+=("${flag}=${val}") || true
+        ;;
+      *) out+=("$flag") ;;
+    esac
+  done
+
+  # normalizações exclusivas
+  dedupe_last() {
+    local key="$1"; shift
+    local -a keep=(); local last=""
+    for t in "$@"; do
+      [[ "$t" == "$key="* ]] && last="$t" || keep+=("$t")
+    done
+    [[ -n "$last" ]] && keep+=("$last")
+    printf '%s\n' "${keep[@]}"
+  }
+
+  local tmp=("${out[@]}")
+  out=($(dedupe_last "--rank-by" "${tmp[@]}"))
+  tmp=("${out[@]}")
+  out=($(dedupe_last "--kpi-base" "${tmp[@]}"))
+
+  printf '%s\n' "${out[@]}"
+}
+
 EXTRA_FLAGS=()
 if (( USE_DEFAULT == 0 )); then
+  echo
+  echo "=== Extras (múltipla seleção) ==="
+  mapfile -t EXTRA_FLAGS < <(collect_extras)
+  if ((${#EXTRA_FLAGS[@]})); then
+    echo "Extras selecionados: ${EXTRA_FLAGS[*]}"
+  else
+    echo "Nenhum extra selecionado."
+  fi
+fi
+
+# ========== EDIÇÃO INTERATIVA DE FLAGS (seed com defaults SEMPRE) ==========
+# Defaults
+PRE_TOPK_DEFAULT="10"
+PRE_FLUXO_DEFAULT="B"
+PRE_MIN_DEFAULT="50"
+PRE_PLAN_ONLY_DEFAULT="N"   # gerar CSVs por padrão
+
+MAIN_FLUXO_DEFAULT="B"
+MAIN_MIN_DEFAULT="50"
+
+# Seed (evita 'unbound' com set -u)
+PRE_TOPK="$PRE_TOPK_DEFAULT"
+PRE_FLUXO="$PRE_FLUXO_DEFAULT"
+PRE_MIN="$PRE_MIN_DEFAULT"
+PRE_PLAN_ONLY="$PRE_PLAN_ONLY_DEFAULT"
+MAIN_FLUXO="$MAIN_FLUXO_DEFAULT"
+MAIN_MIN="$MAIN_MIN_DEFAULT"
+
+# Quando não usar padrão, permitir editar
+if (( USE_DEFAULT == 0 )); then
+  echo
+  echo "=== Edição de Flags (Pré-pass TopK) ==="
+  PRE_TOPK="$(ask "TopK" "$PRE_TOPK_DEFAULT")"
+  PRE_FLUXO="$(ask "Fluxo (A/B)" "$PRE_FLUXO_DEFAULT")"
+  PRE_MIN="$(ask "Mínimo de análises (pré-pass)" "$PRE_MIN_DEFAULT")"
+  PRE_PLAN_ONLY="$(ask "Pré-pass em modo plan-only? (Y/n)" "$PRE_PLAN_ONLY_DEFAULT")"
+
+  echo
+  echo "=== Edição de Flags (Run principal) ==="
+  MAIN_FLUXO="$(ask "Fluxo (A/B)" "$MAIN_FLUXO_DEFAULT")"
+  MAIN_MIN="$(ask "Mínimo de análises (run)" "$MAIN_MIN_DEFAULT")"
+
+  echo
+  echo "Selecione os recursos para o relatório:"
+  OPT_ORG="$(ask "Exportar ORG? (Y/n)" "Y")"
+  OPT_PDF="$(ask "Exportar PDF? (Y/n)" "Y")"
+  OPT_COMMENTS="$(ask "Incluir comentários ChatGPT? (Y/n)" "Y")"
+  OPT_RAPP="$(ask "Incluir apêndice R? (Y/n)" "Y")"
+  OPT_HIGHNC="$(ask "Incluir seção High-NC? (Y/n)" "Y")"
+  KPI_BASE="$(ask "Base KPI (full|nc-only)" "full")"
+
+  echo
   echo "Você pode acrescentar flags extras (vazio para continuar)."
   echo "Exemplos: --with-impact  --impact-all-tests  --reuse-kpi  --rank-by scoreFinal"
   read -rp "Flags extras: " EXTRA_LINE || true
-  # shellcheck disable=SC2206
-  EXTRA_FLAGS=( $EXTRA_LINE )
+  EXTRA_LINE_ARR=( $EXTRA_LINE )
+  EXTRA_FLAGS=( "${EXTRA_FLAGS[@]}" "${EXTRA_LINE_ARR[@]}" )
+
+  EDITED_DEFAULTS=()
+  [[ "${OPT_ORG^^}"      == "Y" ]] && EDITED_DEFAULTS+=( --export-org )
+  [[ "${OPT_PDF^^}"      == "Y" ]] && EDITED_DEFAULTS+=( --export-pdf )
+  [[ "${OPT_COMMENTS^^}" == "Y" ]] && EDITED_DEFAULTS+=( --add-comments )
+  [[ "${OPT_RAPP^^}"     == "Y" ]] && EDITED_DEFAULTS+=( --r-appendix )
+  [[ "${OPT_HIGHNC^^}"   == "Y" ]] && EDITED_DEFAULTS+=( --include-high-nc )
+  EDITED_DEFAULTS+=( --kpi-base "$KPI_BASE" --save-manifests )
+
+  DEFAULT_FLAGS=( --min-analises "$MAIN_MIN" "${EDITED_DEFAULTS[@]}" )
 fi
 
 # ───────────────────────────── Montagem do comando ─────────────────────────────
@@ -219,16 +388,16 @@ TOP_DIR="${PERIODO_DIR}/top10"
 mkdir -p "$TOP_DIR"
 
 if [[ "$KIND" == "top10" ]]; then
-  # ───────────────────── Pré-pass: materializa seleção (TopK=10, Fluxo B) ─────────────────────
   echo
-  echo "🔎 Pré-pass: gerando CSVs de seleção (TopK=10, Fluxo B)…"
+  echo "🔎 Pré-pass: gerando CSVs de seleção (TopK/Fluxo configuráveis)…"
   PREPASS_CMD=( "$PYTHON_BIN" "$MAKE_KPI_PY"
     --start "$START" --end "$END"
-    --topk 10 --fluxo B
-    --min-analises 50
+    --topk "$PRE_TOPK" --fluxo "$PRE_FLUXO"
+    --min-analises "$PRE_MIN"
     --save-manifests
-    --plan-only
   )
+  [[ "${PRE_PLAN_ONLY^^}" == "Y" ]] && PREPASS_CMD+=( --plan-only )
+
   printf ' [prepass] %q' "${PREPASS_CMD[@]}"; echo
   "${PREPASS_CMD[@]}"
 
@@ -241,23 +410,16 @@ if [[ "$KIND" == "top10" ]]; then
     echo "   Verifique se há peritos elegíveis (gate Fluxo B) no período informado."
     exit 3
   fi
-  if [[ ! -f "$SCOPE_CSV" ]]; then
-    echo "⚠️  Pré-pass não gerou ${SCOPE_CSV}. Seguirei apenas com --peritos-csv."
-    SCOPE_CSV=""
-  fi
+  [[ ! -f "$SCOPE_CSV" ]] && { echo "⚠️  Pré-pass não gerou ${SCOPE_CSV}. Seguirei apenas com --peritos-csv."; SCOPE_CSV=""; }
 
-  # Comando principal em Top10 (Fluxo B) com CSVs materializados
-  CMD+=( --top10 --fluxo B --peritos-csv "$PERITOS_CSV" )
+  CMD+=( --top10 --fluxo "$MAIN_FLUXO" --peritos-csv "$PERITOS_CSV" )
   [[ -n "$SCOPE_CSV" ]] && CMD+=( --scope-csv "$SCOPE_CSV" )
 else
-  # Individual
   CMD+=( --perito "$PERITO_NAME" )
 fi
 
-# Acrescenta flags padrão e extras
-if (( USE_DEFAULT == 1 )); then
-  CMD+=( "${DEFAULT_FLAGS[@]}" )
-fi
+# Acrescenta flags padrão (ou editadas) e extras
+CMD+=( "${DEFAULT_FLAGS[@]}" )
 if ((${#EXTRA_FLAGS[@]} > 0)); then
   CMD+=( "${EXTRA_FLAGS[@]}" )
 fi
