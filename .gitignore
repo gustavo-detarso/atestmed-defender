@@ -9,6 +9,8 @@ lista*
 
 /testing/**
 
+/smoke_logs/**
+
 /debug_logs/**
 
 /reports/outputs/**
