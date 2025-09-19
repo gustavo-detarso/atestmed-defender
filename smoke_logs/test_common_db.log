@@ -1,0 +1,26 @@
+[R] test_common_db.R 
+→ Carregando: /home/gustavodetarso/Documentos/atestmed-defender/r_checks/_common.R 
+→ Abrindo DB: db/atestmed.db 
+→ SELECT 1...
+  ok
+1  1
+→ PRAGMA database_list...
+  seq name                                                             file
+1   0 main /home/gustavodetarso/Documentos/atestmed-defender/db/atestmed.db
+→ PRAGMA schema_version...
+  schema_version
+1             12
+→ Tabelas disponíveis...
+[1] "analises"             "indicadores"          "peritos"             
+[4] "protocolos"           "protocolos_reabertos"
+→ Detectando tabela de análises...
+   tabela: analises 
+→ Colunas da tabela de análises...
+ [1] "protocolo"            "siapePerito"          "cid10"               
+ [4] "conformado"           "motivoNaoConformado"  "tipoPrazoAfastamento"
+ [7] "totalDiasRepouso"     "dataHoraIniPericia"   "dataHoraFimPericia"  
+[10] "duracaoPericia"       "duracao_seg"         
+→ Testando wrappers sem con explícito (via KPI_DB)...
+  ok_wrapper
+1         99
+✓ Tudo certo.

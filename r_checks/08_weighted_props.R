@@ -27,7 +27,28 @@ suppressPackageStartupMessages({
   library(dplyr); library(ggplot2); library(scales); library(stringr); library(tibble); library(readr)
 })
 
-# --- begin: am_db_reconnect_helpers ---
+# ── Localizar e carregar _common.R de forma robusta (se existir) ───────────────
+local({
+  args_all   <- commandArgs(trailingOnly = FALSE)
+  file_arg   <- sub("^--file=", "", args_all[grep("^--file=", args_all)])
+  script_dir <- if (length(file_arg)) dirname(normalizePath(file_arg)) else getwd()
+  common_candidates <- c(
+    file.path(script_dir, "_common.R"),
+    file.path(script_dir, "r_checks", "_common.R"),
+    file.path(getwd(), "_common.R"),
+    file.path(getwd(), "r_checks", "_common.R")
+  )
+  common_path <- common_candidates[file.exists(common_candidates)][1]
+  if (!is.na(common_path)) {
+    # Carrega no ambiente local (não polui global), mas define funções com <<- se necessário
+    source(common_path, local = TRUE)
+  }
+})
+
+# --- begin: am_db_reconnect_helpers (fallbacks, caso _common.R não tenha sido carregado) ---
+`%||%` <- get("%||%", envir = .GlobalEnv, inherits = TRUE)
+if (!is.function(`%||%`)) `%||%` <- function(a,b) if (is.null(a)) b else a
+
 if (!exists("am_safe_disconnect", mode="function", inherits=TRUE)) {
   am_safe_disconnect <- function(con) {
     try({
@@ -46,16 +67,34 @@ if (!exists("am__db_path_guess", mode="function", inherits=TRUE)) {
         p <- tryCatch(opt$db, error=function(e) NULL)
         if (!is.null(p) && nzchar(p)) return(p)
       }
-      NULL
-    }, error=function(e) NULL)
+      Sys.getenv("KPI_DB", "")
+    }, error=function(e) "")
+  }
+}
+# >>> ADIÇÃO: conector único
+if (!exists("am_db_connect", mode="function", inherits=TRUE)) {
+  am_db_connect <- function(db_arg = NULL) {
+    dbp <- db_arg %||% am__db_path_guess()
+    if (!nzchar(dbp)) stop("Caminho do banco não informado. Use --db ou KPI_DB.", call. = FALSE)
+    dbp <- tryCatch(normalizePath(dbp, mustWork = TRUE), error = function(e) dbp)
+    DBI::dbConnect(RSQLite::SQLite(), dbname = dbp)
   }
 }
 if (!exists("am_ensure_con", mode="function", inherits=TRUE)) {
-  am_ensure_con <- function(con) {
+  am_ensure_con <- function(con, db_arg = NULL) {
     if (inherits(con, "DBIConnection") && DBI::dbIsValid(con)) return(con)
-    dbp <- am__db_path_guess()
-    if (is.null(dbp) || !nzchar(dbp)) stop("am_ensure_con: caminho do DB desconhecido")
-    DBI::dbConnect(RSQLite::SQLite(), dbname = dbp)
+    am_db_connect(db_arg)
+  }
+}
+# >>> ADIÇÃO: open_db fino
+if (!exists("am_open_db", mode="function", inherits=TRUE)) {
+  am_open_db <- function(db_path = NULL) {
+    con <- am_db_connect(db_path)
+    ok <- tryCatch(DBI::dbIsValid(con), error = function(e) FALSE)
+    if (!isTRUE(ok)) stop("am_open_db: conexão inválida")
+    tryCatch(DBI::dbGetQuery(con, "SELECT 1"),
+             error = function(e) stop("am_open_db: SELECT 1 falhou: ", conditionMessage(e)))
+    con
   }
 }
 if (!exists("am_dbGetQuery", mode="function", inherits=TRUE)) {
@@ -82,7 +121,6 @@ if (!exists("am_dbQuoteIdentifier", mode="function", inherits=TRUE)) {
 # ==== ATESTMED PROLOGO (INICIO) ====
 local({
   # Prólogo específico para 08_weighted_props.R (sem abrir/fechar DB)
-  `%||%` <- function(a,b) if (is.null(a)) b else a
 
   # Wrapper robusto para consultas (aceita vetor de strings)
   if (!exists("am_dbGetQuery", mode="function", inherits=TRUE)) {
@@ -162,9 +200,10 @@ if (!exists("start_d", inherits=TRUE) ||
     export_dir <- if (!is.null(out_dir) && nzchar(out_dir)) normalizePath(out_dir, mustWork=FALSE) else file.path(base_dir, "graphs_and_tables","exports")
     if (!dir.exists(export_dir)) dir.create(export_dir, recursive=TRUE, showWarnings=FALSE)
 
-    con <- am_db_connect(db_path)
+    # >>> AJUSTE: abrir conexão via helper presente (do _common.R ou fallback)
+    con <- am_open_db(db_path)
     on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
-    if (!is.null(con)) on.exit(try(DBI::dbDisconnect(con), silent=TRUE), add = TRUE)
+
     if (is.null(con) || !DBI::dbIsValid(con)) stop("Conexão DB inválida (fallback).")
 
     if (!exists("am_detect_analises_table", mode="function", inherits=TRUE)) {

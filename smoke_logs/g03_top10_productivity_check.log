@@ -1,0 +1,5 @@
+[R] g03_top10_productivity_check.R --db db/atestmed.db --start 2025-01-01 --end 2025-01-21 --out-dir graphs_and_tables/exports --perito ALEXANDRE FELIPE FRANCA --threshold 50
+[1] "LC_CTYPE=C.UTF-8;LC_NUMERIC=C;LC_TIME=C.UTF-8;LC_COLLATE=C.UTF-8;LC_MONETARY=C.UTF-8;LC_MESSAGES=C.UTF-8;LC_PAPER=C.UTF-8;LC_NAME=C;LC_ADDRESS=C;LC_TELEPHONE=C;LC_MEASUREMENT=C.UTF-8;LC_IDENTIFICATION=C"
+✅ Figura salva: /home/gustavodetarso/Documentos/atestmed-defender/graphs_and_tables/exports/rcheck_top10_productivity.png
+✅ Org salvo: /home/gustavodetarso/Documentos/atestmed-defender/graphs_and_tables/exports/rcheck_top10_productivity.org
+✅ Org(comment) salvo: /home/gustavodetarso/Documentos/atestmed-defender/graphs_and_tables/exports/rcheck_top10_productivity_comment.org

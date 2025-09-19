@@ -1,0 +1,5 @@
+[R] 01_nc_rate_check.R --db db/atestmed.db --start 2025-01-01 --end 2025-01-21 --out-dir graphs_and_tables/exports --perito ALEXANDRE FELIPE FRANCA
+[1] "LC_CTYPE=C.UTF-8;LC_NUMERIC=C;LC_TIME=C.UTF-8;LC_COLLATE=C.UTF-8;LC_MONETARY=C.UTF-8;LC_MESSAGES=C.UTF-8;LC_PAPER=C.UTF-8;LC_NAME=C;LC_ADDRESS=C;LC_TELEPHONE=C;LC_MEASUREMENT=C.UTF-8;LC_IDENTIFICATION=C"
+✓ salvo: /home/gustavodetarso/Documentos/atestmed-defender/graphs_and_tables/exports/rcheck_nc_rate_ALEXANDRE_FELIPE_FRANCA.png
+✓ org: /home/gustavodetarso/Documentos/atestmed-defender/graphs_and_tables/exports/rcheck_nc_rate_ALEXANDRE_FELIPE_FRANCA.org
+✓ org(comment): /home/gustavodetarso/Documentos/atestmed-defender/graphs_and_tables/exports/rcheck_nc_rate_ALEXANDRE_FELIPE_FRANCA_comment.org

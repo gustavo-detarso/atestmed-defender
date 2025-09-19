@@ -9,6 +9,22 @@ Sys.setlocale(category = "LC_ALL", locale = "C.UTF-8")
 # ----------------------------------------------------------------------
 
 suppressPackageStartupMessages({
+# ── Localizar e carregar _common.R de forma robusta ────────────────────────────
+args_all   <- commandArgs(trailingOnly = FALSE)
+file_arg   <- sub("^--file=", "", args_all[grep("^--file=", args_all)])
+script_dir <- if (length(file_arg)) dirname(normalizePath(file_arg)) else getwd()
+common_candidates <- c(
+  file.path(script_dir, "_common.R"),
+  file.path(script_dir, "r_checks", "_common.R"),
+  file.path(getwd(), "_common.R"),
+  file.path(getwd(), "r_checks", "_common.R")
+)
+common_path <- common_candidates[file.exists(common_candidates)][1]
+if (!is.na(common_path)) {
+  source(common_path, local = TRUE)
+} else {
+  message("[g05_top10_motivos_chisq] _common.R não encontrado — usando fallbacks internos.")
+}
 
 # --- hardening: garanta am_resolve_export_dir mesmo sem _common.R ---
 if (!exists("am_resolve_export_dir", mode = "function", inherits = TRUE)
@@ -191,7 +207,8 @@ to_upper <- function(xs) unique(toupper(trimws(xs)))
 # ────────────────────────────────────────────────────────────────────────────────
 # Seleção do grupo-alvo (manifesto OU Top10 interno por scoreFinal/harm) + ESCOPO
 # ────────────────────────────────────────────────────────────────────────────────
-con <- am_db_connect(opt$db)
+con <- am_open_db(opt$db)
+on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
 on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
 a_tbl <- detect_analises_table(con)
 

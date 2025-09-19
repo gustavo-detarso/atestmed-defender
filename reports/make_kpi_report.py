@@ -34,17 +34,66 @@ from PyPDF2 import PdfMerger
 # ────────────────────────────────────────────────────────────────────────────────
 # Paths e diretórios
 # ────────────────────────────────────────────────────────────────────────────────
-BASE_DIR    = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-DB_PATH     = os.path.join(BASE_DIR, 'db', 'atestmed.db')
-GRAPHS_DIR  = os.path.join(BASE_DIR, 'graphs_and_tables')
-SCRIPTS_DIR = GRAPHS_DIR  # alias
-EXPORT_DIR  = os.path.join(GRAPHS_DIR, 'exports')
-OUTPUTS_DIR = os.path.join(BASE_DIR, 'reports', 'outputs')
-MISC_DIR    = os.path.join(BASE_DIR, 'misc')
-RCHECK_DIR  = os.path.join(BASE_DIR, 'r_checks')  # onde ficam os .R
-
-os.makedirs(EXPORT_DIR, exist_ok=True)
+# ─────────────────────────────────────────────────────────
+# Layout compatível com make_kpi_report.py (reports/outputs)
+# ─────────────────────────────────────────────────────────
+BASE_DIR     = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+OUTPUTS_DIR  = os.path.join(BASE_DIR, 'reports', 'outputs')
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
+
+# pasta do período: reports/outputs/START_a_END/
+PERIODO_DIR  = os.path.join(OUTPUTS_DIR, f"{args.start}_a_{args.end}")
+os.makedirs(PERIODO_DIR, exist_ok=True)
+
+# para o fluxo B, criamos um sub-rótulo fixo
+RELATORIO_DIR = os.path.join(PERIODO_DIR, "fluxo_b")
+
+# subpastas espelhando o make_kpi_report.py
+IMGS_DIR      = os.path.join(RELATORIO_DIR, "imgs")
+COMMENTS_DIR  = os.path.join(RELATORIO_DIR, "comments")
+ORGS_DIR      = os.path.join(RELATORIO_DIR, "orgs")
+MARKDOWN_DIR  = os.path.join(RELATORIO_DIR, "markdown")
+PDF_DIR       = os.path.join(RELATORIO_DIR, "pdf")
+
+for d in (RELATORIO_DIR, IMGS_DIR, COMMENTS_DIR, ORGS_DIR, MARKDOWN_DIR, PDF_DIR):
+    os.makedirs(d, exist_ok=True)
+
+# Redireciona as saídas do fluxo B:
+#  - CSVs/PNGs (que o script grava em args.out_dir) → imgs/
+#  - .org → orgs/
+#  - .pdf → pdf/
+# Mantém flags do usuário se ele passou caminhos explícitos diferentes (heurística: apenas
+# sobrescrever quando os caminhos atuais ainda são os defaults da própria ferramenta).
+def _is_default(p: str, defaults: set[str]) -> bool:
+    try:
+        ap = os.path.abspath(p)
+        return any(os.path.abspath(x) == ap for x in defaults)
+    except Exception:
+        return False
+
+defaults_out = {
+    os.path.join(BASE_DIR, 'graphs_and_tables', 'exports'),
+}
+defaults_org = {
+    os.path.join(BASE_DIR, 'graphs_and_tables', 'exports'),
+}
+defaults_pdf = {
+    os.path.join(BASE_DIR, 'graphs_and_tables', 'exports', 'pdf'),
+}
+
+if _is_default(getattr(args, "out_dir", ""), defaults_out):
+    args.out_dir = IMGS_DIR
+if _is_default(getattr(args, "org_dir", ""), defaults_org):
+    args.org_dir = ORGS_DIR
+if _is_default(getattr(args, "pdf_dir", ""), defaults_pdf):
+    args.pdf_dir = PDF_DIR
+
+# opcional: expor para outras partes do script se quiser reutilizar
+args.relatorio_dir = RELATORIO_DIR
+args.periodo_dir   = PERIODO_DIR
+args.imgs_dir      = IMGS_DIR
+args.comments_dir  = COMMENTS_DIR
+args.markdown_dir  = MARKDOWN_DIR
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Carregamento de .env na raiz (se existir)

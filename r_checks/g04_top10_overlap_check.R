@@ -8,6 +8,22 @@ Sys.setlocale(category = "LC_ALL", locale = "C.UTF-8")
 # ----------------------------------------------------------------------
 
 suppressPackageStartupMessages({
+# ── Localizar e carregar _common.R de forma robusta ────────────────────────────
+args_all   <- commandArgs(trailingOnly = FALSE)
+file_arg   <- sub("^--file=", "", args_all[grep("^--file=", args_all)])
+script_dir <- if (length(file_arg)) dirname(normalizePath(file_arg)) else getwd()
+common_candidates <- c(
+  file.path(script_dir, "_common.R"),
+  file.path(script_dir, "r_checks", "_common.R"),
+  file.path(getwd(), "_common.R"),
+  file.path(getwd(), "r_checks", "_common.R")
+)
+common_path <- common_candidates[file.exists(common_candidates)][1]
+if (!is.na(common_path)) {
+  source(common_path, local = TRUE)
+} else {
+  message("[g04_top10_overlap_check] _common.R não encontrado — usando fallbacks internos.")
+}
 
 # --- hardening: garanta am_resolve_export_dir mesmo sem _common.R ---
 if (!exists("am_resolve_export_dir", mode = "function", inherits = TRUE)
@@ -185,7 +201,8 @@ org_main <- file.path(export_dir, "rcheck_top10_overlap.org")
 org_comm <- file.path(export_dir, "rcheck_top10_overlap_comment.org")
 
 # ─────────────── Helpers de schema ───────────────
-con <- am_db_connect(db_path)
+con <- am_open_db(db_path)
+on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
 on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
 table_exists <- function(con, name) nrow(am_dbGetQuery(con, "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1", params=list(name))) > 0
 detect_analises_table <- function(con) { for (t in c("analises","analises_atestmed")) if (table_exists(con, t)) return(t); stop("Não encontrei 'analises' nem 'analises_atestmed'.") }

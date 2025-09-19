@@ -64,14 +64,94 @@ def _dbg(msg: str):
         except Exception:
             pass
 
-# Pastas padrão
+# ─────────────────────────────────────────────────────────
+# Defaults globais (seguros no nível de módulo)
+# ─────────────────────────────────────────────────────────
+import os
+
 BASE_DIR    = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-OUT_DIR     = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
-ORG_DIR     = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports')
-PDF_DIR     = os.path.join(BASE_DIR, 'graphs_and_tables', 'exports', 'pdf')
+
+# onde ficam saídas “clássicas” (compatível com scripts existentes)
+GRAPHS_DIR  = os.path.join(BASE_DIR, 'graphs_and_tables')
+OUT_DIR     = os.path.join(GRAPHS_DIR, 'exports')
+ORG_DIR     = os.path.join(GRAPHS_DIR, 'exports')
+PDF_DIR     = os.path.join(GRAPHS_DIR, 'exports', 'pdf')
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(ORG_DIR, exist_ok=True)
 os.makedirs(PDF_DIR, exist_ok=True)
+
+# raiz dos relatórios por período (usada dentro de setup_output_layout)
+OUTPUTS_DIR = os.path.join(BASE_DIR, 'reports', 'outputs')
+os.makedirs(OUTPUTS_DIR, exist_ok=True)
+
+def setup_output_layout(args):
+    """
+    Alinha o fluxo B ao mesmo layout de saídas do make_kpi_report.py:
+    reports/outputs/{START}_a_{END}/fluxo_b/{imgs,comments,orgs,markdown,pdf}
+
+    Só redireciona args.*dir se o usuário não tiver passado caminhos customizados
+    (i.e., se ainda estiverem nos defaults do arquivo).
+    """
+    import os
+
+    BASE_DIR    = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    OUTPUTS_DIR = os.path.join(BASE_DIR, 'reports', 'outputs')
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
+
+    periodo_dir   = os.path.join(OUTPUTS_DIR, f"{args.start}_a_{args.end}")
+    relatorio_dir = os.path.join(periodo_dir, "fluxo_b")
+
+    imgs_dir      = os.path.join(relatorio_dir, "imgs")
+    comments_dir  = os.path.join(relatorio_dir, "comments")
+    orgs_dir      = os.path.join(relatorio_dir, "orgs")
+    markdown_dir  = os.path.join(relatorio_dir, "markdown")
+    pdf_dir       = os.path.join(relatorio_dir, "pdf")
+
+    for d in (periodo_dir, relatorio_dir, imgs_dir, comments_dir, orgs_dir, markdown_dir, pdf_dir):
+        os.makedirs(d, exist_ok=True)
+
+    # Só sobrescreve se estiver usando os defaults do próprio script
+    def _is_default(p: str, defaults: set[str]) -> bool:
+        try:
+            ap = os.path.abspath(p or "")
+            return any(os.path.abspath(x) == ap for x in defaults)
+        except Exception:
+            return False
+
+    defaults_out = {
+        os.path.join(BASE_DIR, 'graphs_and_tables', 'exports'),
+    }
+    defaults_org = {
+        os.path.join(BASE_DIR, 'graphs_and_tables', 'exports'),
+    }
+    defaults_pdf = {
+        os.path.join(BASE_DIR, 'graphs_and_tables', 'exports', 'pdf'),
+    }
+
+    if _is_default(getattr(args, "out_dir", ""), defaults_out):
+        args.out_dir = imgs_dir
+    if _is_default(getattr(args, "org_dir", ""), defaults_org):
+        args.org_dir = orgs_dir
+    if _is_default(getattr(args, "pdf_dir", ""), defaults_pdf):
+        args.pdf_dir = pdf_dir
+
+    # Disponibiliza caminhos para quem quiser usar depois
+    args.periodo_dir   = periodo_dir
+    args.relatorio_dir = relatorio_dir
+    args.imgs_dir      = imgs_dir
+    args.comments_dir  = comments_dir
+    args.markdown_dir  = markdown_dir
+    args.pdf_dir_eff   = pdf_dir
+
+    return {
+        "PERIODO_DIR": periodo_dir,
+        "RELATORIO_DIR": relatorio_dir,
+        "IMGS_DIR": imgs_dir,
+        "COMMENTS_DIR": comments_dir,
+        "ORGS_DIR": orgs_dir,
+        "MARKDOWN_DIR": markdown_dir,
+        "PDF_DIR": pdf_dir,
+    }
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -2167,6 +2247,9 @@ def main():
     _load_dotenv_from_base()
     args = parse_args()
 
+    # Layout compatível com make_kpi_report.py (APÓS parse_args)
+    setup_output_layout(args)
+
     # DEBUG_AI
     try:
         dbg_flag = bool(getattr(args, "debug_ai", False))
@@ -2638,7 +2721,7 @@ def main():
         )
         _dbg(f"files section (unificada): {len(files_links)} links")
 
-    # Comentários de TABELAS (tenta AI centralizada; fallback para _coment)
+    # Comentários de TABELAS
     table_captions: Dict[str, str] = {}
     tables_meta = [
         {"id": "main",        "title": "Tabela principal (ranking)"},
@@ -2654,7 +2737,6 @@ def main():
         except Exception as e:
             _dbg(f"ai_table_captions falhou: {e!r}")
             table_captions = {}
-    # Completa faltantes com _coment() e defaults curtos
     defaults_tab = {
         "main": "Tabela principal com ranking dos elegíveis e impacto estimado.",
         "plan": "Resumo do plano de ação por perito com ganho esperado.",
@@ -2727,9 +2809,9 @@ def main():
             else:
                 print("⚠️  Falha ao gerar PDF (Emacs/pandoc). Verifique PATH e engines.")
 
-    # ZIP bundle (opcional)
+    # ZIP bundle (opcional) — agora dentro da pasta do relatório
     if getattr(args, "zip_bundle", False):
-        zip_path = os.path.join(args.out_dir, base_name + "_bundle.zip")
+        zip_path = os.path.join(args.relatorio_dir, base_name + "_bundle.zip")
         bundle_files = [csv_path, full_csv, plano_acao_csv] + figs
         org_candidate = os.path.join(args.org_dir, base_name + ".org")
         pdf_candidate = os.path.join(args.pdf_dir, base_name + ".pdf")

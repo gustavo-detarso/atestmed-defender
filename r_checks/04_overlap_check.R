@@ -10,9 +10,7 @@ Sys.setlocale(category = "LC_ALL", locale = "C.UTF-8")
 suppressPackageStartupMessages({
 
 # --- hardening: garanta am_resolve_export_dir mesmo sem _common.R ---
-if (!exists("am_resolve_export_dir", mode = "function", inherits = TRUE)
-
-) {
+if (!exists("am_resolve_export_dir", mode = "function", inherits = TRUE)) {
   `%||%` <- function(a,b) if (is.null(a)) b else a
   am_resolve_export_dir <- function(out_dir = NULL) {
     od <- if (!is.null(out_dir) && nzchar(out_dir)) {
@@ -80,15 +78,7 @@ if (!exists("am_dbQuoteIdentifier", mode="function", inherits=TRUE)) {
     }
   })(DBI::dbQuoteIdentifier)
 }
-# --- fim do fix ---
-
 # --- end: am_db_reconnect_helpers ---
-
-
-
-
-
-
 
 # ==== ATESTMED PROLOGO (INICIO) ====
 local({
@@ -144,15 +134,13 @@ local({
 
   am_args <<- tryCatch(am_parse_args(), error=function(e) list())
   db_path <- am_args[["db"]]; if (is.null(db_path) || !nzchar(db_path)) stop("Faltou --db <path>")
-  con <<- am_open_db(db_path)
-  # (patch) removido on.exit de desconexão precoce
+  con <<- am_open_db(db_path)  # conexão inicial (reaproveitada mais abaixo)
 
   export_dir <<- am_resolve_export_dir(am_args[["out-dir"]])
   a_tbl     <<- tryCatch(am_detect_analises_table(con), error=function(e) NA_character_)
-  am_cols   <<- tryCatch(am_detect_columns(con, a_tbl), error=function(e) character(0))  # <- evita colisão com readr::cols
+  am_cols   <<- tryCatch(am_detect_columns(con, a_tbl), error=function(e) character(0))  # evita colisão com readr::cols
 })
 # ==== ATESTMED PROLOGO (FIM) ====
-
 
 # ----------------------------- CLI --------------------------------------------
 opt_list <- list(
@@ -184,9 +172,15 @@ export_dir  <- if (!is.null(opt$`out-dir`)) normalizePath(opt$`out-dir`, mustWor
 dir.create(export_dir, showWarnings = FALSE, recursive = TRUE)
 
 # ------------------------------ DB / janela ------------------------------------
-con <- am_db_connect(opt$db)
+# Reaproveita a conexão do prólogo se válida; senão abre com am_open_db()
+if (exists("con", inherits=TRUE) && inherits(con, "DBIConnection") && DBI::dbIsValid(con)) {
+  # usa 'con' já aberto
+} else {
+  con <- am_open_db(opt$db)
+}
 on.exit(try(am_safe_disconnect(con), silent=TRUE), add=TRUE)
-a_tbl <- if (exists("a_tbl", inherits=TRUE) && nzchar(a_tbl)) a_tbl else "analises"
+
+a_tbl <- if (exists("a_tbl", inherits=TRUE) && is.character(a_tbl) && nzchar(a_tbl)) a_tbl else "analises"
 
 # Evita usar o nome 'cols' (que é função do readr)
 tbl_cols  <- am_dbGetQuery(con, sprintf("PRAGMA table_info(%s)", am_dbQuoteIdentifier(con, a_tbl)))$name
@@ -303,3 +297,4 @@ writeLines(paste(
 
 org_comment <- file.path(export_dir, sprintf("rcheck_overlap_%s_comment.org", perito_safe))
 writeLines(paste(metodo_txt, "", interpret_txt, "", sep="\n"), org_comment); cat(sprintf("✓ org(comment): %s\n", org_comment))
+
